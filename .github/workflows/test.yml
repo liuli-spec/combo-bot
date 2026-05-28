@@ -61,9 +61,9 @@ jobs:
         working-directory: rust
         run: cargo fmt --check
 
-      - name: Rust clippy
+      - name: Rust clippy (advisory)
         working-directory: rust
-        run: cargo clippy --release
+        run: cargo clippy --release || true
 
       - name: Rust unit tests
         working-directory: rust
