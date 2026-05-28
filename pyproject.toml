@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "combo-futures"
+version = "0.1.0"
+description = "Combined grid + trend futures trading bot"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Combo Futures Contributors" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "ccxt>=4.0.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+cache = [
+    "pandas",
+    "pyarrow",
+]
+optimize = [
+    "optuna",
+]
+all = [
+    "pandas",
+    "pyarrow",
+    "optuna",
+]
+
+[project.scripts]
+combo-futures = "combo_bot.main:main"
+
+[project.urls]
+Homepage = "https://github.com/combo-futures/combo-futures"
+Repository = "https://github.com/combo-futures/combo-futures"
+Issues = "https://github.com/combo-futures/combo-futures/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["combo_bot"]

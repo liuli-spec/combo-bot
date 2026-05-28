@@ -1,0 +1,71 @@
+{
+    "symbols": [
+        "BTC/USDT:USDT",
+        "ETH/USDT:USDT",
+        "SOL/USDT:USDT",
+        "XRP/USDT:USDT",
+        "DOGE/USDT:USDT",
+        "ADA/USDT:USDT",
+        "LINK/USDT:USDT"
+    ],
+    "starting_balance": 10000,
+    "leverage": 5,
+    "maker_fee": 0.0002,
+    "taker_fee": 0.0005,
+    "data_dir": "data",
+
+    "grid": {
+        "entry_initial_ema_dist": 0.008,
+        "entry_initial_qty_pct": 0.012,
+        "entry_grid_spacing_pct": 0.025,
+        "entry_grid_spacing_volatility_weight": 15.0,
+        "entry_grid_spacing_we_weight": 1.0,
+        "entry_grid_double_down_factor": 1.3,
+        "close_grid_markup_start": 0.005,
+        "close_grid_markup_end": 0.015,
+        "close_grid_qty_pct": 0.5,
+        "close_trailing_threshold_pct": 0.01,
+        "close_trailing_retracement_pct": 0.004,
+        "wallet_exposure_limit": 1.0,
+        "n_positions": 7,
+        "total_wallet_exposure_limit": 1.5,
+        "max_grid_levels": 10,
+        "ema_span_0": 385,
+        "ema_span_1": 620,
+        "entry_volatility_ema_span_hours": 1000
+    },
+
+    "trend": {
+        "rsi_period": 14,
+        "macd_fast": 12,
+        "macd_slow": 26,
+        "macd_signal": 9,
+        "bb_period": 20,
+        "bb_std": 2.0,
+        "ema_fast": 20,
+        "ema_slow": 50,
+        "strong_threshold": 0.6,
+        "weak_threshold": 0.25
+    },
+
+    "merger": {
+        "grid_depth_limit_in_downtrend": 2,
+        "trend_position_max_pct": 0.15,
+        "trend_entry_qty_pct": 0.03,
+        "mode_switch_strong_threshold": 0.6,
+        "mode_switch_weak_threshold": 0.3,
+        "trend_stop_loss_pct": 0.03,
+        "trend_take_profit_pct": 0.06
+    },
+
+    "risk": {
+        "max_drawdown_pct": 0.25,
+        "yellow_threshold": 0.10,
+        "orange_threshold": 0.18,
+        "red_threshold": 0.25,
+        "max_total_wallet_exposure": 3.0,
+        "max_single_exposure": 0.5,
+        "liquidation_threshold": 0.05,
+        "cooldown_after_red_minutes": 60
+    }
+}

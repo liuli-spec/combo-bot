@@ -1,0 +1,346 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+from combo_bot.types import (
+    AccountState,
+    EMAState,
+    ExchangeParams,
+    Order,
+    OrderSource,
+    Position,
+    Side,
+    TradingMode,
+    VolatilityState,
+)
+
+
+@dataclass
+class GridConfig:
+    entry_initial_ema_dist: float = 0.008
+    entry_initial_qty_pct: float = 0.012
+    entry_grid_spacing_pct: float = 0.025
+    entry_grid_spacing_volatility_weight: float = 15.0
+    entry_grid_spacing_we_weight: float = 1.0
+    entry_grid_double_down_factor: float = 1.3
+    close_grid_markup_start: float = 0.005
+    close_grid_markup_end: float = 0.015
+    close_grid_qty_pct: float = 0.5
+    close_trailing_threshold_pct: float = 0.01
+    close_trailing_retracement_pct: float = 0.004
+    wallet_exposure_limit: float = 1.0
+    n_positions: int = 7
+    total_wallet_exposure_limit: float = 1.5
+    max_grid_levels: int = 10
+    ema_span_0: float = 385.0
+    ema_span_1: float = 620.0
+    entry_volatility_ema_span_hours: float = 1000.0
+
+
+@dataclass
+class ForagerWeights:
+    volume: float = 0.23
+    volatility: float = 0.71
+    ema_readiness: float = 0.06
+
+
+def quantize_qty(qty: float, step: float) -> float:
+    if step <= 0:
+        return qty
+    return math.floor(qty / step) * step
+
+
+def quantize_price(price: float, step: float, *, round_up: bool = False) -> float:
+    if step <= 0:
+        return price
+    if round_up:
+        return math.ceil(price / step) * step
+    return math.floor(price / step) * step
+
+
+def calc_wallet_exposure(
+    balance: float,
+    position_size: float,
+    entry_price: float,
+    c_mult: float,
+) -> float:
+    if balance <= 0:
+        return 0.0
+    return abs(position_size) * entry_price * c_mult / balance
+
+
+class GridEngine:
+    def __init__(self, config: GridConfig) -> None:
+        self._cfg = config
+
+    def compute_orders(
+        self,
+        symbol: str,
+        side: Side,
+        position: Position,
+        ema_state: EMAState,
+        volatility: VolatilityState,
+        balance: float,
+        wallet_exposure: float,
+        exchange_params: ExchangeParams,
+        mode: TradingMode,
+    ) -> list[Order]:
+        orders: list[Order] = []
+
+        if mode == TradingMode.PANIC:
+            return self._panic_close(symbol, side, position)
+
+        if position.is_open and mode != TradingMode.PANIC:
+            close_orders = self._compute_close_orders(
+                symbol, side, position, exchange_params, mode,
+            )
+            orders.extend(close_orders)
+
+        if mode == TradingMode.NORMAL:
+            entry_orders = self._compute_entry_orders(
+                symbol, side, position, ema_state, volatility,
+                balance, wallet_exposure, exchange_params,
+            )
+            orders.extend(entry_orders)
+
+        return orders
+
+    def _panic_close(
+        self,
+        symbol: str,
+        side: Side,
+        position: Position,
+    ) -> list[Order]:
+        if not position.is_open:
+            return []
+        return [
+            Order(
+                symbol=symbol,
+                side=side,
+                price=0.0,
+                qty=abs(position.size),
+                source=OrderSource.RISK,
+                reduce_only=True,
+            ),
+        ]
+
+    def _compute_entry_orders(
+        self,
+        symbol: str,
+        side: Side,
+        position: Position,
+        ema_state: EMAState,
+        volatility: VolatilityState,
+        balance: float,
+        wallet_exposure: float,
+        exchange_params: ExchangeParams,
+    ) -> list[Order]:
+        cfg = self._cfg
+        ep = exchange_params
+
+        ema_band = ema_state.lower if side == Side.LONG else ema_state.upper
+        if ema_band <= 0:
+            return []
+
+        first_price = self._first_entry_price(side, ema_band)
+        first_qty = self._initial_entry_qty(balance, first_price, ep)
+
+        if first_qty < ep.min_qty:
+            return []
+
+        orders: list[Order] = []
+        cumulative_size = abs(position.size) if position.is_open else 0.0
+        price = first_price
+        qty = first_qty
+
+        for _ in range(cfg.max_grid_levels):
+            price = self._quantize_entry_price(price, ep.price_step, side)
+            qty = quantize_qty(qty, ep.qty_step)
+
+            if qty < ep.min_qty or price <= 0:
+                break
+            if qty * price * ep.c_mult < ep.min_cost:
+                break
+
+            projected_we = calc_wallet_exposure(
+                balance, cumulative_size + qty, price, ep.c_mult,
+            )
+            if projected_we > cfg.wallet_exposure_limit:
+                remaining_cost = (
+                    cfg.wallet_exposure_limit * balance
+                    - cumulative_size * price * ep.c_mult
+                )
+                capped_qty = quantize_qty(
+                    remaining_cost / (price * ep.c_mult), ep.qty_step,
+                )
+                if capped_qty >= ep.min_qty:
+                    orders.append(self._make_entry(symbol, side, price, capped_qty))
+                break
+
+            orders.append(self._make_entry(symbol, side, price, qty))
+            cumulative_size += qty
+
+            spacing = self._grid_spacing(volatility.value, wallet_exposure)
+            price = self._next_entry_price(price, spacing, side)
+            qty *= cfg.entry_grid_double_down_factor
+
+        return orders
+
+    def _compute_close_orders(
+        self,
+        symbol: str,
+        side: Side,
+        position: Position,
+        exchange_params: ExchangeParams,
+        mode: TradingMode,
+    ) -> list[Order]:
+        cfg = self._cfg
+        ep = exchange_params
+
+        markup_start = cfg.close_grid_markup_start
+        markup_end = cfg.close_grid_markup_end
+
+        if mode == TradingMode.GRACEFUL_STOP:
+            markup_start *= 0.5
+            markup_end *= 0.5
+
+        remaining = abs(position.size)
+        if remaining < ep.min_qty:
+            return []
+
+        n_levels = max(1, int(math.ceil(1.0 / cfg.close_grid_qty_pct)))
+        markup_step = (
+            (markup_end - markup_start) / max(n_levels - 1, 1)
+        )
+
+        orders: list[Order] = []
+        for i in range(n_levels):
+            markup = markup_start + markup_step * i
+            close_price = self._close_price(position.entry_price, markup, side)
+            close_price = self._quantize_close_price(close_price, ep.price_step, side)
+
+            if i < n_levels - 1:
+                qty = quantize_qty(
+                    abs(position.size) * cfg.close_grid_qty_pct, ep.qty_step,
+                )
+                qty = min(qty, remaining)
+            else:
+                qty = quantize_qty(remaining, ep.qty_step)
+
+            if qty < ep.min_qty:
+                continue
+
+            remaining -= qty
+            orders.append(
+                Order(
+                    symbol=symbol,
+                    side=side,
+                    price=close_price,
+                    qty=qty,
+                    source=OrderSource.GRID,
+                    reduce_only=True,
+                ),
+            )
+
+            if remaining < ep.min_qty:
+                break
+
+        return orders
+
+    def _first_entry_price(self, side: Side, ema_band: float) -> float:
+        dist = self._cfg.entry_initial_ema_dist
+        if side == Side.LONG:
+            return ema_band * (1.0 - dist)
+        return ema_band * (1.0 + dist)
+
+    def _initial_entry_qty(
+        self,
+        balance: float,
+        entry_price: float,
+        ep: ExchangeParams,
+    ) -> float:
+        cfg = self._cfg
+        notional = balance * cfg.wallet_exposure_limit * cfg.entry_initial_qty_pct
+        raw_qty = notional / (entry_price * ep.c_mult)
+        return max(quantize_qty(raw_qty, ep.qty_step), ep.min_qty)
+
+    def _grid_spacing(self, volatility: float, wallet_exposure: float) -> float:
+        cfg = self._cfg
+        vol_component = volatility * cfg.entry_grid_spacing_volatility_weight
+        we_component = wallet_exposure * cfg.entry_grid_spacing_we_weight
+        return cfg.entry_grid_spacing_pct * (1.0 + vol_component + we_component)
+
+    def _next_entry_price(
+        self, price: float, spacing: float, side: Side,
+    ) -> float:
+        if side == Side.LONG:
+            return price * (1.0 - spacing)
+        return price * (1.0 + spacing)
+
+    def _close_price(
+        self, entry_price: float, markup: float, side: Side,
+    ) -> float:
+        if side == Side.LONG:
+            return entry_price * (1.0 + markup)
+        return entry_price * (1.0 - markup)
+
+    @staticmethod
+    def _quantize_entry_price(
+        price: float, step: float, side: Side,
+    ) -> float:
+        # Long entries: round down to get a better fill price.
+        # Short entries: round up.
+        return quantize_price(price, step, round_up=(side == Side.SHORT))
+
+    @staticmethod
+    def _quantize_close_price(
+        price: float, step: float, side: Side,
+    ) -> float:
+        # Long closes (sells): round up for better fill.
+        # Short closes (buys): round down.
+        return quantize_price(price, step, round_up=(side == Side.LONG))
+
+    @staticmethod
+    def _make_entry(
+        symbol: str, side: Side, price: float, qty: float,
+    ) -> Order:
+        return Order(
+            symbol=symbol,
+            side=side,
+            price=price,
+            qty=qty,
+            source=OrderSource.GRID,
+            reduce_only=False,
+        )
+
+
+class ForagerScorer:
+    @staticmethod
+    def score_symbol(
+        volume_score: float,
+        volatility_score: float,
+        ema_readiness_score: float,
+        weights: ForagerWeights,
+    ) -> float:
+        return (
+            weights.volume * volume_score
+            + weights.volatility * volatility_score
+            + weights.ema_readiness * ema_readiness_score
+        )
+
+    @staticmethod
+    def select_symbols(
+        candidates: dict[str, tuple[float, float, float]],
+        n_positions: int,
+        weights: ForagerWeights,
+    ) -> list[str]:
+        scored: list[tuple[str, float]] = []
+        for symbol, (vol_score, volatility_score, ema_score) in candidates.items():
+            total = ForagerScorer.score_symbol(
+                vol_score, volatility_score, ema_score, weights,
+            )
+            scored.append((symbol, total))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [symbol for symbol, _ in scored[:n_positions]]
