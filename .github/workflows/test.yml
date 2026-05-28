@@ -63,13 +63,19 @@ jobs:
 
       - name: Rust clippy (advisory)
         working-directory: rust
+        env:
+          RUSTFLAGS: ""
         run: cargo clippy --release || true
 
       - name: Rust unit tests
         working-directory: rust
+        env:
+          RUSTFLAGS: ""
         run: cargo test --release --lib
 
       - name: Install maturin & build wheel
+        env:
+          RUSTFLAGS: ""
         run: |
           python -m pip install --upgrade pip
           pip install maturin
