@@ -188,7 +188,10 @@ pub fn run_backtest(
         if state.ema.initialized && bar_idx >= bp.ema_span_1 as usize {
             let sp = StateParams {
                 balance,
-                order_book: OrderBook { bid: close, ask: close },
+                order_book: OrderBook {
+                    bid: close,
+                    ask: close,
+                },
                 ema_bands: EMABands {
                     upper: state.ema.upper(),
                     lower: state.ema.lower(),
@@ -283,12 +286,7 @@ fn apply_fill(
         if side == 0 {
             // Close long: reduce position_long.
             let close_qty = order.qty.min(state.position_long.size);
-            pnl = calc_pnl_long(
-                state.position_long.price,
-                order.price,
-                close_qty,
-                ep.c_mult,
-            );
+            pnl = calc_pnl_long(state.position_long.price, order.price, close_qty, ep.c_mult);
             state.position_long.size -= close_qty;
             if state.position_long.size <= 0.0 {
                 state.position_long = Position::default();
@@ -384,7 +382,7 @@ mod tests {
             entry_grid_double_down_factor: 1.3,
             entry_trailing_threshold_pct: 0.01,
             entry_trailing_retracement_pct: 0.005,
-            entry_trailing_grid_ratio: -1.0,  // pure grid for test stability
+            entry_trailing_grid_ratio: -1.0, // pure grid for test stability
             close_grid_markup_start: 0.003,
             close_grid_markup_end: 0.008,
             close_grid_qty_pct: 0.6,
@@ -409,8 +407,13 @@ mod tests {
 
     fn default_ep() -> ExchangeParams {
         ExchangeParams {
-            qty_step: 0.001, price_step: 0.01, min_qty: 0.001, min_cost: 5.0,
-            c_mult: 1.0, maker_fee: 0.0002, taker_fee: 0.0005,
+            qty_step: 0.001,
+            price_step: 0.01,
+            min_qty: 0.001,
+            min_cost: 5.0,
+            c_mult: 1.0,
+            maker_fee: 0.0002,
+            taker_fee: 0.0005,
         }
     }
 

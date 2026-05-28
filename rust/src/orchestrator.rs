@@ -110,8 +110,8 @@ pub fn orchestrate(input: &OrchestratorInput) -> OrchestratorOutput {
                     input.position_long.size,
                     input.position_long.price,
                 );
-                let loss_allowance = input.state_params.balance
-                    * input.bot_params.unstuck_loss_allowance_pct;
+                let loss_allowance =
+                    input.state_params.balance * input.bot_params.unstuck_loss_allowance_pct;
                 if let Some(u) = calc_unstuck_close_long(
                     input.exchange_params,
                     input.bot_params,
@@ -180,8 +180,8 @@ pub fn orchestrate(input: &OrchestratorInput) -> OrchestratorOutput {
                     input.position_short.size,
                     input.position_short.price,
                 );
-                let loss_allowance = input.state_params.balance
-                    * input.bot_params.unstuck_loss_allowance_pct;
+                let loss_allowance =
+                    input.state_params.balance * input.bot_params.unstuck_loss_allowance_pct;
                 if let Some(u) = calc_unstuck_close_short(
                     input.exchange_params,
                     input.bot_params,
@@ -246,25 +246,45 @@ mod tests {
     fn normal_mode_produces_entries_and_closes_when_position_open() {
         let bp = default_bp();
         let ep = ExchangeParams {
-            qty_step: 0.001, price_step: 0.01, min_qty: 0.001, min_cost: 5.0,
-            c_mult: 1.0, maker_fee: 0.0002, taker_fee: 0.0005,
+            qty_step: 0.001,
+            price_step: 0.01,
+            min_qty: 0.001,
+            min_cost: 5.0,
+            c_mult: 1.0,
+            maker_fee: 0.0002,
+            taker_fee: 0.0005,
         };
         let sp = StateParams {
             balance: 10000.0,
-            order_book: OrderBook { bid: 49900.0, ask: 50000.0 },
-            ema_bands: EMABands { upper: 50500.0, lower: 49500.0 },
+            order_book: OrderBook {
+                bid: 49900.0,
+                ask: 50000.0,
+            },
+            ema_bands: EMABands {
+                upper: 50500.0,
+                lower: 49500.0,
+            },
             entry_volatility_logrange_ema_1h: 0.0,
         };
-        let pos_long = Position { size: 0.01, price: 50000.0 };
+        let pos_long = Position {
+            size: 0.01,
+            price: 50000.0,
+        };
         let pos_short = Position::default();
 
         let input = OrchestratorInput {
-            bot_params: &bp, exchange_params: &ep, state_params: &sp,
-            position_long: &pos_long, position_short: &pos_short,
+            bot_params: &bp,
+            exchange_params: &ep,
+            state_params: &sp,
+            position_long: &pos_long,
+            position_short: &pos_short,
             trailing_long: &TrailingPriceBundle::default(),
             trailing_short: &TrailingPriceBundle::default(),
-            mode_long: TradingMode::Normal, mode_short: TradingMode::Normal,
-            wel_cap_long: 1.0, wel_cap_short: 1.0, max_grid_levels: 5,
+            mode_long: TradingMode::Normal,
+            mode_short: TradingMode::Normal,
+            wel_cap_long: 1.0,
+            wel_cap_short: 1.0,
+            max_grid_levels: 5,
         };
 
         let out = orchestrate(&input);
@@ -276,30 +296,53 @@ mod tests {
     fn panic_mode_market_closes_full_position() {
         let bp = default_bp();
         let ep = ExchangeParams {
-            qty_step: 0.001, price_step: 0.01, min_qty: 0.001, min_cost: 5.0,
-            c_mult: 1.0, maker_fee: 0.0002, taker_fee: 0.0005,
+            qty_step: 0.001,
+            price_step: 0.01,
+            min_qty: 0.001,
+            min_cost: 5.0,
+            c_mult: 1.0,
+            maker_fee: 0.0002,
+            taker_fee: 0.0005,
         };
         let sp = StateParams {
             balance: 10000.0,
-            order_book: OrderBook { bid: 49900.0, ask: 50000.0 },
-            ema_bands: EMABands { upper: 50500.0, lower: 49500.0 },
+            order_book: OrderBook {
+                bid: 49900.0,
+                ask: 50000.0,
+            },
+            ema_bands: EMABands {
+                upper: 50500.0,
+                lower: 49500.0,
+            },
             entry_volatility_logrange_ema_1h: 0.0,
         };
-        let pos_long = Position { size: 0.1, price: 50000.0 };
+        let pos_long = Position {
+            size: 0.1,
+            price: 50000.0,
+        };
         let pos_short = Position::default();
 
         let input = OrchestratorInput {
-            bot_params: &bp, exchange_params: &ep, state_params: &sp,
-            position_long: &pos_long, position_short: &pos_short,
+            bot_params: &bp,
+            exchange_params: &ep,
+            state_params: &sp,
+            position_long: &pos_long,
+            position_short: &pos_short,
             trailing_long: &TrailingPriceBundle::default(),
             trailing_short: &TrailingPriceBundle::default(),
-            mode_long: TradingMode::Panic, mode_short: TradingMode::Normal,
-            wel_cap_long: 1.0, wel_cap_short: 1.0, max_grid_levels: 5,
+            mode_long: TradingMode::Panic,
+            mode_short: TradingMode::Normal,
+            wel_cap_long: 1.0,
+            wel_cap_short: 1.0,
+            max_grid_levels: 5,
         };
 
         let out = orchestrate(&input);
         assert_eq!(out.closes_long.len(), 1);
-        assert!(matches!(out.closes_long[0].order_type, OrderType::ClosePanicLong));
+        assert!(matches!(
+            out.closes_long[0].order_type,
+            OrderType::ClosePanicLong
+        ));
         assert_eq!(out.closes_long[0].qty, pos_long.size);
     }
 
@@ -307,24 +350,44 @@ mod tests {
     fn tp_only_mode_no_new_entries() {
         let bp = default_bp();
         let ep = ExchangeParams {
-            qty_step: 0.001, price_step: 0.01, min_qty: 0.001, min_cost: 5.0,
-            c_mult: 1.0, maker_fee: 0.0002, taker_fee: 0.0005,
+            qty_step: 0.001,
+            price_step: 0.01,
+            min_qty: 0.001,
+            min_cost: 5.0,
+            c_mult: 1.0,
+            maker_fee: 0.0002,
+            taker_fee: 0.0005,
         };
         let sp = StateParams {
             balance: 10000.0,
-            order_book: OrderBook { bid: 49900.0, ask: 50000.0 },
-            ema_bands: EMABands { upper: 50500.0, lower: 49500.0 },
+            order_book: OrderBook {
+                bid: 49900.0,
+                ask: 50000.0,
+            },
+            ema_bands: EMABands {
+                upper: 50500.0,
+                lower: 49500.0,
+            },
             entry_volatility_logrange_ema_1h: 0.0,
         };
-        let pos_long = Position { size: 0.01, price: 50000.0 };
+        let pos_long = Position {
+            size: 0.01,
+            price: 50000.0,
+        };
 
         let input = OrchestratorInput {
-            bot_params: &bp, exchange_params: &ep, state_params: &sp,
-            position_long: &pos_long, position_short: &Position::default(),
+            bot_params: &bp,
+            exchange_params: &ep,
+            state_params: &sp,
+            position_long: &pos_long,
+            position_short: &Position::default(),
             trailing_long: &TrailingPriceBundle::default(),
             trailing_short: &TrailingPriceBundle::default(),
-            mode_long: TradingMode::TpOnly, mode_short: TradingMode::Normal,
-            wel_cap_long: 1.0, wel_cap_short: 1.0, max_grid_levels: 5,
+            mode_long: TradingMode::TpOnly,
+            mode_short: TradingMode::Normal,
+            wel_cap_long: 1.0,
+            wel_cap_short: 1.0,
+            max_grid_levels: 5,
         };
 
         let out = orchestrate(&input);

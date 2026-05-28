@@ -17,8 +17,10 @@ pub fn wallet_exposure_limit_with_allowance(bp: &BotParams) -> f64 {
 
 #[inline]
 pub fn calc_min_entry_qty(entry_price: f64, ep: &ExchangeParams) -> f64 {
-    ep.min_qty
-        .max(round_up(cost_to_qty(ep.min_cost, entry_price, ep.c_mult), ep.qty_step))
+    ep.min_qty.max(round_up(
+        cost_to_qty(ep.min_cost, entry_price, ep.c_mult),
+        ep.qty_step,
+    ))
 }
 
 #[inline]
@@ -29,7 +31,11 @@ pub fn calc_initial_entry_qty(
     entry_price: f64,
 ) -> f64 {
     let wel = wallet_exposure_limit_with_allowance(bp);
-    let target_qty = cost_to_qty(balance * wel * bp.entry_initial_qty_pct, entry_price, ep.c_mult);
+    let target_qty = cost_to_qty(
+        balance * wel * bp.entry_initial_qty_pct,
+        entry_price,
+        ep.c_mult,
+    );
     calc_min_entry_qty(entry_price, ep).max(round_(target_qty, ep.qty_step))
 }
 
@@ -44,9 +50,8 @@ pub fn calc_reentry_qty(
 ) -> f64 {
     let effective_wel = wel_cap.min(wallet_exposure_limit_with_allowance(bp));
     let by_dd = position_size.abs() * double_down_factor;
-    let by_initial = cost_to_qty(balance, entry_price, ep.c_mult)
-        * effective_wel
-        * bp.entry_initial_qty_pct;
+    let by_initial =
+        cost_to_qty(balance, entry_price, ep.c_mult) * effective_wel * bp.entry_initial_qty_pct;
     let raw = by_dd.max(by_initial);
     calc_min_entry_qty(entry_price, ep).max(round_(raw, ep.qty_step))
 }
@@ -128,7 +133,11 @@ pub fn calc_cropped_reentry_qty(
     let qty_abs = entry_qty.abs();
 
     let cost_after = (psize_abs + qty_abs) * entry_price * ep.c_mult;
-    let we_if_filled = if balance > 0.0 { cost_after / balance } else { 0.0 };
+    let we_if_filled = if balance > 0.0 {
+        cost_after / balance
+    } else {
+        0.0
+    };
 
     let min_qty = calc_min_entry_qty(entry_price, ep);
 
@@ -188,7 +197,8 @@ pub fn calc_grid_entry_long(
         });
     }
 
-    let wallet_exposure = calc_wallet_exposure(ep.c_mult, sp.balance, position.size, position.price);
+    let wallet_exposure =
+        calc_wallet_exposure(ep.c_mult, sp.balance, position.size, position.price);
     let effective_wel = wel_cap.min(wallet_exposure_limit_with_allowance(bp));
     if wallet_exposure >= effective_wel * 0.999 {
         return None;
@@ -282,7 +292,8 @@ pub fn calc_grid_entry_short(
         });
     }
 
-    let wallet_exposure = calc_wallet_exposure(ep.c_mult, sp.balance, position.size, position.price);
+    let wallet_exposure =
+        calc_wallet_exposure(ep.c_mult, sp.balance, position.size, position.price);
     let effective_wel = wel_cap.min(wallet_exposure_limit_with_allowance(bp));
     if wallet_exposure >= effective_wel * 0.999 {
         return None;
@@ -349,7 +360,8 @@ pub fn calc_trailing_entry_long(
         return None;
     }
 
-    let wallet_exposure = calc_wallet_exposure(ep.c_mult, sp.balance, position.size, position.price);
+    let wallet_exposure =
+        calc_wallet_exposure(ep.c_mult, sp.balance, position.size, position.price);
     let effective_wel = wel_cap.min(wallet_exposure_limit_with_allowance(bp));
     if wallet_exposure >= effective_wel * 0.999 {
         return None;
@@ -421,7 +433,8 @@ pub fn calc_trailing_entry_short(
         return None;
     }
 
-    let wallet_exposure = calc_wallet_exposure(ep.c_mult, sp.balance, position.size, position.price);
+    let wallet_exposure =
+        calc_wallet_exposure(ep.c_mult, sp.balance, position.size, position.price);
     let effective_wel = wel_cap.min(wallet_exposure_limit_with_allowance(bp));
     if wallet_exposure >= effective_wel * 0.999 {
         return None;
@@ -649,8 +662,14 @@ mod tests {
     fn default_sp() -> StateParams {
         StateParams {
             balance: 10000.0,
-            order_book: OrderBook { bid: 49900.0, ask: 50000.0 },
-            ema_bands: EMABands { upper: 50500.0, lower: 49500.0 },
+            order_book: OrderBook {
+                bid: 49900.0,
+                ask: 50000.0,
+            },
+            ema_bands: EMABands {
+                upper: 50500.0,
+                lower: 49500.0,
+            },
             entry_volatility_logrange_ema_1h: 0.0,
         }
     }
@@ -658,7 +677,11 @@ mod tests {
     #[test]
     fn initial_long_entry_when_no_position() {
         let order = calc_grid_entry_long(
-            &default_ep(), &default_sp(), &default_bp(), &Position::default(), 1.0,
+            &default_ep(),
+            &default_sp(),
+            &default_bp(),
+            &Position::default(),
+            1.0,
         );
         let o = order.unwrap();
         assert!(matches!(o.order_type, OrderType::EntryInitialNormalLong));
@@ -670,7 +693,11 @@ mod tests {
     #[test]
     fn initial_short_entry_when_no_position() {
         let order = calc_grid_entry_short(
-            &default_ep(), &default_sp(), &default_bp(), &Position::default(), 1.0,
+            &default_ep(),
+            &default_sp(),
+            &default_bp(),
+            &Position::default(),
+            1.0,
         );
         let o = order.unwrap();
         assert!(matches!(o.order_type, OrderType::EntryInitialNormalShort));
@@ -682,16 +709,19 @@ mod tests {
     fn no_entry_when_wel_zero() {
         let mut bp = default_bp();
         bp.wallet_exposure_limit = 0.0;
-        let order = calc_grid_entry_long(
-            &default_ep(), &default_sp(), &bp, &Position::default(), 1.0,
-        );
+        let order =
+            calc_grid_entry_long(&default_ep(), &default_sp(), &bp, &Position::default(), 1.0);
         assert!(order.is_none());
     }
 
     #[test]
     fn grid_reentry_lower_than_position_price() {
-        let pos = Position { size: 0.01, price: 50000.0 };
-        let order = calc_grid_entry_long(&default_ep(), &default_sp(), &default_bp(), &pos, 1.0).unwrap();
+        let pos = Position {
+            size: 0.01,
+            price: 50000.0,
+        };
+        let order =
+            calc_grid_entry_long(&default_ep(), &default_sp(), &default_bp(), &pos, 1.0).unwrap();
         assert!(
             matches!(order.order_type, OrderType::EntryGridNormalLong)
                 || matches!(order.order_type, OrderType::EntryInitialNormalLong)
@@ -701,36 +731,66 @@ mod tests {
 
     #[test]
     fn no_reentry_when_at_wel_limit() {
-        let pos = Position { size: 0.2, price: 50000.0 }; // 10k notional at 10k balance = WE 1.0
+        let pos = Position {
+            size: 0.2,
+            price: 50000.0,
+        }; // 10k notional at 10k balance = WE 1.0
         let order = calc_grid_entry_long(&default_ep(), &default_sp(), &default_bp(), &pos, 1.0);
         assert!(order.is_none());
     }
 
     #[test]
     fn double_down_increases_qty() {
-        let pos = Position { size: 0.01, price: 50000.0 };
-        let qty = calc_reentry_qty(49000.0, 10000.0, pos.size, 1.5, &default_ep(), &default_bp(), 1.0);
+        let pos = Position {
+            size: 0.01,
+            price: 50000.0,
+        };
+        let qty = calc_reentry_qty(
+            49000.0,
+            10000.0,
+            pos.size,
+            1.5,
+            &default_ep(),
+            &default_bp(),
+            1.0,
+        );
         assert!(qty > pos.size);
     }
 
     #[test]
     fn multiple_entries_accumulate() {
         let orders = calc_entries_long(
-            &default_ep(), &default_sp(), &default_bp(),
-            &Position::default(), &TrailingPriceBundle::default(), 1.0, 5,
+            &default_ep(),
+            &default_sp(),
+            &default_bp(),
+            &Position::default(),
+            &TrailingPriceBundle::default(),
+            1.0,
+            5,
         );
         assert!(!orders.is_empty());
         for i in 1..orders.len() {
-            assert!(orders[i].price < orders[i - 1].price, "entries must descend");
+            assert!(
+                orders[i].price < orders[i - 1].price,
+                "entries must descend"
+            );
         }
     }
 
     #[test]
     fn trailing_entry_requires_retracement() {
-        let pos = Position { size: 0.01, price: 50000.0 };
+        let pos = Position {
+            size: 0.01,
+            price: 50000.0,
+        };
         let trailing = TrailingPriceBundle::default();
         let order = calc_trailing_entry_long(
-            &default_ep(), &default_sp(), &default_bp(), &pos, &trailing, 1.0,
+            &default_ep(),
+            &default_sp(),
+            &default_bp(),
+            &pos,
+            &trailing,
+            1.0,
         );
         assert!(order.is_none(), "no trailing without retracement data");
     }
@@ -740,17 +800,22 @@ mod tests {
         let mut bp = default_bp();
         bp.entry_trailing_threshold_pct = 0.005;
         bp.entry_trailing_retracement_pct = 0.002;
-        let pos = Position { size: 0.01, price: 50000.0 };
+        let pos = Position {
+            size: 0.01,
+            price: 50000.0,
+        };
         let trailing = TrailingPriceBundle {
             min_since_open: 49000.0,
             max_since_min: 49500.0,
             max_since_open: 50100.0,
             min_since_max: 49000.0,
         };
-        let order = calc_trailing_entry_long(
-            &default_ep(), &default_sp(), &bp, &pos, &trailing, 1.0,
-        );
+        let order =
+            calc_trailing_entry_long(&default_ep(), &default_sp(), &bp, &pos, &trailing, 1.0);
         assert!(order.is_some());
-        assert!(matches!(order.unwrap().order_type, OrderType::EntryTrailingNormalLong));
+        assert!(matches!(
+            order.unwrap().order_type,
+            OrderType::EntryTrailingNormalLong
+        ));
     }
 }

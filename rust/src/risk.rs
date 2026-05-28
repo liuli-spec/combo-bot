@@ -1,7 +1,5 @@
 use crate::types::{BotParams, ExchangeParams, Order, OrderType, Position, StateParams};
-use crate::utils::{
-    calc_pnl_long, calc_pnl_short, calc_wallet_exposure, cost_to_qty, round_up,
-};
+use crate::utils::{calc_pnl_long, calc_pnl_short, calc_wallet_exposure, cost_to_qty, round_up};
 
 use crate::entries::calc_min_entry_qty;
 
@@ -182,7 +180,12 @@ pub fn calc_unstuck_close_long(
     .max(calc_min_entry_qty(close_price, exchange_params))
     .min(psize_abs);
 
-    let projected_loss = calc_pnl_long(position.price, close_price, close_qty, exchange_params.c_mult);
+    let projected_loss = calc_pnl_long(
+        position.price,
+        close_price,
+        close_qty,
+        exchange_params.c_mult,
+    );
     if projected_loss.abs() > loss_allowance_balance {
         return None;
     }
@@ -231,7 +234,12 @@ pub fn calc_unstuck_close_short(
     .max(calc_min_entry_qty(close_price, exchange_params))
     .min(psize_abs);
 
-    let projected_loss = calc_pnl_short(position.price, close_price, close_qty, exchange_params.c_mult);
+    let projected_loss = calc_pnl_short(
+        position.price,
+        close_price,
+        close_qty,
+        exchange_params.c_mult,
+    );
     if projected_loss.abs() > loss_allowance_balance {
         return None;
     }
@@ -260,8 +268,8 @@ pub enum HardStopTier {
 pub struct HslConfig {
     pub red_threshold: f64,
     pub ema_span_minutes: f64,
-    pub yellow_ratio: f64,  // fraction of red_threshold for yellow (e.g. 0.5)
-    pub orange_ratio: f64,  // fraction of red_threshold for orange (e.g. 0.75)
+    pub yellow_ratio: f64, // fraction of red_threshold for yellow (e.g. 0.5)
+    pub orange_ratio: f64, // fraction of red_threshold for orange (e.g. 0.75)
 }
 
 #[derive(Debug, Clone)]
@@ -406,12 +414,16 @@ mod tests {
     #[test]
     fn twel_blocks_when_exceeded() {
         let positions = vec![(1.0, 50000.0)]; // 1 BTC at 50k = 50k exposure
-        assert!(!twel_allows_entry(10000.0, 1.0, &positions, 0.1, 50000.0, 3.0));
+        assert!(!twel_allows_entry(
+            10000.0, 1.0, &positions, 0.1, 50000.0, 3.0
+        ));
     }
 
     #[test]
     fn twel_allows_when_under_limit() {
         let positions = vec![(0.01, 50000.0)]; // 0.01 BTC = 500 exposure on 10k balance = 0.05 WE
-        assert!(twel_allows_entry(10000.0, 1.0, &positions, 0.01, 50000.0, 3.0));
+        assert!(twel_allows_entry(
+            10000.0, 1.0, &positions, 0.01, 50000.0, 3.0
+        ));
     }
 }

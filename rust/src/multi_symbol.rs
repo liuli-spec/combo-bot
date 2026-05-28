@@ -165,7 +165,11 @@ pub fn run_multi_symbol_backtest(
     let n_symbols = candles_per_symbol.len();
     assert!(n_symbols > 0, "must have at least one symbol");
     assert_eq!(bot_params.len(), n_symbols, "bot_params len mismatch");
-    assert_eq!(exchange_params.len(), n_symbols, "exchange_params len mismatch");
+    assert_eq!(
+        exchange_params.len(),
+        n_symbols,
+        "exchange_params len mismatch"
+    );
 
     let n_bars = candles_per_symbol[0].len();
     for c in candles_per_symbol {
@@ -278,11 +282,7 @@ pub fn run_multi_symbol_backtest(
 
         // ---- 5) Forager selection: which symbols may open NEW positions ----
         // Symbols with existing positions are always allowed to manage them.
-        let active_symbols = select_forager_symbols(
-            &symbols,
-            cfg.n_positions_max,
-            forager_weights,
-        );
+        let active_symbols = select_forager_symbols(&symbols, cfg.n_positions_max, forager_weights);
 
         // ---- 6) Recompute desired orders per symbol ----
         // First gather all positions for cross-symbol TWEL check.
@@ -387,7 +387,13 @@ pub fn run_multi_symbol_backtest(
 
     let final_positions = symbols
         .iter()
-        .map(|s| (s.symbol_idx, s.position_long.clone(), s.position_short.clone()))
+        .map(|s| {
+            (
+                s.symbol_idx,
+                s.position_long.clone(),
+                s.position_short.clone(),
+            )
+        })
         .collect();
 
     MultiSymbolResult {
@@ -594,8 +600,13 @@ mod tests {
 
     fn default_ep() -> ExchangeParams {
         ExchangeParams {
-            qty_step: 0.001, price_step: 0.01, min_qty: 0.001, min_cost: 5.0,
-            c_mult: 1.0, maker_fee: 0.0002, taker_fee: 0.0005,
+            qty_step: 0.001,
+            price_step: 0.01,
+            min_qty: 0.001,
+            min_cost: 5.0,
+            c_mult: 1.0,
+            maker_fee: 0.0002,
+            taker_fee: 0.0005,
         }
     }
 
@@ -643,8 +654,12 @@ mod tests {
         let candles_a = oscillating(3000, 50000.0, 800.0, 0.0);
         let candles_b = oscillating(3000, 3000.0, 50.0, 1.5);
         let cfg = MultiSymbolConfig {
-            starting_balance: 10000.0, funding_rate: 0.0, funding_interval_bars: 0,
-            liquidation_threshold_pct: 0.05, max_grid_levels: 5, n_positions_max: 2,
+            starting_balance: 10000.0,
+            funding_rate: 0.0,
+            funding_interval_bars: 0,
+            liquidation_threshold_pct: 0.05,
+            max_grid_levels: 5,
+            n_positions_max: 2,
         };
         let result = run_multi_symbol_backtest(
             &[candles_a, candles_b],
@@ -665,19 +680,31 @@ mod tests {
         // 5 symbols but n_positions_max = 2 — at most 2 should have positions.
         let mut all_candles = Vec::new();
         for i in 0..5 {
-            all_candles.push(oscillating(3000, 50000.0 / (i + 1) as f64, 800.0 / (i + 1) as f64, i as f64));
+            all_candles.push(oscillating(
+                3000,
+                50000.0 / (i + 1) as f64,
+                800.0 / (i + 1) as f64,
+                i as f64,
+            ));
         }
         let bps: Vec<_> = (0..5).map(|_| default_bp()).collect();
         let eps: Vec<_> = (0..5).map(|_| default_ep()).collect();
 
         let cfg = MultiSymbolConfig {
-            starting_balance: 10000.0, funding_rate: 0.0, funding_interval_bars: 0,
-            liquidation_threshold_pct: 0.05, max_grid_levels: 5, n_positions_max: 2,
+            starting_balance: 10000.0,
+            funding_rate: 0.0,
+            funding_interval_bars: 0,
+            liquidation_threshold_pct: 0.05,
+            max_grid_levels: 5,
+            n_positions_max: 2,
         };
-        let result = run_multi_symbol_backtest(&all_candles, &bps, &eps, &cfg, ForagerWeights::default());
+        let result =
+            run_multi_symbol_backtest(&all_candles, &bps, &eps, &cfg, ForagerWeights::default());
 
         // Count symbols with non-zero position at end
-        let active = result.final_positions.iter()
+        let active = result
+            .final_positions
+            .iter()
             .filter(|(_, l, s)| l.size > 0.0 || s.size < 0.0)
             .count();
         assert!(active <= 5, "active count sanity");

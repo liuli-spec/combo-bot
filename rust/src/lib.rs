@@ -172,7 +172,10 @@ fn trailing_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<TrailingPriceBundle>
     })
 }
 
-fn order_to_dict<'py>(py: Python<'py>, order: &crate::types::Order) -> PyResult<Bound<'py, PyDict>> {
+fn order_to_dict<'py>(
+    py: Python<'py>,
+    order: &crate::types::Order,
+) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("qty", order.qty)?;
     dict.set_item("price", order.price)?;
@@ -488,11 +491,11 @@ fn run_multi_symbol_backtest<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let n_symbols = candles_per_symbol.len();
     if n_symbols == 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err("no symbols provided"));
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "no symbols provided",
+        ));
     }
-    if bot_params_per_symbol.len() != n_symbols
-        || exchange_params_per_symbol.len() != n_symbols
-    {
+    if bot_params_per_symbol.len() != n_symbols || exchange_params_per_symbol.len() != n_symbols {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "candles, bot_params, exchange_params must have same length",
         ));
@@ -511,8 +514,11 @@ fn run_multi_symbol_backtest<'py>(
         let mut rows = Vec::with_capacity(n);
         for i in 0..n {
             rows.push([
-                view[[i, 0]], view[[i, 1]], view[[i, 2]],
-                view[[i, 3]], view[[i, 4]],
+                view[[i, 0]],
+                view[[i, 1]],
+                view[[i, 2]],
+                view[[i, 3]],
+                view[[i, 4]],
             ]);
         }
         candles_vec.push(rows);

@@ -42,10 +42,20 @@ pub fn calc_grid_close_long(
         return None;
     }
 
-    let close_price = round_up(position.price * (1.0 + bp.close_grid_markup_start), ep.price_step)
-        .max(round_up(sp.order_book.ask, ep.price_step));
+    let close_price = round_up(
+        position.price * (1.0 + bp.close_grid_markup_start),
+        ep.price_step,
+    )
+    .max(round_up(sp.order_book.ask, ep.price_step));
 
-    let qty = calc_close_qty(ep, bp, position, bp.close_grid_qty_pct, sp.balance, close_price);
+    let qty = calc_close_qty(
+        ep,
+        bp,
+        position,
+        bp.close_grid_qty_pct,
+        sp.balance,
+        close_price,
+    );
     if qty <= 0.0 {
         return None;
     }
@@ -67,13 +77,23 @@ pub fn calc_grid_close_short(
         return None;
     }
 
-    let close_price = round_dn(position.price * (1.0 - bp.close_grid_markup_start), ep.price_step)
-        .min(round_dn(sp.order_book.bid, ep.price_step));
+    let close_price = round_dn(
+        position.price * (1.0 - bp.close_grid_markup_start),
+        ep.price_step,
+    )
+    .min(round_dn(sp.order_book.bid, ep.price_step));
     if close_price <= 0.0 {
         return None;
     }
 
-    let qty = calc_close_qty(ep, bp, position, bp.close_grid_qty_pct, sp.balance, close_price);
+    let qty = calc_close_qty(
+        ep,
+        bp,
+        position,
+        bp.close_grid_qty_pct,
+        sp.balance,
+        close_price,
+    );
     if qty <= 0.0 {
         return None;
     }
@@ -201,8 +221,8 @@ pub fn calc_closes_long(
     let psize_abs = position.size.abs();
     let n_levels = (1.0 / bp.close_grid_qty_pct.max(0.01)).ceil() as usize;
     let mut remaining = psize_abs;
-    let markup_step = (bp.close_grid_markup_end - bp.close_grid_markup_start).max(0.0)
-        / (n_levels.max(1) as f64);
+    let markup_step =
+        (bp.close_grid_markup_end - bp.close_grid_markup_start).max(0.0) / (n_levels.max(1) as f64);
 
     for i in 0..n_levels {
         let markup = bp.close_grid_markup_start + markup_step * i as f64;
@@ -255,8 +275,8 @@ pub fn calc_closes_short(
     let psize_abs = position.size.abs();
     let n_levels = (1.0 / bp.close_grid_qty_pct.max(0.01)).ceil() as usize;
     let mut remaining = psize_abs;
-    let markup_step = (bp.close_grid_markup_end - bp.close_grid_markup_start).max(0.0)
-        / (n_levels.max(1) as f64);
+    let markup_step =
+        (bp.close_grid_markup_end - bp.close_grid_markup_start).max(0.0) / (n_levels.max(1) as f64);
 
     for i in 0..n_levels {
         let markup = bp.close_grid_markup_start + markup_step * i as f64;
@@ -347,29 +367,44 @@ mod tests {
     fn sp() -> StateParams {
         StateParams {
             balance: 10000.0,
-            order_book: OrderBook { bid: 50000.0, ask: 50100.0 },
-            ema_bands: EMABands { upper: 50500.0, lower: 49500.0 },
+            order_book: OrderBook {
+                bid: 50000.0,
+                ask: 50100.0,
+            },
+            ema_bands: EMABands {
+                upper: 50500.0,
+                lower: 49500.0,
+            },
             entry_volatility_logrange_ema_1h: 0.0,
         }
     }
 
     #[test]
     fn close_long_above_entry() {
-        let pos = Position { size: 0.1, price: 50000.0 };
+        let pos = Position {
+            size: 0.1,
+            price: 50000.0,
+        };
         let order = calc_grid_close_long(&ep(), &sp(), &bp(), &pos).unwrap();
         assert!(order.price > pos.price);
     }
 
     #[test]
     fn close_short_below_entry() {
-        let pos = Position { size: -0.1, price: 50000.0 };
+        let pos = Position {
+            size: -0.1,
+            price: 50000.0,
+        };
         let order = calc_grid_close_short(&ep(), &sp(), &bp(), &pos).unwrap();
         assert!(order.price < pos.price);
     }
 
     #[test]
     fn close_levels_distributed_across_markup_range() {
-        let pos = Position { size: 0.1, price: 50000.0 };
+        let pos = Position {
+            size: 0.1,
+            price: 50000.0,
+        };
         let orders = calc_closes_long(&ep(), &sp(), &bp(), &pos, &TrailingPriceBundle::default());
         assert!(orders.len() >= 2);
         for i in 1..orders.len() {
@@ -383,7 +418,10 @@ mod tests {
 
     #[test]
     fn close_qtys_sum_to_position() {
-        let pos = Position { size: 0.1, price: 50000.0 };
+        let pos = Position {
+            size: 0.1,
+            price: 50000.0,
+        };
         let orders = calc_closes_long(&ep(), &sp(), &bp(), &pos, &TrailingPriceBundle::default());
         let grid_total: f64 = orders
             .iter()
@@ -395,7 +433,10 @@ mod tests {
 
     #[test]
     fn trailing_close_activates_after_run_up() {
-        let pos = Position { size: 0.1, price: 50000.0 };
+        let pos = Position {
+            size: 0.1,
+            price: 50000.0,
+        };
         let trailing = TrailingPriceBundle {
             min_since_open: 49000.0,
             max_since_min: 51500.0,
@@ -407,7 +448,10 @@ mod tests {
         b.close_trailing_retracement_pct = 0.005;
         let order = calc_trailing_close_long(&ep(), &sp(), &b, &pos, &trailing);
         assert!(order.is_some());
-        assert!(matches!(order.unwrap().order_type, OrderType::CloseTrailingLong));
+        assert!(matches!(
+            order.unwrap().order_type,
+            OrderType::CloseTrailingLong
+        ));
     }
 
     #[test]
