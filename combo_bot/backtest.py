@@ -10,6 +10,10 @@ from combo_bot.grid_engine import GridConfig, GridEngine, ForagerScorer, Forager
 from combo_bot.trend_signal import TrendConfig, TrendEngine
 from combo_bot.merger import MergerConfig, DecisionMerger
 from combo_bot.risk import RiskConfig, RiskManager
+from combo_bot.strategy import DefaultStrategy, IStrategy, StrategyRunner, TradeContext
+from combo_bot.data_provider import DataProvider
+from combo_bot.regime import RegimeArbiter, RegimeArbiterConfig, read_strategy_signals
+from combo_bot.types import RegimeView, TrendRegime, TrendSignal
 
 
 @dataclass
@@ -25,18 +29,40 @@ class BacktestConfig:
     trend: TrendConfig = field(default_factory=TrendConfig)
     merger: MergerConfig = field(default_factory=MergerConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    regime: RegimeArbiterConfig = field(default_factory=RegimeArbiterConfig)
     forager_weights: ForagerWeights = field(default_factory=ForagerWeights)
     symbols: list[str] = field(default_factory=list)
 
 
 class Backtester:
-    def __init__(self, config: BacktestConfig):
+    def __init__(
+        self,
+        config: BacktestConfig,
+        strategy: IStrategy | None = None,
+        data_provider_max_rows: int = 1000,
+    ):
         self.config = config
         self.grid = GridEngine(config.grid)
         self.trend = TrendEngine(config.trend)
         self.merger = DecisionMerger(config.merger)
         self.risk = RiskManager(config.risk)
+        self.regime_arbiter = RegimeArbiter(config.regime)
         self.forager = ForagerScorer()
+        self.strategy: IStrategy = strategy or DefaultStrategy()
+        self.strategy_runner = StrategyRunner(self.strategy)
+        self.data_provider = DataProvider(max_rows=data_provider_max_rows)
+        # Skip the per-tick DataFrame construction when the strategy
+        # demonstrably doesn't consume signal columns. DefaultStrategy's
+        # populate_* are no-ops, so for the common "engine-only" case we
+        # avoid rebuilding pandas frames on every tick.
+        self._strategy_uses_dataframe = (
+            type(self.strategy).populate_entry_trend
+            is not DefaultStrategy.populate_entry_trend
+            or type(self.strategy).populate_exit_trend
+            is not DefaultStrategy.populate_exit_trend
+            or type(self.strategy).populate_indicators
+            is not DefaultStrategy.populate_indicators
+        )
 
     def run(
         self,
@@ -73,7 +99,11 @@ class Backtester:
             self._update_emas(account, candles)
             self._update_volatility(account, candles)
 
+            # Feed the rolling DataFrame view (only if the strategy reads it)
+            # alongside the trend engine.
             for s in symbols:
+                if self._strategy_uses_dataframe:
+                    self.data_provider.append(s, candles[s])
                 self.trend.update(s, candles[s].close)
 
             account.update_equity()
@@ -87,12 +117,30 @@ class Backtester:
                 ss = account.symbols[s]
                 signal = self.trend.compute(s)
                 ep = exchange_params[s]
-                price = candles[s].close
+                candle = candles[s]
+                price = candle.close
 
-                mode_long = self.merger.compute_mode(signal, Side.LONG, ss.position_long)
-                mode_short = self.merger.compute_mode(signal, Side.SHORT, ss.position_short)
-                ss.mode_long = mode_long
-                ss.mode_short = mode_short
+                # Strategy signal from DataFrame's latest row (freqtrade convention).
+                # Skip the DataFrame access entirely if the strategy doesn't write signals.
+                if self._strategy_uses_dataframe:
+                    _enter_long, _enter_short, strat_exit_long, strat_exit_short = (
+                        read_strategy_signals(self.data_provider, s)
+                    )
+                else:
+                    strat_exit_long = strat_exit_short = False
+
+                # Funding rate at this tick (used by arbiter for overlay veto).
+                fr = self._funding_rate_for(funding_rates, s, step)
+
+                # Arbiter is the single source of mode / overlay / compression truth.
+                regime_view = self.regime_arbiter.compute(
+                    signal,
+                    funding_rate=fr,
+                    strategy_exit_long=strat_exit_long,
+                    strategy_exit_short=strat_exit_short,
+                )
+                ss.mode_long = regime_view.long_mode
+                ss.mode_short = regime_view.short_mode
 
                 we_long = calc_wallet_exposure(
                     account.balance, abs(ss.position_long.size),
@@ -103,7 +151,8 @@ class Backtester:
                     symbol=s, side=Side.LONG, position=ss.position_long,
                     ema_state=ss.ema, volatility=ss.volatility,
                     balance=account.balance, wallet_exposure=we_long,
-                    exchange_params=ep, mode=mode_long,
+                    exchange_params=ep, mode=regime_view.long_mode, mark_price=price,
+                    close_markup_multiplier=regime_view.close_aggressiveness,
                 )
 
                 we_short = calc_wallet_exposure(
@@ -115,28 +164,70 @@ class Backtester:
                     symbol=s, side=Side.SHORT, position=ss.position_short,
                     ema_state=ss.ema, volatility=ss.volatility,
                     balance=account.balance, wallet_exposure=we_short,
-                    exchange_params=ep, mode=mode_short,
+                    exchange_params=ep, mode=regime_view.short_mode, mark_price=price,
+                    close_markup_multiplier=regime_view.close_aggressiveness,
                 )
 
-                grid_long = self.merger.filter_grid_orders(grid_long, signal, Side.LONG)
-                grid_short = self.merger.filter_grid_orders(grid_short, signal, Side.SHORT)
-
-                trend_entries = self.merger.generate_trend_orders(
-                    s, signal, price, account, ep
+                # Strategy-layer hooks — applied AFTER the engine proposes orders
+                # but BEFORE risk gating. The runner can veto, reprice, or
+                # resize individual orders, and can also inject a forced exit.
+                ctx_long = TradeContext(
+                    symbol=s, side=Side.LONG, position=ss.position_long,
+                    account=account, candle=candle, signal=signal,
+                    current_time_ms=ts, exchange_params=ep,
+                )
+                ctx_short = TradeContext(
+                    symbol=s, side=Side.SHORT, position=ss.position_short,
+                    account=account, candle=candle, signal=signal,
+                    current_time_ms=ts, exchange_params=ep,
+                )
+                grid_long = self.strategy_runner.filter_exits(
+                    self.strategy_runner.filter_entries(grid_long, ctx_long),
+                    ctx_long,
+                )
+                grid_short = self.strategy_runner.filter_exits(
+                    self.strategy_runner.filter_entries(grid_short, ctx_short),
+                    ctx_short,
                 )
 
+                # Trend overlay — direct emission driven by the arbiter.
+                trend_entries = self._emit_trend_overlay(
+                    s, regime_view, price, account, ep,
+                )
+
+                # Trend SL/TP only acts on the trend bucket — grid TP/SL
+                # is managed by the grid engine's close ladder.
                 trend_exits_long = self.merger.generate_trend_exit_orders(
-                    s, ss.position_long, Side.LONG, price, ep
+                    s, ss.trend_long, Side.LONG, price, ep
                 )
                 trend_exits_short = self.merger.generate_trend_exit_orders(
-                    s, ss.position_short, Side.SHORT, price, ep
+                    s, ss.trend_short, Side.SHORT, price, ep
                 )
+
+                # Strategy-triggered forced exits and position adjustments
+                # (custom_exit / custom_stoploss / adjust_trade_position).
+                strategy_orders: list[Order] = []
+                if ss.position_long.is_open:
+                    fx = self.strategy_runner.check_custom_exit(ctx_long)
+                    if fx is not None:
+                        strategy_orders.append(fx)
+                    adj = self.strategy_runner.check_position_adjustment(ctx_long)
+                    if adj is not None:
+                        strategy_orders.append(adj)
+                if ss.position_short.is_open:
+                    fx = self.strategy_runner.check_custom_exit(ctx_short)
+                    if fx is not None:
+                        strategy_orders.append(fx)
+                    adj = self.strategy_runner.check_position_adjustment(ctx_short)
+                    if adj is not None:
+                        strategy_orders.append(adj)
 
                 all_orders.extend(grid_long)
                 all_orders.extend(grid_short)
                 all_orders.extend(trend_entries)
                 all_orders.extend(trend_exits_long)
                 all_orders.extend(trend_exits_short)
+                all_orders.extend(strategy_orders)
 
             all_orders = self.risk.filter_orders(all_orders, account, ts)
 
@@ -144,10 +235,13 @@ class Backtester:
             for f in step_fills:
                 fills.append(f)
                 account.balance += f.realized_pnl - f.fee
-                if f.source == OrderSource.GRID:
-                    grid_pnl += f.realized_pnl - f.fee
-                else:
+                # GRID + RISK both touch the grid bucket; TREND touches the
+                # trend bucket. Attribute P&L by the bucket, not by who
+                # emitted the order.
+                if f.source == OrderSource.TREND:
                     trend_pnl += f.realized_pnl - f.fee
+                else:
+                    grid_pnl += f.realized_pnl - f.fee
 
             hours_elapsed = (step + 1) / 60.0
             if int(hours_elapsed / self.config.funding_interval_hours) > funding_hour_counter:
@@ -162,7 +256,17 @@ class Backtester:
 
     def _update_prices(self, account: AccountState, candles: dict[str, Candle]):
         for s, c in candles.items():
-            account.symbols[s].last_price = c.close
+            ss = account.symbols[s]
+            ss.last_price = c.close
+            # Ratchet the high-water-mark used by trailing stops across
+            # both grid and trend buckets so source-isolated trailing
+            # stops still tighten with favorable moves.
+            for pos in (ss.position_long, ss.trend_long):
+                if pos.is_open:
+                    pos.update_best_price(c.high, Side.LONG)
+            for pos in (ss.position_short, ss.trend_short):
+                if pos.is_open:
+                    pos.update_best_price(c.low, Side.SHORT)
 
     def _update_emas(self, account: AccountState, candles: dict[str, Candle]):
         for s, c in candles.items():
@@ -187,6 +291,65 @@ class Backtester:
             else:
                 ss.volatility.update(log_range)
 
+    def _funding_rate_for(
+        self,
+        funding_rates: dict[str, list[float]] | None,
+        symbol: str,
+        step: int,
+    ) -> float:
+        if funding_rates and symbol in funding_rates:
+            idx = min(step, len(funding_rates[symbol]) - 1)
+            if idx >= 0:
+                return funding_rates[symbol][idx]
+        return self.config.funding_rate_default
+
+    def _emit_trend_overlay(
+        self,
+        symbol: str,
+        regime: RegimeView,
+        price: float,
+        account: AccountState,
+        exchange: ExchangeParams,
+    ) -> list[Order]:
+        """Convert the arbiter's overlay decision into an entry order.
+
+        Sizing uses merger.trend_position_max_pct as the budget ceiling and
+        merger.trend_entry_qty_pct as the first-entry fraction, scaled by
+        the arbiter's conviction-derived qty scale. Stage 5 will replace
+        this with a TrendOverlay class that pyramids on ATR moves.
+        """
+        if regime.trend_overlay is None or regime.trend_qty_scale <= 0:
+            return []
+
+        ss = account.symbols.get(symbol)
+        if ss is not None:
+            existing = (
+                ss.trend_long if regime.trend_overlay == Side.LONG
+                else ss.trend_short
+            )
+            # Don't double up the first trend entry. Pyramiding is Stage 5+.
+            # Note: we check the trend bucket only — a co-existing grid
+            # position on the same side is fine and is the point of overlay.
+            if existing.is_open:
+                return []
+
+        merger_cfg = self.config.merger
+        budget = account.balance * merger_cfg.trend_position_max_pct
+        notional = budget * merger_cfg.trend_entry_qty_pct * regime.trend_qty_scale
+        qty = notional / max(price * exchange.c_mult, 1e-12)
+        qty = max(qty, exchange.min_qty)
+        cost = qty * price * exchange.c_mult
+        if cost > budget or cost < exchange.min_cost:
+            return []
+
+        return [Order(
+            symbol=symbol,
+            side=regime.trend_overlay,
+            price=price,
+            qty=qty,
+            source=OrderSource.TREND,
+        )]
+
     def _simulate_fills(
         self,
         orders: list[Order],
@@ -209,16 +372,27 @@ class Backtester:
             if not filled:
                 continue
 
-            fill_price = order.price
-            if order.source == OrderSource.TREND and not order.reduce_only:
+            # Market orders cross the book at close ± slippage with taker fee.
+            # Trend entries also cross aggressively (legacy behavior).
+            # Grid limits fill at their stated price with maker fee.
+            if order.is_market:
+                slip_dir = 1 if (order.side == Side.LONG and not order.reduce_only) or (order.side == Side.SHORT and order.reduce_only) else -1
+                fill_price = c.close * (1.0 + self.config.slippage_pct * slip_dir)
+                fee_rate = self.config.taker_fee
+            elif order.source == OrderSource.TREND and not order.reduce_only:
                 fill_price = c.close * (1.0 + self.config.slippage_pct * (1 if order.side == Side.LONG else -1))
-
-            fee_rate = self.config.maker_fee if order.price != c.close else self.config.taker_fee
+                fee_rate = self.config.taker_fee
+            else:
+                fill_price = order.price
+                fee_rate = self.config.maker_fee
             fee = abs(order.qty) * fill_price * ep.c_mult * fee_rate
 
             pnl = 0.0
+            # Route fills to the bucket designated by order.source so grid
+            # and trend P&L stay isolated. RISK falls back to grid for
+            # backward compat with strategy custom_exit.
+            pos = ss.bucket(order.source, order.side)
             if order.reduce_only:
-                pos = ss.position_long if order.side == Side.LONG else ss.position_short
                 if not pos.is_open:
                     continue
                 close_qty = min(abs(order.qty), abs(pos.size))
@@ -228,7 +402,6 @@ class Backtester:
                     pnl = close_qty * (pos.entry_price - fill_price) * ep.c_mult
                 self._reduce_position(pos, close_qty)
             else:
-                pos = ss.position_long if order.side == Side.LONG else ss.position_short
                 self._add_to_position(pos, order.qty, fill_price)
 
             step_fills.append(Fill(
@@ -245,6 +418,8 @@ class Backtester:
         return step_fills
 
     def _check_fill(self, order: Order, candle: Candle) -> bool:
+        if order.is_market:
+            return True
         if order.side == Side.LONG:
             if order.reduce_only:
                 return candle.high >= order.price
@@ -258,6 +433,7 @@ class Backtester:
         if not pos.is_open:
             pos.size = qty
             pos.entry_price = price
+            pos.best_price = price
         else:
             new_size = pos.size + qty
             if abs(new_size) > 1e-12:
@@ -268,6 +444,7 @@ class Backtester:
         if abs(pos.size) <= close_qty + 1e-12:
             pos.size = 0.0
             pos.entry_price = 0.0
+            pos.best_price = 0.0
         else:
             pos.size = pos.size - close_qty if pos.size > 0 else pos.size + close_qty
 
@@ -287,9 +464,13 @@ class Backtester:
                 if idx >= 0:
                     rate = funding_rates[s][idx]
 
+            # Funding hits every open bucket — perp exchanges charge the
+            # full position regardless of which strategy opened it.
             for side, pos in (
                 (Side.LONG, ss.position_long),
+                (Side.LONG, ss.trend_long),
                 (Side.SHORT, ss.position_short),
+                (Side.SHORT, ss.trend_short),
             ):
                 if pos.is_open:
                     notional = abs(pos.size) * ss.last_price

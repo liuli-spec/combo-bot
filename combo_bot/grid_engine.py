@@ -24,6 +24,10 @@ class GridConfig:
     entry_grid_spacing_volatility_weight: float = 15.0
     entry_grid_spacing_we_weight: float = 1.0
     entry_grid_double_down_factor: float = 1.3
+    # In AGGRESSIVE mode (favorable regime), the grid stacks faster: larger
+    # DDF and compressed spacing pull entries in tighter.
+    aggressive_double_down_factor: float = 1.6
+    aggressive_spacing_compression: float = 0.75
     close_grid_markup_start: float = 0.005
     close_grid_markup_end: float = 0.015
     close_grid_qty_pct: float = 0.5
@@ -85,22 +89,27 @@ class GridEngine:
         wallet_exposure: float,
         exchange_params: ExchangeParams,
         mode: TradingMode,
+        mark_price: float = 0.0,
+        close_markup_multiplier: float = 1.0,
     ) -> list[Order]:
         orders: list[Order] = []
 
         if mode == TradingMode.PANIC:
-            return self._panic_close(symbol, side, position)
+            return self._panic_close(symbol, side, position, mark_price)
 
-        if position.is_open and mode != TradingMode.PANIC:
+        if position.is_open:
             close_orders = self._compute_close_orders(
                 symbol, side, position, exchange_params, mode,
+                close_markup_multiplier,
             )
             orders.extend(close_orders)
 
-        if mode == TradingMode.NORMAL:
+        # AGGRESSIVE and NORMAL both produce new entries; AGGRESSIVE stacks
+        # faster via a larger DDF and compressed spacing.
+        if mode in (TradingMode.NORMAL, TradingMode.AGGRESSIVE):
             entry_orders = self._compute_entry_orders(
                 symbol, side, position, ema_state, volatility,
-                balance, wallet_exposure, exchange_params,
+                balance, wallet_exposure, exchange_params, mode,
             )
             orders.extend(entry_orders)
 
@@ -111,17 +120,23 @@ class GridEngine:
         symbol: str,
         side: Side,
         position: Position,
+        mark_price: float,
     ) -> list[Order]:
         if not position.is_open:
             return []
+        # Use mark_price as the limit hint; the is_market flag makes the
+        # fill simulator and live executor treat this as a taker market exit.
+        # Fallback to entry_price only if caller forgot to pass mark_price.
+        price = mark_price if mark_price > 0 else position.entry_price
         return [
             Order(
                 symbol=symbol,
                 side=side,
-                price=0.0,
+                price=price,
                 qty=abs(position.size),
                 source=OrderSource.RISK,
                 reduce_only=True,
+                is_market=True,
             ),
         ]
 
@@ -135,6 +150,7 @@ class GridEngine:
         balance: float,
         wallet_exposure: float,
         exchange_params: ExchangeParams,
+        mode: TradingMode = TradingMode.NORMAL,
     ) -> list[Order]:
         cfg = self._cfg
         ep = exchange_params
@@ -148,6 +164,15 @@ class GridEngine:
 
         if first_qty < ep.min_qty:
             return []
+
+        # AGGRESSIVE mode: larger DDF (stack faster) + compressed spacing
+        # (entries cluster closer together for quicker fills in顺势).
+        if mode == TradingMode.AGGRESSIVE:
+            ddf = cfg.aggressive_double_down_factor
+            spacing_compression = cfg.aggressive_spacing_compression
+        else:
+            ddf = cfg.entry_grid_double_down_factor
+            spacing_compression = 1.0
 
         orders: list[Order] = []
         cumulative_size = abs(position.size) if position.is_open else 0.0
@@ -181,9 +206,9 @@ class GridEngine:
             orders.append(self._make_entry(symbol, side, price, qty))
             cumulative_size += qty
 
-            spacing = self._grid_spacing(volatility.value, wallet_exposure)
+            spacing = self._grid_spacing(volatility.value, wallet_exposure) * spacing_compression
             price = self._next_entry_price(price, spacing, side)
-            qty *= cfg.entry_grid_double_down_factor
+            qty *= ddf
 
         return orders
 
@@ -194,6 +219,7 @@ class GridEngine:
         position: Position,
         exchange_params: ExchangeParams,
         mode: TradingMode,
+        close_markup_multiplier: float = 1.0,
     ) -> list[Order]:
         cfg = self._cfg
         ep = exchange_params
@@ -204,6 +230,12 @@ class GridEngine:
         if mode == TradingMode.GRACEFUL_STOP:
             markup_start *= 0.5
             markup_end *= 0.5
+
+        # Regime-driven compression on top of mode-driven adjustment.
+        # close_markup_multiplier < 1.0 → close sooner (顺势 take-profit).
+        if close_markup_multiplier != 1.0:
+            markup_start *= close_markup_multiplier
+            markup_end *= close_markup_multiplier
 
         remaining = abs(position.size)
         if remaining < ep.min_qty:

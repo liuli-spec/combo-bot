@@ -415,6 +415,8 @@ class StrategyRunner:
 
     @staticmethod
     def _make_close_order(ctx: TradeContext, price: float) -> Order:
+        # Strategy-triggered exits are taker market orders so they actually
+        # fill on the current candle rather than waiting for a limit cross.
         return Order(
             symbol=ctx.symbol,
             side=ctx.side,
@@ -422,6 +424,7 @@ class StrategyRunner:
             qty=abs(ctx.position.size),
             source=OrderSource.RISK,
             reduce_only=True,
+            is_market=True,
         )
 
 
@@ -528,7 +531,12 @@ class ExampleTrendStrategy(IStrategy):
     def custom_stoploss(
         self, ctx: TradeContext, current_profit_pct: float
     ) -> float | None:
-        """5% trailing stop, only active once the trade is in profit."""
+        """High-water-mark trailing stop, armed only after the trade is in profit.
+
+        Uses ``Position.best_price`` (updated each tick by the engine) so the
+        stop ratchets in the favorable direction and never loosens. Matches
+        freqtrade's behavior of deriving the trailing stop from ``max_rate``.
+        """
         if current_profit_pct <= 0:
             return None
 
@@ -536,9 +544,12 @@ class ExampleTrendStrategy(IStrategy):
         if not pos.is_open or pos.entry_price <= 0:
             return None
 
+        # best_price is 0 until the engine starts tracking; fall back to current price.
         if ctx.side == Side.LONG:
-            return ctx.current_price * (1.0 - self.trailing_stop_pct)
-        return ctx.current_price * (1.0 + self.trailing_stop_pct)
+            anchor = pos.best_price if pos.best_price > 0 else ctx.current_price
+            return anchor * (1.0 - self.trailing_stop_pct)
+        anchor = pos.best_price if pos.best_price > 0 else ctx.current_price
+        return anchor * (1.0 + self.trailing_stop_pct)
 
     def confirm_trade_entry(
         self,

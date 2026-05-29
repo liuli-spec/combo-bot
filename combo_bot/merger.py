@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from combo_bot.types import (
     AccountState, Order, OrderSource, Position, Side,
     TradingMode, TrendRegime, TrendSignal, ExchangeParams,
@@ -116,13 +116,22 @@ class DecisionMerger:
         entries = [o for o in grid_orders if not o.reduce_only]
         entries = self.filter_grid_orders(entries, signal, entries[0].side if entries else Side.LONG)
 
+        # In a strong adverse trend, accelerate closes by scaling qty up by 50%.
+        # Return a new list with replaced orders rather than mutating in place.
         if signal.strength > self.config.mode_switch_strong_threshold:
+            accelerated: list[Order] = []
             for o in closes:
-                if (
-                    (o.side == Side.LONG and signal.regime in (TrendRegime.STRONG_BEAR, TrendRegime.BEAR))
-                    or (o.side == Side.SHORT and signal.regime in (TrendRegime.STRONG_BULL, TrendRegime.BULL))
-                ):
-                    o.qty = min(o.qty * 1.5, abs(o.qty) * 2)
+                adverse_for_long = o.side == Side.LONG and signal.regime in (
+                    TrendRegime.STRONG_BEAR, TrendRegime.BEAR,
+                )
+                adverse_for_short = o.side == Side.SHORT and signal.regime in (
+                    TrendRegime.STRONG_BULL, TrendRegime.BULL,
+                )
+                if adverse_for_long or adverse_for_short:
+                    accelerated.append(replace(o, qty=o.qty * 1.5))
+                else:
+                    accelerated.append(o)
+            closes = accelerated
 
         return closes + entries + trend_orders
 

@@ -75,6 +75,7 @@ class RiskManager:
                     qty=abs(ss.position_long.size),
                     source=OrderSource.RISK,
                     reduce_only=True,
+                    is_market=True,
                 ))
             if ss.position_short.is_open:
                 orders.append(Order(
@@ -84,6 +85,7 @@ class RiskManager:
                     qty=abs(ss.position_short.size),
                     source=OrderSource.RISK,
                     reduce_only=True,
+                    is_market=True,
                 ))
         return orders
 

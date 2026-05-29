@@ -81,15 +81,29 @@ class TrendEngine:
 
 
 def _calc_rsi(prices: np.ndarray, period: int) -> float:
+    """Wilder's RSI — matches talib.RSI (freqtrade canonical).
+
+    Seeds avg gain/loss with a simple mean over the first `period` deltas,
+    then applies Wilder's smoothing (alpha = 1/period) for the remainder.
+    Equivalent to a recursive EMA with the Wilder convention.
+    """
     if len(prices) < period + 1:
         return np.nan
-    deltas = np.diff(prices[-(period + 1):])
+    deltas = np.diff(prices)
     gains = np.where(deltas > 0, deltas, 0.0)
     losses = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = np.mean(gains)
-    avg_loss = np.mean(losses)
+
+    avg_gain = float(np.mean(gains[:period]))
+    avg_loss = float(np.mean(losses[:period]))
+
+    inv_p = 1.0 / period
+    keep = 1.0 - inv_p
+    for i in range(period, len(deltas)):
+        avg_gain = avg_gain * keep + gains[i] * inv_p
+        avg_loss = avg_loss * keep + losses[i] * inv_p
+
     if avg_loss < 1e-12:
-        return 100.0 if avg_gain > 0 else 50.0
+        return 100.0 if avg_gain > 1e-12 else 50.0
     rs = avg_gain / avg_loss
     return 100.0 - 100.0 / (1.0 + rs)
 

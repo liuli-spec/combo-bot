@@ -11,6 +11,9 @@ class Side(str, Enum):
 
 class TradingMode(str, Enum):
     NORMAL = "normal"
+    # Favorable regime: grid stacks faster (larger DDF) and closes sooner
+    # (compressed markup). Used for the side aligned with a strong trend.
+    AGGRESSIVE = "aggressive"
     TP_ONLY = "tp_only"
     GRACEFUL_STOP = "graceful_stop"
     PANIC = "panic"
@@ -44,6 +47,10 @@ class Candle:
 class Position:
     size: float = 0.0
     entry_price: float = 0.0
+    # Most-favorable price seen since the position opened.
+    # Long: running max of mark price. Short: running min of mark price.
+    # Zero means uninitialized (treat as entry_price).
+    best_price: float = 0.0
 
     @property
     def is_open(self) -> bool:
@@ -58,6 +65,15 @@ class Position:
             return abs(self.size) * (self.entry_price - price)
         return self.size * (price - self.entry_price)
 
+    def update_best_price(self, mark_price: float, side: Side) -> None:
+        if not self.is_open or mark_price <= 0:
+            return
+        if side == Side.LONG:
+            self.best_price = max(self.best_price or self.entry_price, mark_price)
+        else:
+            current = self.best_price if self.best_price > 0 else self.entry_price
+            self.best_price = min(current, mark_price)
+
 
 @dataclass
 class Order:
@@ -67,6 +83,10 @@ class Order:
     qty: float
     source: OrderSource
     reduce_only: bool = False
+    # When True, the fill simulator treats this as a guaranteed-fill at the
+    # current candle close (taker fee). Live executor sends it as a market
+    # order. Use for forced exits (panic close, trend SL/TP hit).
+    is_market: bool = False
 
     @property
     def exchange_side(self) -> str:
@@ -94,6 +114,35 @@ class TrendSignal:
     direction: float
     strength: float
     regime: TrendRegime
+
+
+@dataclass(frozen=True)
+class RegimeView:
+    """Synthesized regime decision consumed by Backtester / LiveTrader.
+
+    Produced by :class:`combo_bot.regime.RegimeArbiter` from a TrendSignal,
+    an optional strategy signal (latest-row enter_long/enter_short), and the
+    current funding rate. Drives per-side grid mode, trend-overlay activation,
+    and close-markup compression. Frozen so it cannot be mutated mid-tick.
+    """
+
+    primary: TrendRegime
+    conviction: float
+    long_mode: TradingMode
+    short_mode: TradingMode
+    # When True, the merger may emit grid entries on the matching side.
+    # When False, only reduce-only orders pass through (TP_ONLY semantics
+    # are already encoded via long_mode/short_mode == TP_ONLY; this flag is
+    # an extra safety brake the strategy or risk layer can wire to).
+    allow_grid_long: bool = True
+    allow_grid_short: bool = True
+    # Which side, if any, the trend overlay should pyramid into.
+    trend_overlay: Side | None = None
+    # 0..N — multiplier on the base trend entry sizing.
+    trend_qty_scale: float = 0.0
+    # 1.0 = engine defaults. <1.0 = tighter close markup (close sooner).
+    close_aggressiveness: float = 1.0
+    veto_reasons: tuple[str, ...] = ()
 
 
 @dataclass
@@ -141,9 +190,21 @@ class VolatilityState:
 
 @dataclass
 class SymbolState:
+    """Per-symbol state with source-isolated position buckets.
+
+    ``position_long`` / ``position_short`` hold the GRID-engine bucket (and
+    strategy-callback / risk-driven closes route here too — historical
+    "combined" bucket). ``trend_long`` / ``trend_short`` hold the
+    trend-overlay bucket so its PnL, drawdown, and SL/TP can be reasoned
+    about in isolation from the grid. Fills are routed to the correct
+    bucket via :attr:`Order.source` by the fill simulator.
+    """
+
     symbol: str
     position_long: Position = field(default_factory=Position)
     position_short: Position = field(default_factory=Position)
+    trend_long: Position = field(default_factory=Position)
+    trend_short: Position = field(default_factory=Position)
     ema: EMAState = field(default_factory=EMAState)
     volatility: VolatilityState = field(default_factory=VolatilityState)
     mode_long: TradingMode = TradingMode.NORMAL
@@ -151,6 +212,17 @@ class SymbolState:
     trailing_min_since_open: float = 0.0
     trailing_max_since_open: float = 0.0
     last_price: float = 0.0
+
+    def bucket(self, source: "OrderSource", side: Side) -> Position:
+        """Return the position bucket targeted by an order's (source, side).
+
+        RISK is routed to the grid bucket for backward compatibility with
+        the strategy ``custom_exit`` path, which emits RISK-tagged orders
+        against the (combined → now grid) position.
+        """
+        if source == OrderSource.TREND:
+            return self.trend_long if side == Side.LONG else self.trend_short
+        return self.position_long if side == Side.LONG else self.position_short
 
 
 @dataclass
@@ -164,10 +236,11 @@ class AccountState:
 
     def total_wallet_exposure(self, side: Side) -> float:
         twe = 0.0
+        denom = max(self.balance, 1e-12)
         for ss in self.symbols.values():
-            pos = ss.position_long if side == Side.LONG else ss.position_short
-            if pos.is_open:
-                twe += abs(pos.size) * pos.entry_price / max(self.balance, 1e-12)
+            for pos in self._buckets_for_side(ss, side):
+                if pos.is_open:
+                    twe += abs(pos.size) * pos.entry_price / denom
         return twe
 
     def update_equity(self):
@@ -176,8 +249,16 @@ class AccountState:
             price = ss.last_price
             upnl += ss.position_long.unrealized_pnl(price, Side.LONG)
             upnl += ss.position_short.unrealized_pnl(price, Side.SHORT)
+            upnl += ss.trend_long.unrealized_pnl(price, Side.LONG)
+            upnl += ss.trend_short.unrealized_pnl(price, Side.SHORT)
         self.equity = self.balance + upnl
         self.equity_peak = max(self.equity_peak, self.equity)
+
+    @staticmethod
+    def _buckets_for_side(ss: "SymbolState", side: Side) -> tuple[Position, Position]:
+        if side == Side.LONG:
+            return (ss.position_long, ss.trend_long)
+        return (ss.position_short, ss.trend_short)
 
     @property
     def drawdown(self) -> float:

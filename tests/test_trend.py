@@ -24,6 +24,36 @@ class TestRSI:
         prices = np.array([1.0, 2.0])
         assert np.isnan(_calc_rsi(prices, 14))
 
+    def test_matches_pandas_wilder_smoothing(self):
+        """Wilder's RSI must agree with pandas ewm(alpha=1/period) seeded by SMA.
+
+        This is the same formula talib.RSI uses internally; matching pandas
+        here is how we keep our composite TrendEngine RSI consistent with
+        IStrategy.populate_indicators implementations that compute RSI in
+        pandas (the freqtrade convention).
+        """
+        import pandas as pd
+
+        rng = np.random.default_rng(7)
+        prices = 100.0 + np.cumsum(rng.normal(0, 0.5, 200))
+
+        period = 14
+        deltas = np.diff(prices)
+        gains = np.where(deltas > 0, deltas, 0.0)
+        losses = np.where(deltas < 0, -deltas, 0.0)
+
+        seed_gain = float(np.mean(gains[:period]))
+        seed_loss = float(np.mean(losses[:period]))
+
+        # Reference: apply Wilder's smoothing iteratively in pure pandas style.
+        gain_series = pd.Series([seed_gain] + list(gains[period:]))
+        loss_series = pd.Series([seed_loss] + list(losses[period:]))
+        ref_gain = gain_series.ewm(alpha=1.0 / period, adjust=False).mean().iloc[-1]
+        ref_loss = loss_series.ewm(alpha=1.0 / period, adjust=False).mean().iloc[-1]
+        ref_rsi = 100.0 - 100.0 / (1.0 + ref_gain / ref_loss)
+
+        assert _calc_rsi(prices, period) == pytest.approx(ref_rsi, rel=1e-10)
+
 
 class TestTrendEngine:
     def test_neutral_on_flat_data(self):
