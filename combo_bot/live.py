@@ -16,6 +16,7 @@ from combo_bot.risk import RiskConfig, RiskManager
 from combo_bot.strategy import DefaultStrategy, IStrategy, StrategyRunner, TradeContext
 from combo_bot.data_provider import DataProvider
 from combo_bot.regime import RegimeArbiter, RegimeArbiterConfig, read_strategy_signals
+from combo_bot.protections import IProtection, ProtectionManager
 from combo_bot.types import RegimeView
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,13 @@ class LiveConfig:
 
 
 class LiveTrader:
-    def __init__(self, config: LiveConfig, exchange, strategy: IStrategy | None = None):
+    def __init__(
+        self,
+        config: LiveConfig,
+        exchange,
+        strategy: IStrategy | None = None,
+        protections: list[IProtection] | None = None,
+    ):
         self.config = config
         self.exchange = exchange
         self.grid = GridEngine(config.grid)
@@ -50,6 +57,7 @@ class LiveTrader:
         self.strategy: IStrategy = strategy or DefaultStrategy()
         self.strategy_runner = StrategyRunner(self.strategy)
         self.data_provider = DataProvider(max_rows=1000)
+        self.protections = ProtectionManager(protections or [])
         self.account = AccountState()
         self.exchange_params: dict[str, ExchangeParams] = {}
         self._running = False
@@ -191,6 +199,13 @@ class LiveTrader:
             )
 
         tick_ms = int(time.time() * 1000)
+        # Stage 7 protections - drop orders for symbols/sides/sources
+        # currently locked. Live doesn't see fills directly (the
+        # exchange does), so protections.update() is a no-op here for
+        # now; protections that depend on fills require the reconcile
+        # path to surface them — TODO once we wire fill events.
+        all_desired_orders = self.protections.filter_orders(all_desired_orders, tick_ms)
+
         # Stage 5 unstuck — same call as Backtester. Wall-clock time
         # drives both the 24h loss budget and any later staleness checks.
         unstuck_orders = self.risk.compute_unstuck_orders(

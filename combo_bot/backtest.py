@@ -13,6 +13,7 @@ from combo_bot.risk import RiskConfig, RiskManager
 from combo_bot.strategy import DefaultStrategy, IStrategy, StrategyRunner, TradeContext
 from combo_bot.data_provider import DataProvider
 from combo_bot.regime import RegimeArbiter, RegimeArbiterConfig, read_strategy_signals
+from combo_bot.protections import IProtection, ProtectionManager
 from combo_bot.types import RegimeView, TrendRegime, TrendSignal
 
 
@@ -40,6 +41,7 @@ class Backtester:
         config: BacktestConfig,
         strategy: IStrategy | None = None,
         data_provider_max_rows: int = 1000,
+        protections: list[IProtection] | None = None,
     ):
         self.config = config
         self.grid = GridEngine(config.grid)
@@ -51,6 +53,10 @@ class Backtester:
         self.strategy: IStrategy = strategy or DefaultStrategy()
         self.strategy_runner = StrategyRunner(self.strategy)
         self.data_provider = DataProvider(max_rows=data_provider_max_rows)
+        # Stage 7 — pluggable freqtrade-style protection rules. Default
+        # to none so existing tests/configs see no behavior change;
+        # users opt in by passing a list of IProtection instances.
+        self.protections = ProtectionManager(protections or [])
         # Skip the per-tick DataFrame construction when the strategy
         # demonstrably doesn't consume signal columns. DefaultStrategy's
         # populate_* are no-ops, so for the common "engine-only" case we
@@ -227,6 +233,13 @@ class Backtester:
                 all_orders.extend(trend_exits_short)
                 all_orders.extend(strategy_orders)
 
+            # Stage 7: protections filter — drop new entries for any
+            # (symbol, side, source) currently locked by a protection
+            # rule. Runs before unstuck/risk so an active lock
+            # immediately stops new exposure even if risk is happy.
+            # Reduce-only orders always pass.
+            all_orders = self.protections.filter_orders(all_orders, ts)
+
             # Stage 5: passivbot-style unstuck — emit small controlled
             # reduce-only limit orders for any bucket whose wallet
             # exposure crosses the unstuck threshold. Runs alongside
@@ -251,6 +264,10 @@ class Backtester:
                 # threads through so the rolling-24h loss budget can be
                 # measured against bar time, not wall-clock.
                 account.add_realized_pnl(f.source, f.realized_pnl - f.fee, ts)
+
+            # Feed this tick's fills back into protections so the next
+            # tick sees up-to-date loss counts.
+            self.protections.update(step_fills, account, ts)
 
             hours_elapsed = (step + 1) / 60.0
             if int(hours_elapsed / self.config.funding_interval_hours) > funding_hour_counter:
