@@ -17,6 +17,8 @@ from combo_bot.strategy import DefaultStrategy, IStrategy, StrategyRunner, Trade
 from combo_bot.data_provider import DataProvider
 from combo_bot.regime import RegimeArbiter, RegimeArbiterConfig, read_strategy_signals
 from combo_bot.protections import IProtection, ProtectionManager
+from combo_bot.sizing import KellySizer
+from combo_bot.correlation import CorrelationGate
 from combo_bot.types import RegimeView
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,8 @@ class LiveTrader:
         exchange,
         strategy: IStrategy | None = None,
         protections: list[IProtection] | None = None,
+        kelly_sizer: KellySizer | None = None,
+        correlation_gate: CorrelationGate | None = None,
     ):
         self.config = config
         self.exchange = exchange
@@ -58,6 +62,13 @@ class LiveTrader:
         self.strategy_runner = StrategyRunner(self.strategy)
         self.data_provider = DataProvider(max_rows=1000)
         self.protections = ProtectionManager(protections or [])
+        # Stage 9 — optional fractional-Kelly trend overlay throttle.
+        # The reconcile path doesn't surface fills yet (TODO with the
+        # protections wiring), so on live the sizer stays cold-start
+        # at fraction 1.0 until that's hooked up.
+        self.kelly_sizer = kelly_sizer
+        # Stage 10 — optional cross-symbol correlation gate.
+        self.correlation_gate = correlation_gate
         self.account = AccountState()
         self.exchange_params: dict[str, ExchangeParams] = {}
         self._running = False
@@ -219,12 +230,27 @@ class LiveTrader:
             )
 
         tick_ms = int(time.time() * 1000)
+        # Stage 10: feed the correlation tracker once per tick from
+        # each symbol's last known close (set by _refresh_candles).
+        if self.correlation_gate is not None:
+            self.correlation_gate.update_prices(
+                (s, self.account.symbols[s].last_price)
+                for s in self.config.symbols
+                if self.account.symbols[s].last_price > 0
+            )
+
         # Stage 7 protections - drop orders for symbols/sides/sources
         # currently locked. Live doesn't see fills directly (the
         # exchange does), so protections.update() is a no-op here for
         # now; protections that depend on fills require the reconcile
         # path to surface them — TODO once we wire fill events.
         all_desired_orders = self.protections.filter_orders(all_desired_orders, tick_ms)
+
+        # Stage 10 correlation gate — runs after protections, before risk.
+        if self.correlation_gate is not None:
+            all_desired_orders = self.correlation_gate.filter_orders(
+                all_desired_orders, self.account,
+            )
 
         # Stage 5 unstuck — same call as Backtester. Wall-clock time
         # drives both the 24h loss budget and any later staleness checks.
@@ -477,8 +503,16 @@ class LiveTrader:
             if existing.is_open:
                 return []
         merger_cfg = self.config.merger
+        kelly_scale = (
+            self.kelly_sizer.fraction(OrderSource.TREND)
+            if self.kelly_sizer is not None
+            else 1.0
+        )
+        effective_scale = regime.trend_qty_scale * kelly_scale
+        if effective_scale <= 0:
+            return []
         budget = self.account.balance * merger_cfg.trend_position_max_pct
-        notional = budget * merger_cfg.trend_entry_qty_pct * regime.trend_qty_scale
+        notional = budget * merger_cfg.trend_entry_qty_pct * effective_scale
         qty = notional / max(price * exchange.c_mult, 1e-12)
         qty = max(qty, exchange.min_qty)
         cost = qty * price * exchange.c_mult

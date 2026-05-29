@@ -14,6 +14,9 @@ from combo_bot.strategy import DefaultStrategy, IStrategy, StrategyRunner, Trade
 from combo_bot.data_provider import DataProvider
 from combo_bot.regime import RegimeArbiter, RegimeArbiterConfig, read_strategy_signals
 from combo_bot.protections import IProtection, ProtectionManager
+from combo_bot.sizing import KellySizer
+from combo_bot.correlation import CorrelationGate
+from combo_bot.vol_target import VolTargetSizer
 from combo_bot.types import RegimeView, TrendRegime, TrendSignal
 
 
@@ -42,6 +45,9 @@ class Backtester:
         strategy: IStrategy | None = None,
         data_provider_max_rows: int = 1000,
         protections: list[IProtection] | None = None,
+        kelly_sizer: KellySizer | None = None,
+        correlation_gate: CorrelationGate | None = None,
+        vol_target_sizer: VolTargetSizer | None = None,
     ):
         self.config = config
         self.grid = GridEngine(config.grid)
@@ -57,6 +63,18 @@ class Backtester:
         # to none so existing tests/configs see no behavior change;
         # users opt in by passing a list of IProtection instances.
         self.protections = ProtectionManager(protections or [])
+        # Stage 9 — fractional-Kelly trend overlay sizing. None means
+        # constant baseline sizing (preserves legacy behavior); pass a
+        # KellySizer to throttle the overlay by realized edge.
+        self.kelly_sizer = kelly_sizer
+        # Stage 10 — cross-symbol correlation gate. None means no gating;
+        # pass a CorrelationGate to scale or drop new entries that
+        # would compound an already-crowded factor exposure.
+        self.correlation_gate = correlation_gate
+        # Stage 11 — portfolio-level vol-targeting sizer. None means no
+        # scaling. Each tick the sizer sees the latest equity reading
+        # and returns a multiplier applied to every new entry.
+        self.vol_target_sizer = vol_target_sizer
         # Skip the per-tick DataFrame construction when the strategy
         # demonstrably doesn't consume signal columns. DefaultStrategy's
         # populate_* are no-ops, so for the common "engine-only" case we
@@ -109,6 +127,14 @@ class Backtester:
                 if self._strategy_uses_dataframe:
                     self.data_provider.append(s, candles[s])
                 self.trend.update(s, candles[s].close)
+
+            # Stage 10: feed the correlation tracker once per tick so
+            # all pairwise correlations stay current. Cheap (one push
+            # per symbol per tick).
+            if self.correlation_gate is not None:
+                self.correlation_gate.update_prices(
+                    (s, candles[s].close) for s in symbols
+                )
 
             account.update_equity()
 
@@ -262,6 +288,24 @@ class Backtester:
             # Reduce-only orders always pass.
             all_orders = self.protections.filter_orders(all_orders, ts)
 
+            # Stage 10: correlation gate — scale or drop entries that
+            # would compound a same-factor exposure. Runs AFTER
+            # protections (so locks still pre-empt) but BEFORE unstuck/
+            # risk (so the qty seen by the rest of the pipeline is the
+            # gated size).
+            if self.correlation_gate is not None:
+                all_orders = self.correlation_gate.filter_orders(
+                    all_orders, account,
+                )
+
+            # Stage 11: portfolio-level vol-targeting. Scales all
+            # new entries by target_vol / realized_vol so the bot's
+            # ex-ante risk stays stable across regimes. Runs LAST in
+            # the sizing chain so it sees orders already throttled by
+            # Kelly and correlation.
+            if self.vol_target_sizer is not None:
+                all_orders = self.vol_target_sizer.filter_orders(all_orders)
+
             # Stage 5: passivbot-style unstuck — emit small controlled
             # reduce-only limit orders for any bucket whose wallet
             # exposure crosses the unstuck threshold. Runs alongside
@@ -290,6 +334,10 @@ class Backtester:
             # Feed this tick's fills back into protections so the next
             # tick sees up-to-date loss counts.
             self.protections.update(step_fills, account, ts)
+            # Stage 9: feed closing fills into the Kelly sizer so the
+            # next tick's overlay can use the updated edge estimate.
+            if self.kelly_sizer is not None:
+                self.kelly_sizer.record_fills(step_fills)
 
             hours_elapsed = (step + 1) / 60.0
             if int(hours_elapsed / self.config.funding_interval_hours) > funding_hour_counter:
@@ -392,8 +440,22 @@ class Backtester:
                 return []
 
         merger_cfg = self.config.merger
+        # Stage 9: fractional Kelly throttle. Multiplies the arbiter's
+        # qty scale by an edge-driven [0, 1] factor. Below min_samples
+        # the sizer returns 1.0 (cold start, no throttle). When the
+        # rolling mean edge turns negative the sizer returns 0.0 and
+        # the overlay self-suspends.
+        kelly_scale = (
+            self.kelly_sizer.fraction(OrderSource.TREND)
+            if self.kelly_sizer is not None
+            else 1.0
+        )
+        effective_scale = regime.trend_qty_scale * kelly_scale
+        if effective_scale <= 0:
+            return []
+
         budget = account.balance * merger_cfg.trend_position_max_pct
-        notional = budget * merger_cfg.trend_entry_qty_pct * regime.trend_qty_scale
+        notional = budget * merger_cfg.trend_entry_qty_pct * effective_scale
         qty = notional / max(price * exchange.c_mult, 1e-12)
         qty = max(qty, exchange.min_qty)
         cost = qty * price * exchange.c_mult
