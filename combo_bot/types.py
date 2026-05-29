@@ -178,6 +178,56 @@ class EMAState:
 
 
 @dataclass
+class TrailingState:
+    """Per-side trailing price tracker for passivbot-style re-entries.
+
+    Tracks two values across the lifetime of an open position:
+
+    * ``extreme``  — for LONG: the running minimum since position open;
+                     for SHORT: the running maximum.
+    * ``recovery`` — for LONG: the running maximum *after* the most-recent
+                     ``extreme`` was set; for SHORT: the running minimum
+                     after the most-recent extreme.
+
+    The two-stage trigger (passivbot ``calc_trailing_entry_long``):
+      1. extreme moved at least ``threshold_pct`` against the entry price;
+      2. recovery rebounded at least ``retracement_pct`` from extreme.
+
+    Both must fire before a re-entry order is placed — we want to DCA
+    *after* a bottom is in, not while still bleeding.
+    """
+
+    extreme: float = 0.0
+    recovery: float = 0.0
+    initialized: bool = False
+
+    def reset(self, price: float) -> None:
+        self.extreme = price
+        self.recovery = price
+        self.initialized = True
+
+    def update_long(self, high: float, low: float) -> None:
+        if not self.initialized:
+            return
+        if low < self.extreme:
+            self.extreme = low
+            # New low → recovery anchor resets to the same point so the
+            # rebound is measured from this new bottom.
+            self.recovery = low
+        elif high > self.recovery:
+            self.recovery = high
+
+    def update_short(self, high: float, low: float) -> None:
+        if not self.initialized:
+            return
+        if high > self.extreme:
+            self.extreme = high
+            self.recovery = high
+        elif low < self.recovery:
+            self.recovery = low
+
+
+@dataclass
 class VolatilityState:
     ema_span_hours: float = 1000.0
     value: float = 0.0
@@ -215,8 +265,10 @@ class SymbolState:
     volatility: VolatilityState = field(default_factory=VolatilityState)
     mode_long: TradingMode = TradingMode.NORMAL
     mode_short: TradingMode = TradingMode.NORMAL
-    trailing_min_since_open: float = 0.0
-    trailing_max_since_open: float = 0.0
+    # Stage 8 trailing re-entry state. Reset on each side's position
+    # open (size 0 -> non-zero), updated every tick from candle.high/low.
+    trailing_long: TrailingState = field(default_factory=TrailingState)
+    trailing_short: TrailingState = field(default_factory=TrailingState)
     last_price: float = 0.0
 
     def bucket(self, source: "OrderSource", side: Side) -> Position:
