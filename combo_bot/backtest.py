@@ -112,35 +112,53 @@ class Backtester:
         equity_log: list[tuple[int, float]] = []
 
         funding_hour_counter = 0
+        # Orders computed at tick N, filled at tick N+1 (one-bar delay
+        # eliminates look-ahead bias — matches Rust backtest semantics).
+        pending_orders: list[Order] = []
 
         for step in range(n_steps):
             candles = {s: candle_data[s][step] for s in symbols}
             ts = next(iter(candles.values())).timestamp
 
+            # ── update state with current bar ──────────────────────
             self._update_prices(account, candles)
             self._update_emas(account, candles)
             self._update_volatility(account, candles)
-
-            # Feed the rolling DataFrame view (only if the strategy reads it)
-            # alongside the trend engine.
             for s in symbols:
                 if self._strategy_uses_dataframe:
                     self.data_provider.append(s, candles[s])
                 self.trend.update(s, candles[s].close)
-
-            # Stage 10: feed the correlation tracker once per tick so
-            # all pairwise correlations stay current. Cheap (one push
-            # per symbol per tick).
             if self.correlation_gate is not None:
                 self.correlation_gate.update_prices(
                     (s, candles[s].close) for s in symbols
                 )
 
+            # ── fill pending orders from PREVIOUS tick ─────────────
+            step_fills = self._simulate_fills(
+                pending_orders, candles, account, exchange_params, ts,
+            )
+            for f in step_fills:
+                fills.append(f)
+                account.balance += f.realized_pnl - f.fee
+                account.add_realized_pnl(f.source, f.realized_pnl - f.fee, ts)
+            self.protections.update(step_fills, account, ts)
+            if self.kelly_sizer is not None:
+                self.kelly_sizer.record_fills(step_fills)
+
+            # ── funding ───────────────────────────────────────────
+            hours_elapsed = (step + 1) / 60.0
+            if int(hours_elapsed / self.config.funding_interval_hours) > funding_hour_counter:
+                funding_hour_counter = int(hours_elapsed / self.config.funding_interval_hours)
+                fc = self._apply_funding(account, funding_rates, step, symbols)
+                account.funding_cumsum += fc
+
             account.update_equity()
+            equity_log.append((ts, account.equity))
 
             if self.risk.check_liquidation(account):
                 break
 
+            # ── compute orders for NEXT tick ──────────────────────
             all_orders: list[Order] = []
 
             for s in symbols:
@@ -150,19 +168,13 @@ class Backtester:
                 candle = candles[s]
                 price = candle.close
 
-                # Strategy signal from DataFrame's latest row (freqtrade convention).
-                # Skip the DataFrame access entirely if the strategy doesn't write signals.
                 if self._strategy_uses_dataframe:
                     _enter_long, _enter_short, strat_exit_long, strat_exit_short = (
                         read_strategy_signals(self.data_provider, s)
                     )
                 else:
                     strat_exit_long = strat_exit_short = False
-
-                # Funding rate at this tick (used by arbiter for overlay veto).
                 fr = self._funding_rate_for(funding_rates, s, step)
-
-                # Arbiter is the single source of mode / overlay / compression truth.
                 regime_view = self.regime_arbiter.compute(
                     signal,
                     funding_rate=fr,
@@ -176,7 +188,6 @@ class Backtester:
                     account.balance, abs(ss.position_long.size),
                     ss.position_long.entry_price, ep.c_mult
                 ) if ss.position_long.is_open else 0.0
-
                 grid_long = self.grid.compute_orders(
                     symbol=s, side=Side.LONG, position=ss.position_long,
                     ema_state=ss.ema, volatility=ss.volatility,
@@ -184,12 +195,10 @@ class Backtester:
                     exchange_params=ep, mode=regime_view.long_mode, mark_price=price,
                     close_markup_multiplier=regime_view.close_aggressiveness,
                 )
-
                 we_short = calc_wallet_exposure(
                     account.balance, abs(ss.position_short.size),
                     ss.position_short.entry_price, ep.c_mult
                 ) if ss.position_short.is_open else 0.0
-
                 grid_short = self.grid.compute_orders(
                     symbol=s, side=Side.SHORT, position=ss.position_short,
                     ema_state=ss.ema, volatility=ss.volatility,
@@ -197,33 +206,17 @@ class Backtester:
                     exchange_params=ep, mode=regime_view.short_mode, mark_price=price,
                     close_markup_multiplier=regime_view.close_aggressiveness,
                 )
-
-                # Strategy-layer hooks — applied AFTER the engine proposes orders
-                # but BEFORE risk gating. The runner can veto, reprice, or
-                # resize individual orders, and can also inject a forced exit.
                 ctx_long = TradeContext(
                     symbol=s, side=Side.LONG, position=ss.position_long,
                     account=account, candle=candle, signal=signal,
                     current_time_ms=ts, exchange_params=ep,
                 )
+                trailing_entries: list[Order] = []
                 ctx_short = TradeContext(
                     symbol=s, side=Side.SHORT, position=ss.position_short,
                     account=account, candle=candle, signal=signal,
                     current_time_ms=ts, exchange_params=ep,
                 )
-                grid_long = self.strategy_runner.filter_exits(
-                    self.strategy_runner.filter_entries(grid_long, ctx_long),
-                    ctx_long,
-                )
-                grid_short = self.strategy_runner.filter_exits(
-                    self.strategy_runner.filter_entries(grid_short, ctx_short),
-                    ctx_short,
-                )
-
-                # Stage 8 trailing re-entries (passivbot-style two-stage
-                # trigger). No-op when entry_trailing_threshold_pct or
-                # retracement_pct is 0 — config opts in.
-                trailing_entries: list[Order] = []
                 trail_long = self.grid.compute_trailing_entry(
                     s, Side.LONG, ss.position_long, ss.trailing_long,
                     account.balance, we_long, ep, price, regime_view.long_mode,
@@ -240,28 +233,34 @@ class Backtester:
                     trailing_entries.extend(
                         self.strategy_runner.filter_entries([trail_short], ctx_short)
                     )
+                grid_long = self.strategy_runner.filter_exits(
+                    self.strategy_runner.filter_entries(grid_long, ctx_long),
+                    ctx_long,
+                )
+                grid_short = self.strategy_runner.filter_exits(
+                    self.strategy_runner.filter_entries(grid_short, ctx_short),
+                    ctx_short,
+                )
 
-                # Trend overlay — direct emission driven by the arbiter.
                 trend_entries = self._emit_trend_overlay(
                     s, regime_view, price, account, ep,
                 )
-
-                # Trend SL/TP only acts on the trend bucket — grid TP/SL
-                # is managed by the grid engine's close ladder.
                 trend_exits_long = self.merger.generate_trend_exit_orders(
-                    s, ss.trend_long, Side.LONG, price, ep
+                    s, ss.trend_long, Side.LONG, price, ep,
                 )
                 trend_exits_short = self.merger.generate_trend_exit_orders(
-                    s, ss.trend_short, Side.SHORT, price, ep
+                    s, ss.trend_short, Side.SHORT, price, ep,
                 )
 
-                # Strategy-triggered forced exits and position adjustments
-                # (custom_exit / custom_stoploss / adjust_trade_position).
                 strategy_orders: list[Order] = []
                 if ss.position_long.is_open:
                     fx = self.strategy_runner.check_custom_exit(ctx_long)
                     if fx is not None:
                         strategy_orders.append(fx)
+                    # Strategy runner used the ctx position (the *grid* bucket)
+                    # but the risk layer will route the fill to the correct
+                    # bucket downstream — the ctx carries the same side, so
+                    # SymbolState.bucket() resolves it correctly.
                     adj = self.strategy_runner.check_position_adjustment(ctx_long)
                     if adj is not None:
                         strategy_orders.append(adj)
@@ -281,72 +280,22 @@ class Backtester:
                 all_orders.extend(trend_exits_short)
                 all_orders.extend(strategy_orders)
 
-            # Stage 7: protections filter — drop new entries for any
-            # (symbol, side, source) currently locked by a protection
-            # rule. Runs before unstuck/risk so an active lock
-            # immediately stops new exposure even if risk is happy.
-            # Reduce-only orders always pass.
             all_orders = self.protections.filter_orders(all_orders, ts)
-
-            # Stage 10: correlation gate — scale or drop entries that
-            # would compound a same-factor exposure. Runs AFTER
-            # protections (so locks still pre-empt) but BEFORE unstuck/
-            # risk (so the qty seen by the rest of the pipeline is the
-            # gated size).
             if self.correlation_gate is not None:
                 all_orders = self.correlation_gate.filter_orders(
                     all_orders, account,
                 )
-
-            # Stage 11: portfolio-level vol-targeting. Scales all
-            # new entries by target_vol / realized_vol so the bot's
-            # ex-ante risk stays stable across regimes. Runs LAST in
-            # the sizing chain so it sees orders already throttled by
-            # Kelly and correlation.
             if self.vol_target_sizer is not None:
                 all_orders = self.vol_target_sizer.filter_orders(all_orders)
-
-            # Stage 5: passivbot-style unstuck — emit small controlled
-            # reduce-only limit orders for any bucket whose wallet
-            # exposure crosses the unstuck threshold. Runs alongside
-            # (not instead of) the regular close ladder; the fill
-            # simulator deduplicates by limit price.
             unstuck_orders = self.risk.compute_unstuck_orders(
                 account,
                 grid_wallet_exposure_limit=self.config.grid.wallet_exposure_limit,
                 now_ms=ts,
             )
             all_orders.extend(unstuck_orders)
-
             all_orders = self.risk.filter_orders(all_orders, account, ts)
 
-            step_fills = self._simulate_fills(all_orders, candles, account, exchange_params, ts)
-            for f in step_fills:
-                fills.append(f)
-                account.balance += f.realized_pnl - f.fee
-                # Route P&L into the bucket the fill operated on. RISK
-                # source routes to the grid bucket (matches the
-                # fill-routing rule in SymbolState.bucket). Timestamp
-                # threads through so the rolling-24h loss budget can be
-                # measured against bar time, not wall-clock.
-                account.add_realized_pnl(f.source, f.realized_pnl - f.fee, ts)
-
-            # Feed this tick's fills back into protections so the next
-            # tick sees up-to-date loss counts.
-            self.protections.update(step_fills, account, ts)
-            # Stage 9: feed closing fills into the Kelly sizer so the
-            # next tick's overlay can use the updated edge estimate.
-            if self.kelly_sizer is not None:
-                self.kelly_sizer.record_fills(step_fills)
-
-            hours_elapsed = (step + 1) / 60.0
-            if int(hours_elapsed / self.config.funding_interval_hours) > funding_hour_counter:
-                funding_hour_counter = int(hours_elapsed / self.config.funding_interval_hours)
-                fc = self._apply_funding(account, funding_rates, step, symbols)
-                account.funding_cumsum += fc
-
-            account.update_equity()
-            equity_log.append((ts, account.equity))
+            pending_orders = all_orders
 
         return self._compile_result(
             fills, equity_log, account,

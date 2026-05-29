@@ -253,7 +253,11 @@ class TestBacktesterIntegration:
         from combo_bot.grid_engine import GridConfig
         from tests.conftest import make_candles
 
-        candles = make_candles([50_000 + i * 50 for i in range(400)])
+        # Use a longer oscillating series so the one-bar fill delay
+        # (look-ahead fix) still allows grid entries to fill when
+        # price dips toward the EMA band.
+        from tests.conftest import make_oscillating_candles
+        candles = make_oscillating_candles(n=2000, base=50_000, amplitude=500)
         cfg = BacktestConfig(
             starting_balance=10_000, symbols=["BTC"],
             grid=GridConfig(
@@ -267,5 +271,6 @@ class TestBacktesterIntegration:
         )
         sizer = KellySizer()
         Backtester(cfg, kelly_sizer=sizer).run({"BTC": candles})
-        # Grid TPs should have populated the grid bucket.
+        # With enough oscillations the grid engine should fill
+        # entries and take-profits that land in the sizer.
         assert sizer.sample_size(OrderSource.GRID) > 0
