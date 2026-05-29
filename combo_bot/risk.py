@@ -65,28 +65,32 @@ class RiskManager:
         return self._enforce_exposure_limits(orders, account)
 
     def _panic_close_all(self, account: AccountState) -> list[Order]:
-        orders = []
+        """Emit one reduce-only market order per open bucket.
+
+        The fill simulator routes by ``Order.source``, so emitting GRID for
+        the grid bucket and TREND for the trend bucket keeps panic closes
+        source-isolated. We lose the "RISK" tag in fills, but P&L
+        attribution stays correct (each bucket settles into its own
+        running total).
+        """
+        orders: list[Order] = []
         for symbol, ss in account.symbols.items():
-            if ss.position_long.is_open:
-                orders.append(Order(
-                    symbol=symbol,
-                    side=Side.LONG,
-                    price=ss.last_price,
-                    qty=abs(ss.position_long.size),
-                    source=OrderSource.RISK,
-                    reduce_only=True,
-                    is_market=True,
-                ))
-            if ss.position_short.is_open:
-                orders.append(Order(
-                    symbol=symbol,
-                    side=Side.SHORT,
-                    price=ss.last_price,
-                    qty=abs(ss.position_short.size),
-                    source=OrderSource.RISK,
-                    reduce_only=True,
-                    is_market=True,
-                ))
+            for side, source, pos in (
+                (Side.LONG, OrderSource.GRID, ss.position_long),
+                (Side.LONG, OrderSource.TREND, ss.trend_long),
+                (Side.SHORT, OrderSource.GRID, ss.position_short),
+                (Side.SHORT, OrderSource.TREND, ss.trend_short),
+            ):
+                if pos.is_open:
+                    orders.append(Order(
+                        symbol=symbol,
+                        side=side,
+                        price=ss.last_price,
+                        qty=abs(pos.size),
+                        source=source,
+                        reduce_only=True,
+                        is_market=True,
+                    ))
         return orders
 
     def _limit_new_entries(
@@ -127,9 +131,19 @@ class RiskManager:
 
             ss = account.symbols.get(o.symbol)
             if ss:
-                pos = ss.position_long if o.side == Side.LONG else ss.position_short
-                current_we = abs(pos.size) * pos.entry_price / max(account.balance, 1e-12) if pos.is_open else 0.0
-                if current_we + cost / max(account.balance, 1e-12) > self.config.max_single_exposure:
+                # Single-symbol exposure must sum grid + trend buckets —
+                # otherwise the trend overlay sneaks past the per-symbol
+                # cap by living in a separate bucket.
+                if o.side == Side.LONG:
+                    buckets = (ss.position_long, ss.trend_long)
+                else:
+                    buckets = (ss.position_short, ss.trend_short)
+                denom = max(account.balance, 1e-12)
+                current_we = sum(
+                    abs(p.size) * p.entry_price / denom
+                    for p in buckets if p.is_open
+                )
+                if current_we + cost / denom > self.config.max_single_exposure:
                     continue
 
             filtered.append(o)

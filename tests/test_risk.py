@@ -58,12 +58,14 @@ class TestOrderFiltering:
         acc = AccountState(balance=10000, equity=7000, equity_peak=10000)
         acc.symbols["BTC"] = SymbolState("BTC", last_price=50000)
         acc.symbols["BTC"].position_long = Position(0.1, 50000)
+        acc.symbols["BTC"].trend_short = Position(0.2, 50000)
         orders = [
             Order("BTC", Side.LONG, 49000, 0.01, OrderSource.GRID),
         ]
         filtered = risk.filter_orders(orders, acc)
         assert all(o.reduce_only for o in filtered)
-        assert any(o.source == OrderSource.RISK for o in filtered)
+        assert all(o.is_market for o in filtered)
+        assert {o.source for o in filtered} == {OrderSource.GRID, OrderSource.TREND}
 
     def test_yellow_scales_entries(self, risk):
         acc = AccountState(balance=10000, equity=8800, equity_peak=10000)
@@ -81,6 +83,17 @@ class TestOrderFiltering:
         acc.symbols["BTC"].position_long = Position(0.5, 50000)
         orders = [
             Order("BTC", Side.LONG, 49000, 0.2, OrderSource.GRID),
+        ]
+        filtered = risk.filter_orders(orders, acc)
+        entries = [o for o in filtered if not o.reduce_only]
+        assert len(entries) == 0
+
+    def test_single_exposure_limit_counts_trend_bucket(self, risk):
+        acc = AccountState(balance=10000, equity=10000, equity_peak=10000)
+        acc.symbols["BTC"] = SymbolState("BTC", last_price=50000)
+        acc.symbols["BTC"].trend_long = Position(0.1, 50000)
+        orders = [
+            Order("BTC", Side.LONG, 50000, 0.001, OrderSource.GRID),
         ]
         filtered = risk.filter_orders(orders, acc)
         entries = [o for o in filtered if not o.reduce_only]

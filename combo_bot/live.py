@@ -168,8 +168,8 @@ class LiveTrader:
             )
 
             trend_entries = self._emit_trend_overlay(symbol, regime_view, price, ep)
-            trend_exits_l = self.merger.generate_trend_exit_orders(symbol, ss.position_long, Side.LONG, price, ep)
-            trend_exits_s = self.merger.generate_trend_exit_orders(symbol, ss.position_short, Side.SHORT, price, ep)
+            trend_exits_l = self.merger.generate_trend_exit_orders(symbol, ss.trend_long, Side.LONG, price, ep)
+            trend_exits_s = self.merger.generate_trend_exit_orders(symbol, ss.trend_short, Side.SHORT, price, ep)
 
             strategy_orders: list[Order] = []
             for ctx, pos in ((ctx_long, ss.position_long), (ctx_short, ss.position_short)):
@@ -217,10 +217,20 @@ class LiveTrader:
                 side = p.get("side", "")
                 size = abs(float(p.get("contracts", 0) or 0))
                 entry = float(p.get("entryPrice", 0) or 0)
+                # Limitation: the exchange reports a single aggregate
+                # position per side, so we attribute the delta between the
+                # reported total and our tracked trend bucket to the grid
+                # bucket. This means on a cold start the entire position
+                # goes into the grid bucket — trend bookkeeping is rebuilt
+                # only by subsequent overlay entries.
                 if side == "long":
-                    ss.position_long = Position(size=size, entry_price=entry)
+                    tracked_trend = abs(ss.trend_long.size)
+                    grid_size = max(size - tracked_trend, 0.0)
+                    ss.position_long = Position(size=grid_size, entry_price=entry)
                 elif side == "short":
-                    ss.position_short = Position(size=size, entry_price=entry)
+                    tracked_trend = abs(ss.trend_short.size)
+                    grid_size = max(size - tracked_trend, 0.0)
+                    ss.position_short = Position(size=grid_size, entry_price=entry)
                 ss.last_price = float(p.get("markPrice", 0) or ss.last_price)
         except Exception:
             logger.exception("Failed to refresh account")
@@ -245,11 +255,14 @@ class LiveTrader:
                     last = ohlcv[-1]
                     ss = self.account.symbols[symbol]
                     ss.last_price = float(last[4])
-                    # Ratchet trailing-stop high-water-marks for any open position.
-                    if ss.position_long.is_open:
-                        ss.position_long.update_best_price(float(last[2]), Side.LONG)
-                    if ss.position_short.is_open:
-                        ss.position_short.update_best_price(float(last[3]), Side.SHORT)
+                    # Ratchet trailing-stop high-water-marks across grid
+                    # and trend buckets.
+                    for pos in (ss.position_long, ss.trend_long):
+                        if pos.is_open:
+                            pos.update_best_price(float(last[2]), Side.LONG)
+                    for pos in (ss.position_short, ss.trend_short):
+                        if pos.is_open:
+                            pos.update_best_price(float(last[3]), Side.SHORT)
                     # Feed the strategy's rolling DataFrame view.
                     self.data_provider.append(
                         symbol,
@@ -394,8 +407,8 @@ class LiveTrader:
         ss = self.account.symbols.get(symbol)
         if ss is not None:
             existing = (
-                ss.position_long if regime.trend_overlay == Side.LONG
-                else ss.position_short
+                ss.trend_long if regime.trend_overlay == Side.LONG
+                else ss.trend_short
             )
             if existing.is_open:
                 return []
