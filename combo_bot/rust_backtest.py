@@ -21,9 +21,17 @@ except ImportError:
 class RustBacktestConfig:
     starting_balance: float = 10000.0
     funding_rate: float = 0.0001
+    # Funding fires every N bars. Default assumes 1-minute bars
+    # (480 = 8h funding). For 1h bars set to 8, etc. Must match the
+    # bar cadence of the candles passed to ``run_rust_backtest``.
     funding_interval_bars: int = 480
     liquidation_threshold_pct: float = 0.05
     max_grid_levels: int = 5
+    # Bar cadence for Sharpe/Sortino annualization. 1m → 525600 periods
+    # per year; 1h → 8760; daily → 365. Defaults to 1m to preserve
+    # legacy behaviour. Mis-setting this only mis-scales the reported
+    # ratios — the actual P&L is unaffected.
+    bar_interval_minutes: float = 1.0
 
 
 @dataclass
@@ -36,6 +44,11 @@ class RustBacktestResult:
     liquidation_bar: int | None
     equity_curve: np.ndarray
     fills: list[dict]
+    # Periods per year used for Sharpe / Sortino annualization. Default
+    # 525600 = minutes per year (1m bars); 8760 = hourly; 365 = daily.
+    # Populated by ``run_rust_backtest`` from ``RustBacktestConfig
+    # .bar_interval_minutes``.
+    periods_per_year: float = 525_600.0
 
     @property
     def total_return(self) -> float:
@@ -51,7 +64,7 @@ class RustBacktestResult:
         std = float(np.std(returns))
         if std < 1e-12:
             return 0.0
-        return float(np.mean(returns) / std * np.sqrt(525600))
+        return float(np.mean(returns) / std * np.sqrt(self.periods_per_year))
 
     @property
     def sortino_ratio(self) -> float:
@@ -64,7 +77,7 @@ class RustBacktestResult:
         ds_std = float(np.std(downside))
         if ds_std < 1e-12:
             return 0.0
-        return float(np.mean(returns) / ds_std * np.sqrt(525600))
+        return float(np.mean(returns) / ds_std * np.sqrt(self.periods_per_year))
 
     @property
     def calmar_ratio(self) -> float:
@@ -149,6 +162,9 @@ def run_rust_backtest(
         max_grid_levels=cfg.max_grid_levels,
     )
 
+    # Convert bar cadence to "periods per year" for Sharpe/Sortino
+    # annualization. minutes_per_year / bar_minutes = bars_per_year.
+    periods_per_year = max(1.0, 525_600.0 / max(cfg.bar_interval_minutes, 1e-9))
     return RustBacktestResult(
         final_balance=float(raw["final_balance"]),
         final_equity=float(raw["final_equity"]),
@@ -158,6 +174,7 @@ def run_rust_backtest(
         liquidation_bar=raw["liquidation_bar"],
         equity_curve=np.asarray(raw["equity_curve"], dtype=np.float64),
         fills=list(raw["fills"]),
+        periods_per_year=periods_per_year,
     )
 
 

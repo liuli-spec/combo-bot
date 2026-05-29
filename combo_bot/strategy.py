@@ -332,7 +332,19 @@ class StrategyRunner:
     def check_position_adjustment(
         self, context: TradeContext
     ) -> Order | None:
-        """Call ``adjust_trade_position`` and turn its result into an order."""
+        """Call ``adjust_trade_position`` and turn its result into an order.
+
+        The emitted order targets the GRID bucket. ``ctx.position`` in
+        every current caller is the grid-bucket position
+        (``ss.position_long`` / ``ss.position_short``), and freqtrade's
+        ``adjust_trade_position`` is meant to manage the position the
+        strategy is reasoning about. Emitting ``OrderSource.GRID``
+        ensures ``SymbolState.bucket()`` routes the fill to the same
+        bucket whose state the strategy just inspected — a previous
+        hard-coded ``TREND`` source silently no-op'd here because it
+        targeted an empty trend bucket whenever the strategy was
+        managing the grid position.
+        """
         if not context.position.is_open:
             return None
 
@@ -353,7 +365,7 @@ class StrategyRunner:
             side=context.side,
             price=context.current_price,
             qty=abs(delta_qty),
-            source=OrderSource.TREND,
+            source=OrderSource.GRID,
             reduce_only=reduce_only,
         )
 

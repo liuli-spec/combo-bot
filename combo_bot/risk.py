@@ -1,10 +1,11 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from combo_bot.types import (
     AccountState, EMAState, Order, OrderSource, Side,
     SymbolState, ExchangeParams,
 )
+from combo_bot.grid_engine import quantize_qty
 
 
 class RiskTier(str, Enum):
@@ -173,7 +174,13 @@ class RiskManager:
         orders = self._apply_source_pause(orders, account)
 
         if tier == RiskTier.YELLOW:
-            return self._limit_new_entries(orders, account, scale=0.5)
+            # YELLOW: scale entries by 0.5, then STILL enforce the hard
+            # exposure caps. Without the second pass, 0.5 × N orders
+            # could collectively still breach max_total_wallet_exposure
+            # (each individual order halved, but cumulative projection
+            # over N orders is unbounded). The exposure-limit pass also
+            # accumulates same-tick projection (see _enforce_exposure_limits).
+            orders = self._limit_new_entries(orders, account, scale=0.5)
 
         return self._enforce_exposure_limits(orders, account)
 
@@ -242,6 +249,7 @@ class RiskManager:
         account: AccountState,
         grid_wallet_exposure_limit: float,
         now_ms: int,
+        exchange_params: dict[str, ExchangeParams] | None = None,
     ) -> list[Order]:
         """Per-bucket controlled exposure shedding.
 
@@ -259,6 +267,13 @@ class RiskManager:
             The GridConfig.wallet_exposure_limit — passed in because the
             risk layer doesn't own GridConfig. The trend bucket uses
             ``self.config.trend_wallet_exposure_limit`` instead.
+        exchange_params
+            Per-symbol exchange constraints. When provided, the
+            allowance-scaled close qty is quantized to qty_step and
+            validated against min_qty / min_cost — without this the
+            unstuck path can emit sub-step / sub-min orders that the
+            live executor would silently reject, creating
+            backtest/live divergence.
         """
         if self.config.unstuck_threshold < 0 or self.config.unstuck_close_pct <= 0:
             return []
@@ -274,25 +289,26 @@ class RiskManager:
 
         orders: list[Order] = []
         for symbol, ss in account.symbols.items():
+            ep = exchange_params.get(symbol) if exchange_params else None
             orders.extend(self._unstuck_for_bucket(
                 symbol, ss, Side.LONG, OrderSource.GRID,
                 ss.position_long, grid_wallet_exposure_limit,
-                balance, allowance_budget - grid_loss_spent,
+                balance, allowance_budget - grid_loss_spent, ep,
             ))
             orders.extend(self._unstuck_for_bucket(
                 symbol, ss, Side.SHORT, OrderSource.GRID,
                 ss.position_short, grid_wallet_exposure_limit,
-                balance, allowance_budget - grid_loss_spent,
+                balance, allowance_budget - grid_loss_spent, ep,
             ))
             orders.extend(self._unstuck_for_bucket(
                 symbol, ss, Side.LONG, OrderSource.TREND,
                 ss.trend_long, self.config.trend_wallet_exposure_limit,
-                balance, allowance_budget - trend_loss_spent,
+                balance, allowance_budget - trend_loss_spent, ep,
             ))
             orders.extend(self._unstuck_for_bucket(
                 symbol, ss, Side.SHORT, OrderSource.TREND,
                 ss.trend_short, self.config.trend_wallet_exposure_limit,
-                balance, allowance_budget - trend_loss_spent,
+                balance, allowance_budget - trend_loss_spent, ep,
             ))
         return orders
 
@@ -306,6 +322,7 @@ class RiskManager:
         wallet_exposure_limit: float,
         balance: float,
         allowance_remaining: float,
+        ep: ExchangeParams | None = None,
     ) -> list[Order]:
         if not pos.is_open or wallet_exposure_limit <= 0:
             return []
@@ -344,6 +361,44 @@ class RiskManager:
         if close_qty <= 0:
             return []
 
+        # Project the realized P&L this unstuck would book if it filled
+        # at order_price. If that's a LOSS, cap close_qty so the loss
+        # doesn't exceed ``allowance_remaining`` (the 24h budget left
+        # over for this bucket). The pre-fix gate only checked whether
+        # allowance > 0 — once you crossed the threshold, qty was a
+        # fixed % regardless of how big the projected loss was vs the
+        # remaining budget. That made the 24h budget a step function
+        # instead of a continuous brake.
+        if side == Side.LONG:
+            projected_pnl_per_unit = order_price - pos.entry_price
+        else:
+            projected_pnl_per_unit = pos.entry_price - order_price
+        if projected_pnl_per_unit < 0:
+            loss_per_unit = -projected_pnl_per_unit
+            max_qty_by_allowance = allowance_remaining / max(loss_per_unit, 1e-12)
+            if max_qty_by_allowance < close_qty:
+                if max_qty_by_allowance <= 0:
+                    return []
+                close_qty = max_qty_by_allowance
+
+        # Quantize to qty_step and validate the exchange constraints
+        # AFTER allowance scaling — otherwise an allowance-shrunk close
+        # qty can land below qty_step / min_qty / min_cost. Without
+        # ep we have to fall through (used by some tests); the
+        # downstream _simulate_fills / _quantize_order_for_send will
+        # then act as the backstop.
+        if ep is not None:
+            if ep.qty_step > 0:
+                close_qty = quantize_qty(close_qty, ep.qty_step)
+            if close_qty < ep.min_qty:
+                return []
+            cost = close_qty * order_price * ep.c_mult
+            if cost < ep.min_cost:
+                return []
+
+        if close_qty <= 0:
+            return []
+
         return [Order(
             symbol=symbol,
             side=side,
@@ -359,37 +414,56 @@ class RiskManager:
     def _limit_new_entries(
         self, orders: list[Order], account: AccountState, scale: float
     ) -> list[Order]:
+        """Scale new entries by ``scale``; preserve every other field.
+
+        Previously this rebuilt Order with an explicit field list, which
+        silently dropped ``is_market`` (and any future field added to
+        Order) — most importantly, trend-overlay entries (is_market=True)
+        passing through YELLOW risk became is_market=False mid-pipeline
+        and the live executor then sent them as limits instead of
+        crossing the book.
+        """
         filtered = []
         for o in orders:
             if o.reduce_only:
                 filtered.append(o)
             else:
-                scaled = Order(
-                    symbol=o.symbol,
-                    side=o.side,
-                    price=o.price,
-                    qty=o.qty * scale,
-                    source=o.source,
-                    reduce_only=False,
-                )
-                filtered.append(scaled)
+                filtered.append(replace(o, qty=o.qty * scale))
         return filtered
 
     def _enforce_exposure_limits(
         self, orders: list[Order], account: AccountState
     ) -> list[Order]:
+        """Drop entries that would breach the WE caps.
+
+        IMPORTANT: cumulative projection. Each accepted order's cost is
+        added to a running ``twe_added`` / per-(symbol, side)
+        ``we_added`` so that the second, third, ... entry through the
+        loop sees the exposure it would have IF the previously-accepted
+        orders fill. Without this, every order is checked against the
+        current snapshot only and N entries each below the cap can
+        collectively breach it N-fold.
+        """
         filtered = []
+        denom = max(account.balance, 1e-12)
+        base_twe = (
+            account.total_wallet_exposure(Side.LONG)
+            + account.total_wallet_exposure(Side.SHORT)
+        )
+        # Per-(symbol, side) base WE cache so we don't pay the sum
+        # over open buckets every iteration.
+        base_we_per_key: dict[tuple[str, Side], float] = {}
+        twe_added = 0.0
+        we_added: dict[tuple[str, Side], float] = {}
         for o in orders:
             if o.reduce_only:
                 filtered.append(o)
                 continue
 
             cost = o.qty * o.price
-            current_twe = (
-                account.total_wallet_exposure(Side.LONG)
-                + account.total_wallet_exposure(Side.SHORT)
-            )
-            if current_twe + cost / max(account.balance, 1e-12) > self.config.max_total_wallet_exposure:
+            cost_we = cost / denom
+
+            if base_twe + twe_added + cost_we > self.config.max_total_wallet_exposure:
                 continue
 
             ss = account.symbols.get(o.symbol)
@@ -397,18 +471,23 @@ class RiskManager:
                 # Single-symbol exposure must sum grid + trend buckets —
                 # otherwise the trend overlay sneaks past the per-symbol
                 # cap by living in a separate bucket.
-                if o.side == Side.LONG:
-                    buckets = (ss.position_long, ss.trend_long)
-                else:
-                    buckets = (ss.position_short, ss.trend_short)
-                denom = max(account.balance, 1e-12)
-                current_we = sum(
-                    abs(p.size) * p.entry_price / denom
-                    for p in buckets if p.is_open
-                )
-                if current_we + cost / denom > self.config.max_single_exposure:
+                key = (o.symbol, o.side)
+                if key not in base_we_per_key:
+                    if o.side == Side.LONG:
+                        buckets = (ss.position_long, ss.trend_long)
+                    else:
+                        buckets = (ss.position_short, ss.trend_short)
+                    base_we_per_key[key] = sum(
+                        abs(p.size) * p.entry_price / denom
+                        for p in buckets if p.is_open
+                    )
+                base_we = base_we_per_key[key]
+                already_added = we_added.get(key, 0.0)
+                if base_we + already_added + cost_we > self.config.max_single_exposure:
                     continue
+                we_added[key] = already_added + cost_we
 
+            twe_added += cost_we
             filtered.append(o)
         return filtered
 

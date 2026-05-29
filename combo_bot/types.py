@@ -79,7 +79,15 @@ class Position:
             return abs(self.size) * (price - self.entry_price)
         if side == Side.SHORT:
             return abs(self.size) * (self.entry_price - price)
-        return self.size * (price - self.entry_price)
+        # ``size`` is stored as a non-negative scalar regardless of side
+        # (see the class docstring), so a no-side fallback that does
+        # ``self.size * (price - entry)`` silently returns the WRONG SIGN
+        # for short positions. Force callers to specify side instead of
+        # quietly mis-reporting P&L.
+        raise ValueError(
+            "Position.unrealized_pnl requires an explicit side — size is "
+            "stored unsigned so the fallback would mis-report short P&L"
+        )
 
     def update_best_price(self, mark_price: float, side: Side) -> None:
         if not self.is_open or mark_price <= 0:
@@ -244,9 +252,25 @@ class VolatilityState:
     alpha: float = 0.0
     initialized: bool = False
 
-    def init(self, span_hours: float, initial_range: float):
+    def init(
+        self,
+        span_hours: float,
+        initial_range: float,
+        bar_interval_minutes: float = 1.0,
+    ):
+        """Seed the EMA. ``bar_interval_minutes`` lets callers tell us the
+        cadence at which ``update`` will be called — alpha = 2/(N+1)
+        where N is the effective number of bars in ``span_hours``.
+
+        Default of 1.0 preserves legacy behaviour (one-minute bars). For
+        hourly bars, pass 60.0 so the EMA actually spans ``span_hours``
+        and not ``span_hours * 60`` hours.
+        """
         self.ema_span_hours = span_hours
-        self.alpha = 2.0 / (span_hours * 60.0 + 1.0)
+        bars_per_span = max(
+            1.0, span_hours * 60.0 / max(bar_interval_minutes, 1e-9)
+        )
+        self.alpha = 2.0 / (bars_per_span + 1.0)
         self.value = initial_range
         self.initialized = True
 

@@ -28,10 +28,25 @@ def cmd_backtest(args):
 
     cfg = load_config(args.config)
 
+    # Map a "timeframe" string ("1m", "5m", "1h", ...) to bar_interval_minutes
+    # so users can put it in their config alongside the candle download
+    # timeframe and have funding / volatility-EMA / Sharpe annualization
+    # scale correctly. Explicit ``bar_interval_minutes`` in the config
+    # takes priority if set.
+    _TF_TO_MIN = {
+        "1m": 1.0, "3m": 3.0, "5m": 5.0, "15m": 15.0, "30m": 30.0,
+        "1h": 60.0, "2h": 120.0, "4h": 240.0, "6h": 360.0, "8h": 480.0,
+        "12h": 720.0, "1d": 1440.0,
+    }
+    bar_min = cfg.get("bar_interval_minutes")
+    if bar_min is None:
+        bar_min = _TF_TO_MIN.get(str(cfg.get("timeframe", "1m")), 1.0)
+
     bt_config = BacktestConfig(
         starting_balance=cfg.get("starting_balance", 10000),
         maker_fee=cfg.get("maker_fee", 0.0002),
         taker_fee=cfg.get("taker_fee", 0.0005),
+        bar_interval_minutes=float(bar_min),
         symbols=cfg.get("symbols", []),
         grid=GridConfig(**cfg.get("grid", {})),
         trend=TrendConfig(**cfg.get("trend", {})),

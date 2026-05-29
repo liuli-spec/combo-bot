@@ -60,3 +60,6 @@ live_state.json
 # Optuna
 *.db
 optuna-journal*.log
+
+# Codegraph daemon runtime
+.codegraph/

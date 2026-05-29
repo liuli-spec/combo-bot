@@ -199,10 +199,13 @@ class StoplossGuard(IProtection):
         now_ms: int,
     ) -> list[ProtectionLock]:
         for fill in fills:
-            if fill.realized_pnl < self.config.required_profit_pct:
-                # Only closing fills can show realized_pnl != 0; opens
-                # have realized_pnl == 0 and naturally fall outside the
-                # threshold check above when required_profit_pct ≤ 0.
+            # Compare NET PnL (after fees) against threshold. A close
+            # at +$0.10 gross with $0.50 in fees is a real loss that
+            # would otherwise slip past a 0-USD threshold. Skip pure
+            # opens (gross == 0 AND fee >= 0, i.e. net <= 0 but no
+            # close action) by also requiring gross != 0.
+            net_pnl = fill.realized_pnl - fill.fee
+            if fill.realized_pnl != 0 and net_pnl < self.config.required_profit_pct:
                 self._losses.append(fill)
 
         # Prune the deque to the active window.
@@ -275,12 +278,13 @@ class CooldownPeriod(IProtection):
     ) -> list[ProtectionLock]:
         locks: list[ProtectionLock] = []
         for fill in fills:
-            # Only closing fills can produce non-zero realized P&L; opens
-            # always have realized_pnl == 0 so the threshold check skips
-            # them when required_profit_pct ≤ 0.
-            if fill.realized_pnl >= self.config.required_profit_pct:
-                continue
+            # Only closing fills produce non-zero gross PnL — opens have
+            # realized_pnl == 0. Compare NET (after fees) so a fill that
+            # eked out a tiny gross but lost to fees still cools down.
             if fill.realized_pnl == 0:
+                continue
+            net_pnl = fill.realized_pnl - fill.fee
+            if net_pnl >= self.config.required_profit_pct:
                 continue
             locks.append(ProtectionLock(
                 until_ms=now_ms + self.config.stop_duration_ms,

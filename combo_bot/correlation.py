@@ -102,19 +102,50 @@ class CorrelationTracker:
         return max(0, len(self._closes.get(symbol, ())) - 1)
 
     def correlation(self, a: str, b: str) -> float:
-        """Pearson correlation of overlapping returns. Returns 0 when
-        either symbol has fewer than 2 return samples or when either
-        return series has zero variance (no movement to correlate)."""
+        """Pearson correlation of return series, computed by co-iterating
+        the two raw close-price buffers so a transient zero close on one
+        side can't desynchronise the two return series.
+
+        Returns 0 when either symbol has fewer than 2 valid paired returns
+        or when either return series has zero variance.
+
+        Why co-iteration matters: callers (Backtester / LiveTrader) update
+        both deques in lockstep per tick, so aligning by tail-index is
+        only correct when no observation got dropped. Computing
+        ``returns(a)`` and ``returns(b)`` independently and then
+        re-aligning by ``min(len)`` silently shifts one series when a bad
+        close-price appears mid-stream, which silently corrupts the
+        correlation. Here we walk both buffers index-by-index and emit a
+        paired return only when *both* prevs are valid.
+        """
         if a == b:
             return 1.0
-        ra = self.returns(a)
-        rb = self.returns(b)
-        n = min(len(ra), len(rb))
+        closes_a = list(self._closes.get(a, ()))
+        closes_b = list(self._closes.get(b, ()))
+        # Align tail-first — the deques are updated in lockstep, so the
+        # most recent N entries on each side correspond to the same ticks.
+        n_pairs = min(len(closes_a), len(closes_b))
+        if n_pairs < 3:  # need at least 2 valid returns
+            return 0.0
+        closes_a = closes_a[-n_pairs:]
+        closes_b = closes_b[-n_pairs:]
+
+        ra: list[float] = []
+        rb: list[float] = []
+        for i in range(1, n_pairs):
+            pa, pb = closes_a[i - 1], closes_b[i - 1]
+            ca, cb = closes_a[i], closes_b[i]
+            # Both the prev AND the current must be valid on BOTH sides
+            # — a zero on either side at either step makes the paired
+            # return undefined, so we drop the index entirely rather
+            # than emit a spurious -1 / +inf.
+            if pa > 0 and pb > 0 and ca > 0 and cb > 0:
+                ra.append(ca / pa - 1.0)
+                rb.append(cb / pb - 1.0)
+
+        n = len(ra)
         if n < 2:
             return 0.0
-        # Align the trailing N returns so we compare over the same period.
-        ra = ra[-n:]
-        rb = rb[-n:]
         mean_a = sum(ra) / n
         mean_b = sum(rb) / n
         cov = sum(
@@ -171,17 +202,34 @@ class CorrelationGate:
     def filter_orders(
         self, orders: list[Order], account: AccountState,
     ) -> list[Order]:
+        """Scale or drop new entries that increase same-factor exposure.
+
+        Tracks ``new_exposure`` accumulated by orders accepted in THIS
+        call so the second / third / ... entry on a correlated symbol
+        sees the projected exposure including its predecessors. Without
+        this, two same-side entries on BTC + ETH each passed the gate
+        because neither saw the other being accepted on the same tick.
+        """
+        # Already-accepted notional per (symbol, side) — gets added to
+        # account-side existing positions when evaluating future orders.
+        new_exposure: dict[tuple[str, Side], float] = {}
         result: list[Order] = []
         for order in orders:
             if order.reduce_only:
                 result.append(order)
                 continue
-            max_eff = self._max_effective_correlation(order, account)
+            max_eff = self._max_effective_correlation(
+                order, account, new_exposure,
+            )
             if max_eff >= self.config.hard_threshold:
                 # Drop — adding here piles onto an already-overcrowded factor.
                 continue
             if max_eff <= self.config.soft_threshold:
                 result.append(order)
+                new_exposure[(order.symbol, order.side)] = (
+                    new_exposure.get((order.symbol, order.side), 0.0)
+                    + abs(order.qty * order.price)
+                )
                 continue
             # Linear ramp between soft and hard.
             span = self.config.hard_threshold - self.config.soft_threshold
@@ -190,31 +238,53 @@ class CorrelationGate:
             if new_qty <= 0:
                 continue
             result.append(replace(order, qty=new_qty))
+            new_exposure[(order.symbol, order.side)] = (
+                new_exposure.get((order.symbol, order.side), 0.0)
+                + abs(new_qty * order.price)
+            )
         return result
 
     def _max_effective_correlation(
         self, order: Order, account: AccountState,
+        new_exposure: dict[tuple[str, Side], float] | None = None,
     ) -> float:
+        """Compute the worst-case effective correlation across other
+        symbols' existing exposure PLUS any same-tick entries already
+        accepted into ``new_exposure`` (treated as positions that will
+        exist by the time ``order`` fills).
+        """
         cfg = self.config
         if self.tracker.sample_size(order.symbol) < cfg.min_samples:
             return 0.0
 
-        max_eff = 0.0
+        # Build a {(symbol, side): has_exposure} view that combines
+        # account-side open positions with the same-tick accumulator.
+        # Magnitude doesn't enter the correlation calc — only presence
+        # of exposure on a side matters here — but we keep the API
+        # symmetric in case we later weight by size.
+        sides_with_exposure: dict[str, set[Side]] = {}
         for sym, ss in account.symbols.items():
             if sym == order.symbol:
                 continue
-            if self.tracker.sample_size(sym) < cfg.min_samples:
-                continue
-            # Both grid and trend buckets count: same-factor exposure
-            # compounds whichever bucket holds the position.
             for side, pos in (
                 (Side.LONG, ss.position_long),
                 (Side.LONG, ss.trend_long),
                 (Side.SHORT, ss.position_short),
                 (Side.SHORT, ss.trend_short),
             ):
-                if not pos.is_open:
+                if pos.is_open:
+                    sides_with_exposure.setdefault(sym, set()).add(side)
+        if new_exposure:
+            for (sym, side), notional in new_exposure.items():
+                if sym == order.symbol or notional <= 0:
                     continue
+                sides_with_exposure.setdefault(sym, set()).add(side)
+
+        max_eff = 0.0
+        for sym, sides in sides_with_exposure.items():
+            if self.tracker.sample_size(sym) < cfg.min_samples:
+                continue
+            for side in sides:
                 raw = self.tracker.correlation(order.symbol, sym)
                 eff = raw if side == order.side else -raw
                 if eff > max_eff:

@@ -29,6 +29,14 @@ class BacktestConfig:
     funding_rate_default: float = 0.0001
     funding_interval_hours: int = 8
     liquidation_threshold: float = 0.05
+    # Bar cadence assumed for the input candles. Defaults to 1m (legacy
+    # behaviour); set to 60.0 for hourly bars, etc. Wired into:
+    #   * funding-application loop (every funding_interval_hours of wall
+    #     clock, not every funding_interval_hours * 60 bars);
+    #   * VolatilityState.init so EMA span matches the cadence;
+    # If you backtest 1h candles with the default 1.0 you get funding
+    # applied ~60× too rarely and a volatility EMA ~60× too slow.
+    bar_interval_minutes: float = 1.0
     grid: GridConfig = field(default_factory=GridConfig)
     trend: TrendConfig = field(default_factory=TrendConfig)
     merger: MergerConfig = field(default_factory=MergerConfig)
@@ -127,6 +135,18 @@ class Backtester:
             for s in symbols:
                 if self._strategy_uses_dataframe:
                     self.data_provider.append(s, candles[s])
+                    # Apply the strategy's populate_* callbacks so the
+                    # signal columns (enter_long / enter_short / etc.)
+                    # actually exist on the cached DataFrame that
+                    # read_strategy_signals reads from. Without this
+                    # call the populate hooks were dead code — the
+                    # strategy's entry/exit logic never reached the
+                    # regime arbiter, so user-defined signals silently
+                    # never fired. Strategies are expected to mutate
+                    # the DataFrame in place (freqtrade convention);
+                    # callbacks that return a new DataFrame won't
+                    # propagate back to the cache.
+                    self._apply_strategy_populates(s)
                 self.trend.update(s, candles[s].close)
             if self.correlation_gate is not None:
                 self.correlation_gate.update_prices(
@@ -146,7 +166,10 @@ class Backtester:
                 self.kelly_sizer.record_fills(step_fills)
 
             # ── funding ───────────────────────────────────────────
-            hours_elapsed = (step + 1) / 60.0
+            # Wall-clock hours, not bars-since-start. Without scaling by
+            # bar_interval, 1h backtests would only trigger funding every
+            # 480h instead of every 8h.
+            hours_elapsed = (step + 1) * self.config.bar_interval_minutes / 60.0
             if int(hours_elapsed / self.config.funding_interval_hours) > funding_hour_counter:
                 funding_hour_counter = int(hours_elapsed / self.config.funding_interval_hours)
                 fc = self._apply_funding(account, funding_rates, step, symbols)
@@ -174,10 +197,11 @@ class Backtester:
                 price = candle.close
 
                 if self._strategy_uses_dataframe:
-                    _enter_long, _enter_short, strat_exit_long, strat_exit_short = (
+                    strat_enter_long, strat_enter_short, strat_exit_long, strat_exit_short = (
                         read_strategy_signals(self.data_provider, s)
                     )
                 else:
+                    strat_enter_long = strat_enter_short = False
                     strat_exit_long = strat_exit_short = False
                 fr = self._funding_rate_for(funding_rates, s, step)
                 regime_view = self.regime_arbiter.compute(
@@ -185,6 +209,8 @@ class Backtester:
                     funding_rate=fr,
                     strategy_exit_long=strat_exit_long,
                     strategy_exit_short=strat_exit_short,
+                    strategy_enter_long=strat_enter_long,
+                    strategy_enter_short=strat_enter_short,
                 )
                 ss.mode_long = regime_view.long_mode
                 ss.mode_short = regime_view.short_mode
@@ -250,6 +276,28 @@ class Backtester:
                 trend_entries = self._emit_trend_overlay(
                     s, regime_view, price, account, ep,
                 )
+                # Run trend overlay entries through the strategy's veto
+                # / price / sizing pipeline using a context whose
+                # position is the TREND bucket (not the grid bucket).
+                # Without this, confirm_trade_entry, custom_entry_price,
+                # custom_stake_amount, and adjust_entry_price all had no
+                # effect on trend overlay — a real safety gap because
+                # the overlay is the most aggressive entry path the bot
+                # emits.
+                if trend_entries:
+                    overlay_side = trend_entries[0].side
+                    overlay_pos = (
+                        ss.trend_long if overlay_side == Side.LONG
+                        else ss.trend_short
+                    )
+                    ctx_overlay = TradeContext(
+                        symbol=s, side=overlay_side, position=overlay_pos,
+                        account=account, candle=candle, signal=signal,
+                        current_time_ms=ts, exchange_params=ep,
+                    )
+                    trend_entries = self.strategy_runner.filter_entries(
+                        trend_entries, ctx_overlay,
+                    )
                 trend_exits_long = self.merger.generate_trend_exit_orders(
                     s, ss.trend_long, Side.LONG, price, ep,
                 )
@@ -262,10 +310,9 @@ class Backtester:
                     fx = self.strategy_runner.check_custom_exit(ctx_long)
                     if fx is not None:
                         strategy_orders.append(fx)
-                    # Strategy runner used the ctx position (the *grid* bucket)
-                    # but the risk layer will route the fill to the correct
-                    # bucket downstream — the ctx carries the same side, so
-                    # SymbolState.bucket() resolves it correctly.
+                    # ctx.position is the grid bucket; the runner emits
+                    # source=GRID so the fill lands in the same bucket
+                    # the strategy is reasoning about.
                     adj = self.strategy_runner.check_position_adjustment(ctx_long)
                     if adj is not None:
                         strategy_orders.append(adj)
@@ -296,6 +343,7 @@ class Backtester:
                 account,
                 grid_wallet_exposure_limit=self.config.grid.wallet_exposure_limit,
                 now_ms=ts,
+                exchange_params=exchange_params,
             )
             all_orders.extend(unstuck_orders)
             all_orders = self.risk.filter_orders(all_orders, account, ts)
@@ -306,6 +354,44 @@ class Backtester:
             fills, equity_log, account,
             account.grid_realized_pnl, account.trend_realized_pnl,
         )
+
+    def _apply_strategy_populates(self, symbol: str) -> None:
+        """Run the strategy's populate_indicators/entry/exit hooks on the
+        cached DataFrame so signal columns become readable by
+        :func:`combo_bot.regime.read_strategy_signals`.
+
+        Strategies should mutate the DataFrame in place per freqtrade
+        convention; if the hook returns a NEW DataFrame, we copy any
+        signal columns it added back into the cache so reads still see
+        them.
+        """
+        try:
+            df = self.data_provider.get_dataframe(symbol)
+        except Exception:
+            return
+        if df is None or len(df) == 0:
+            return
+        meta = {"pair": symbol}
+        try:
+            out_ind = self.strategy.populate_indicators(df, meta)
+            out_ent = self.strategy.populate_entry_trend(
+                out_ind if out_ind is not None else df, meta,
+            )
+            out_ext = self.strategy.populate_exit_trend(
+                out_ent if out_ent is not None else (out_ind or df), meta,
+            )
+        except Exception:
+            # A misbehaving user strategy mustn't crash the backtest loop.
+            return
+        final = out_ext if out_ext is not None else df
+        if final is df:
+            return
+        # Copy any signal columns the strategy added on a copy of the
+        # frame back into the cached frame so downstream reads see them.
+        for col in ("enter_long", "enter_short", "exit_long", "exit_short",
+                    "enter_tag", "exit_tag"):
+            if col in final.columns and col not in df.columns:
+                df[col] = final[col]
 
     def _update_prices(self, account: AccountState, candles: dict[str, Candle]):
         for s, c in candles.items():
@@ -347,7 +433,11 @@ class Backtester:
             else:
                 log_range = 0.0
             if not ss.volatility.initialized:
-                ss.volatility.init(self.config.grid.entry_volatility_ema_span_hours, log_range)
+                ss.volatility.init(
+                    self.config.grid.entry_volatility_ema_span_hours,
+                    log_range,
+                    bar_interval_minutes=self.config.bar_interval_minutes,
+                )
             else:
                 ss.volatility.update(log_range)
 
@@ -416,12 +506,20 @@ class Backtester:
         if cost > budget or cost < exchange.min_cost:
             return []
 
+        # Trend overlay entries cross the book immediately — the whole
+        # point of overlay activation is that we want exposure NOW in a
+        # strong regime, not when a limit price might (or might not) be
+        # touched. is_market=True makes the fill simulator and the live
+        # executor agree on the same semantics. (Previously is_market
+        # was False but a special-case in the fill simulator filled at
+        # close*slip anyway, so backtest and live diverged.)
         return [Order(
             symbol=symbol,
             side=regime.trend_overlay,
             price=price,
             qty=qty,
             source=OrderSource.TREND,
+            is_market=True,
         )]
 
     def _simulate_fills(
@@ -446,15 +544,38 @@ class Backtester:
             if not filled:
                 continue
 
+            # Backstop: enforce the same exchange constraints the live
+            # executor's _quantize_order_for_send applies, so any upstream
+            # generator that forgot to quantize / validate (e.g. a sizer
+            # that scaled qty below qty_step, an unstuck path with no
+            # ep, a strategy adjust returning a sub-step delta) is
+            # rejected by the simulator too. Without this guard, backtest
+            # quietly fills orders that live would never accept, and the
+            # two paths report different fill streams.
+            if ep.qty_step > 0:
+                # Match live: floor to qty_step before validating.
+                import math
+                qstep_qty = math.floor(order.qty / ep.qty_step) * ep.qty_step
+                if qstep_qty < ep.min_qty:
+                    continue
+                if qstep_qty * order.price * ep.c_mult < ep.min_cost:
+                    continue
+                if qstep_qty != order.qty:
+                    # Quantize the order in place for the rest of the
+                    # fill pipeline so fee / pnl / position math all
+                    # use the same qty the live executor would send.
+                    from dataclasses import replace
+                    order = replace(order, qty=qstep_qty)
+
             # Market orders cross the book at close ± slippage with taker fee.
-            # Trend entries also cross aggressively (legacy behavior).
             # Grid limits fill at their stated price with maker fee.
+            # (Trend overlay entries are now is_market=True at the source,
+            # so they take the market branch — the old elif special-case
+            # that filled them at close*slip while is_market was False
+            # has been removed.)
             if order.is_market:
                 slip_dir = 1 if (order.side == Side.LONG and not order.reduce_only) or (order.side == Side.SHORT and order.reduce_only) else -1
                 fill_price = c.close * (1.0 + self.config.slippage_pct * slip_dir)
-                fee_rate = self.config.taker_fee
-            elif order.source == OrderSource.TREND and not order.reduce_only:
-                fill_price = c.close * (1.0 + self.config.slippage_pct * (1 if order.side == Side.LONG else -1))
                 fee_rate = self.config.taker_fee
             else:
                 fill_price = order.price

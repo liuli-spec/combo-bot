@@ -159,7 +159,14 @@ def compute_grid_orders_rust(
             closes = _rust.calc_closes_short(bp_dict, ep_dict, sp_dict, pos_dict, trail_dict)
         orders.extend(_rust_orders_to_python(closes, symbol, side, reduce_only=True))
 
-    if mode == TradingMode.NORMAL:
+    # NORMAL and AGGRESSIVE both emit entries; TP_ONLY / GRACEFUL_STOP
+    # / PANIC do not. AGGRESSIVE falls through to NORMAL Rust sizing
+    # for now — the larger-DDF / compressed-spacing tuning the Python
+    # path applies for AGGRESSIVE isn't yet plumbed through to the Rust
+    # bot_params, so passing it here would have no effect. Without this
+    # mode-inclusive branch, AGGRESSIVE silently produced zero entries
+    # on the Rust path — the opposite of intent.
+    if mode in (TradingMode.NORMAL, TradingMode.AGGRESSIVE):
         wel_cap = grid_config.wallet_exposure_limit
         if side == Side.LONG:
             entries = _rust.calc_entries_long(

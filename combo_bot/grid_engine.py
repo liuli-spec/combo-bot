@@ -327,7 +327,13 @@ class GridEngine:
             orders.append(self._make_entry(symbol, side, price, qty))
             cumulative_size += qty
 
-            spacing = self._grid_spacing(volatility.value, wallet_exposure) * spacing_compression
+            # Spacing for the NEXT level should widen as cumulative
+            # wallet exposure grows — passivbot's `we_multiplier` does the
+            # same. Without this the loop emits a constant-spacing ladder
+            # regardless of how much commitment has stacked.
+            spacing = self._grid_spacing(
+                volatility.value, projected_we,
+            ) * spacing_compression
             price = self._next_entry_price(price, spacing, side)
             qty *= ddf
 

@@ -59,6 +59,8 @@ class RegimeArbiter:
         funding_rate: float = 0.0,
         strategy_exit_long: bool = False,
         strategy_exit_short: bool = False,
+        strategy_enter_long: bool = False,
+        strategy_enter_short: bool = False,
     ) -> RegimeView:
         cfg = self.config
         regime = signal.regime
@@ -133,6 +135,48 @@ class RegimeArbiter:
         if strategy_exit_short and overlay == Side.SHORT:
             overlay = None
             overlay_scale = 0.0
+
+        # Strategy entry signals are symmetric to exits: they PROMOTE the
+        # matching side's mode toward AGGRESSIVE and force-activate the
+        # trend overlay if it wasn't already on. Exit signals on the same
+        # side take precedence — if the strategy says both enter_long
+        # and exit_long, exit wins (we already downgraded to TP_ONLY
+        # above; the promotion below skips that case). Defensive modes
+        # (PANIC / GRACEFUL_STOP) also override — strategy entry must
+        # not punch through a risk-driven graceful stop. Funding veto
+        # still applies to the overlay activation.
+        def _promote(
+            mode: TradingMode, side: Side, overlay_blocked: bool,
+            current_overlay: Side | None, current_scale: float,
+        ) -> tuple[TradingMode, Side | None, float]:
+            if mode in (
+                TradingMode.PANIC,
+                TradingMode.GRACEFUL_STOP,
+                TradingMode.TP_ONLY,
+            ):
+                return mode, current_overlay, current_scale
+            new_mode = TradingMode.AGGRESSIVE
+            if current_overlay is None and not overlay_blocked:
+                # Force overlay activation with a conservative scale —
+                # the strategy committed to a direction, but we still
+                # want size discipline. Use the lesser of conviction
+                # and a 0.5 floor so a cold-start NEUTRAL regime can
+                # also benefit.
+                new_overlay = side
+                new_scale = max(current_scale, 0.5)
+                return new_mode, new_overlay, new_scale
+            return new_mode, current_overlay, current_scale
+
+        if strategy_enter_long and not strategy_exit_long:
+            long_mode, overlay, overlay_scale = _promote(
+                long_mode, Side.LONG, long_overlay_blocked, overlay, overlay_scale,
+            )
+            veto.append("strategy enter_long → AGGRESSIVE")
+        if strategy_enter_short and not strategy_exit_short:
+            short_mode, overlay, overlay_scale = _promote(
+                short_mode, Side.SHORT, short_overlay_blocked, overlay, overlay_scale,
+            )
+            veto.append("strategy enter_short → AGGRESSIVE")
 
         return RegimeView(
             primary=regime,
