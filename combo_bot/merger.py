@@ -26,6 +26,11 @@ class DecisionMerger:
     def compute_mode(
         self, signal: TrendSignal, side: Side, position: Position
     ) -> TradingMode:
+        """DEPRECATED: superseded by :class:`RegimeArbiter.compute`.
+        Retained for test compatibility only; production paths use the
+        arbiter directly."""
+        import warnings
+        warnings.warn("DecisionMerger.compute_mode is deprecated; use RegimeArbiter.compute", DeprecationWarning, stacklevel=2)
         if side == Side.LONG:
             if signal.regime == TrendRegime.STRONG_BEAR:
                 return TradingMode.GRACEFUL_STOP if position.is_open else TradingMode.TP_ONLY
@@ -115,6 +120,11 @@ class DecisionMerger:
         trend_orders: list[Order],
         signal: TrendSignal,
     ) -> list[Order]:
+        """DEPRECATED: production paths call filter_grid_orders and
+        generate_trend_orders separately.  Kept as a convenience wrapper
+        for interactive use."""
+        import warnings
+        warnings.warn("DecisionMerger.merge_orders is unused in production; use filter_grid_orders + generate_trend_orders separately", DeprecationWarning, stacklevel=2)
         closes = [o for o in grid_orders if o.reduce_only]
         entries = [o for o in grid_orders if not o.reduce_only]
         entries = self.filter_grid_orders(entries, signal, entries[0].side if entries else Side.LONG)
@@ -161,6 +171,7 @@ class DecisionMerger:
                     qty=abs(position.size),
                     source=OrderSource.TREND,
                     reduce_only=True,
+                    is_market=True,  # SL/TP exits cross the book immediately
                 ))
         else:
             sl_price = position.entry_price * (1.0 + self.config.trend_stop_loss_pct)
@@ -173,6 +184,7 @@ class DecisionMerger:
                     qty=abs(position.size),
                     source=OrderSource.TREND,
                     reduce_only=True,
+                    is_market=True,
                 ))
 
         return orders

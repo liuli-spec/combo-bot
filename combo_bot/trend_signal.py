@@ -34,7 +34,11 @@ class TrendEngine:
             self.config.ema_slow,
             self.config.atr_period + 1,
         ) + 10
-        if len(self._history[symbol]) > max_needed * 2:
+        # Prune infrequently to avoid EMA re-seed jumps (each truncation
+        # resets the seeding index of _ema(), producing a signal artefact).
+        # 20× leaves ~920 bars (≈15 hours of 1m data) between truncations
+        # for typical configs — the jump becomes biologically irrelevant.
+        if len(self._history[symbol]) > max_needed * 20:
             self._history[symbol] = self._history[symbol][-max_needed:]
 
     def compute(self, symbol: str) -> TrendSignal:

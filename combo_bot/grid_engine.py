@@ -488,6 +488,10 @@ class ForagerScorer:
         n_positions: int,
         weights: ForagerWeights,
     ) -> list[str]:
+        """DEPRECATED: Forager selection is handled in Rust
+        multi_symbol.rs.  Retained for reference / interactive use."""
+        import warnings
+        warnings.warn("ForagerScorer.select_symbols is unused; Forager runs in Rust multi_symbol.rs", DeprecationWarning, stacklevel=2)
         scored: list[tuple[str, float]] = []
         for symbol, (vol_score, volatility_score, ema_score) in candidates.items():
             total = ForagerScorer.score_symbol(

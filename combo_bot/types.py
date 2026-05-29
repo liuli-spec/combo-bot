@@ -51,6 +51,16 @@ class Candle:
 
 @dataclass
 class Position:
+    """Position bucket for one side of one symbol.
+
+    ``size`` is always stored as a *non-negative* scalar (|contracts|) for
+    both long and short sides.  The direction is determined by the enclosing
+    :class:`SymbolState` bucket (``position_long`` vs ``position_short``).
+    Callers MUST pass the correct :class:`Side` to :meth:`unrealized_pnl`
+    and :meth:`update_best_price` — a missing ``side`` argument falls back
+    to a long-biased calculation and will produce wrong P&L for short
+    positions.
+    """
     size: float = 0.0
     entry_price: float = 0.0
     # Most-favorable price seen since the position opened.
