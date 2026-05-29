@@ -155,6 +155,11 @@ class Backtester:
             account.update_equity()
             equity_log.append((ts, account.equity))
 
+            # Stage 11: feed the vol-target sizer so its rolling
+            # equity-return history stays current every tick.
+            if self.vol_target_sizer is not None:
+                self.vol_target_sizer.record_equity(account.equity)
+
             if self.risk.check_liquidation(account):
                 break
 
@@ -590,7 +595,8 @@ class Backtester:
 
         total_pnl = sum(f.realized_pnl for f in fills)
         total_fees = sum(f.fee for f in fills)
-        winning = sum(1 for f in fills if f.realized_pnl > 0 and f.realized_pnl != 0)
+        # Net PnL (after fees) determines win/loss, not gross.
+        winning = sum(1 for f in fills if f.realized_pnl > f.fee and f.realized_pnl != 0)
         closing = sum(1 for f in fills if f.realized_pnl != 0)
         win_rate = winning / max(closing, 1)
 

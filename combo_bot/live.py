@@ -19,6 +19,7 @@ from combo_bot.regime import RegimeArbiter, RegimeArbiterConfig, read_strategy_s
 from combo_bot.protections import IProtection, ProtectionManager
 from combo_bot.sizing import KellySizer
 from combo_bot.correlation import CorrelationGate
+from combo_bot.vol_target import VolTargetSizer
 from combo_bot.types import RegimeView
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ class LiveTrader:
         protections: list[IProtection] | None = None,
         kelly_sizer: KellySizer | None = None,
         correlation_gate: CorrelationGate | None = None,
+        vol_target_sizer: VolTargetSizer | None = None,
     ):
         self.config = config
         self.exchange = exchange
@@ -69,6 +71,8 @@ class LiveTrader:
         self.kelly_sizer = kelly_sizer
         # Stage 10 — optional cross-symbol correlation gate.
         self.correlation_gate = correlation_gate
+        # Stage 11 — optional portfolio-level vol-targeting sizer.
+        self.vol_target_sizer = vol_target_sizer
         self.account = AccountState()
         self.exchange_params: dict[str, ExchangeParams] = {}
         self._running = False
@@ -251,6 +255,10 @@ class LiveTrader:
             all_desired_orders = self.correlation_gate.filter_orders(
                 all_desired_orders, self.account,
             )
+
+        # Stage 11 portfolio-level vol-targeting — same as Backtester.
+        if self.vol_target_sizer is not None:
+            all_desired_orders = self.vol_target_sizer.filter_orders(all_desired_orders)
 
         # Stage 5 unstuck — same call as Backtester. Wall-clock time
         # drives both the 24h loss budget and any later staleness checks.

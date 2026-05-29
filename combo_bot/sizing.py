@@ -115,12 +115,15 @@ class KellySizer:
         return distribution — matches the fill-routing rule from
         Stage 3 (RISK closes the grid bucket).
         """
-        if fill.realized_pnl == 0:
+        # Use net PnL (after fees) so Kelly estimates the real edge
+        # the strategy actually captures, not the pre-fee gross.
+        net_pnl = fill.realized_pnl - fill.fee
+        if net_pnl == 0:
             return
         notional = abs(fill.qty * fill.price)
         if notional <= 0:
             return
-        return_pct = fill.realized_pnl / notional
+        return_pct = net_pnl / notional
         bucket = (
             OrderSource.TREND
             if fill.source == OrderSource.TREND
