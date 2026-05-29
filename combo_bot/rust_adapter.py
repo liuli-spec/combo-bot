@@ -2,7 +2,7 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict
 from combo_bot.types import (
-    EMAState, ExchangeParams, Order, OrderSource, Position, Side, TradingMode, VolatilityState,
+    EMAState, ExchangeParams, Order, OrderSource, Position, Side, TradingMode, TrailingState, VolatilityState,
 )
 from combo_bot.grid_engine import GridConfig
 
@@ -65,19 +65,36 @@ def _state_to_dict(
     }
 
 
-def _trailing_to_dict(
-    min_since_open: float = float("inf"),
-    max_since_min: float = float("-inf"),
-    max_since_open: float = float("-inf"),
-    min_since_max: float = float("inf"),
-) -> dict:
+def _trailing_to_dict(trailing: TrailingState, side: Side) -> dict:
+    """Map Python TrailingState (extreme + recovery, 2 fields) to Rust
+    TrailingPriceBundle (min_since_open / max_since_min / max_since_open /
+    min_since_max, 4 fields).
+
+    * LONG:  extreme = running minimum, recovery = running maximum after extreme.
+    * SHORT: extreme = running maximum, recovery = running minimum after extreme.
+    """
     import sys
-    return {
-        "min_since_open": min_since_open if min_since_open != float("inf") else sys.float_info.max,
-        "max_since_min": max_since_min if max_since_min != float("-inf") else sys.float_info.min,
-        "max_since_open": max_since_open if max_since_open != float("-inf") else sys.float_info.min,
-        "min_since_max": min_since_max if min_since_max != float("inf") else sys.float_info.max,
-    }
+    if not trailing.initialized:
+        return {
+            "min_since_open": sys.float_info.max,
+            "max_since_min": sys.float_info.min,
+            "max_since_open": sys.float_info.min,
+            "min_since_max": sys.float_info.max,
+        }
+    if side == Side.LONG:
+        return {
+            "min_since_open": trailing.extreme,
+            "max_since_min": trailing.recovery,
+            "max_since_open": trailing.recovery,   # best-effort: no independent max_since_open
+            "min_since_max": trailing.extreme,      # best-effort
+        }
+    else:
+        return {
+            "min_since_open": trailing.recovery,    # best-effort
+            "max_since_min": trailing.extreme,      # best-effort
+            "max_since_open": trailing.extreme,
+            "min_since_max": trailing.recovery,
+        }
 
 
 def _rust_orders_to_python(
@@ -110,6 +127,7 @@ def compute_grid_orders_rust(
     grid_config: GridConfig,
     mode: TradingMode,
     max_levels: int = 5,
+    trailing: TrailingState | None = None,
 ) -> list[Order]:
     """Compute grid orders using the Rust core for performance.
 
@@ -122,7 +140,7 @@ def compute_grid_orders_rust(
     ep_dict = _ep_to_dict(exchange_params)
     sp_dict = _state_to_dict(balance, bid, ask, ema_state, volatility)
     pos_dict = _position_to_dict(position)
-    trail_dict = _trailing_to_dict()
+    trail_dict = _trailing_to_dict(trailing or TrailingState(), side)
 
     orders: list[Order] = []
 
