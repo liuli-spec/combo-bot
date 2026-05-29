@@ -12,6 +12,7 @@ from combo_bot.types import (
     Position,
     Side,
     TradingMode,
+    TrailingState,
     VolatilityState,
 )
 
@@ -33,6 +34,20 @@ class GridConfig:
     close_grid_qty_pct: float = 0.5
     close_trailing_threshold_pct: float = 0.01
     close_trailing_retracement_pct: float = 0.004
+    # Stage 8 trailing re-entry (passivbot ``calc_trailing_entry_long``).
+    # Defaults of 0 disable the path entirely — opt-in safety.
+    #
+    # Stage 1: price has moved at least ``entry_trailing_threshold_pct``
+    # against the avg entry (i.e. the position is at least that far
+    # underwater) — we don't trail until we're committed enough that a
+    # cheaper re-entry is meaningful.
+    # Stage 2: price has recovered at least ``entry_trailing_retracement_pct``
+    # from the local extreme — we want to DCA after a bottom is in, not
+    # while still bleeding.
+    # Both conditions must fire on the same tick.
+    entry_trailing_threshold_pct: float = 0.0
+    entry_trailing_retracement_pct: float = 0.0
+    entry_trailing_double_down_factor: float = 1.3
     wallet_exposure_limit: float = 1.0
     n_positions: int = 7
     total_wallet_exposure_limit: float = 1.5
@@ -114,6 +129,112 @@ class GridEngine:
             orders.extend(entry_orders)
 
         return orders
+
+    def compute_trailing_entry(
+        self,
+        symbol: str,
+        side: Side,
+        position: Position,
+        trailing: TrailingState,
+        balance: float,
+        wallet_exposure: float,
+        exchange_params: ExchangeParams,
+        mark_price: float,
+        mode: TradingMode = TradingMode.NORMAL,
+    ) -> Order | None:
+        """passivbot-style two-stage trailing re-entry.
+
+        Returns a single re-entry :class:`Order` when both stages fire
+        on the same tick, or ``None`` otherwise. See
+        :class:`TrailingState` for the bundle semantics.
+
+        The method is a no-op (returns ``None``) when:
+
+        * trailing is disabled (either threshold is 0);
+        * the position isn't open (passivbot trails *re*-entries, not
+          initial entries);
+        * the trailing bundle hasn't been seeded yet;
+        * the side is in a non-entering mode (TP_ONLY / GRACEFUL_STOP /
+          PANIC) — trailing is a new-exposure path, so risk-off modes
+          gate it;
+        * the wallet-exposure ceiling would be breached.
+        """
+        cfg = self._cfg
+        threshold = cfg.entry_trailing_threshold_pct
+        retracement = cfg.entry_trailing_retracement_pct
+        if threshold <= 0 or retracement <= 0:
+            return None
+        if not position.is_open or not trailing.initialized:
+            return None
+        if mode not in (TradingMode.NORMAL, TradingMode.AGGRESSIVE):
+            return None
+        if balance <= 0 or mark_price <= 0:
+            return None
+        if wallet_exposure >= cfg.wallet_exposure_limit * 0.999:
+            return None
+
+        if side == Side.LONG:
+            below_threshold = (
+                trailing.extreme < position.entry_price * (1.0 - threshold)
+            )
+            bounced = (
+                trailing.recovery > trailing.extreme * (1.0 + retracement)
+            )
+            if not (below_threshold and bounced):
+                return None
+            # Limit price sits between the extreme and the entry — a level
+            # we'll only fill if price retraces back into it.
+            raw_price = position.entry_price * (1.0 - threshold + retracement)
+            order_price = min(mark_price, raw_price)
+        else:
+            above_threshold = (
+                trailing.extreme > position.entry_price * (1.0 + threshold)
+            )
+            retraced = (
+                trailing.recovery < trailing.extreme * (1.0 - retracement)
+            )
+            if not (above_threshold and retraced):
+                return None
+            raw_price = position.entry_price * (1.0 + threshold - retracement)
+            order_price = max(mark_price, raw_price)
+
+        # Size the re-entry like a DDF-scaled DCA against the current
+        # position. Use the trailing-specific DDF so users can tune it
+        # independently from the grid ladder.
+        ddf = cfg.entry_trailing_double_down_factor
+        qty = abs(position.size) * ddf
+        qty = max(qty, exchange_params.min_qty)
+        qty = quantize_qty(qty, exchange_params.qty_step)
+        if qty <= 0:
+            return None
+
+        # Crop qty so we don't blow past the wallet-exposure limit.
+        cost = qty * order_price * exchange_params.c_mult
+        room = (
+            cfg.wallet_exposure_limit * balance
+            - abs(position.size) * position.entry_price * exchange_params.c_mult
+        )
+        if room <= 0:
+            return None
+        if cost > room:
+            qty = quantize_qty(
+                room / max(order_price * exchange_params.c_mult, 1e-12),
+                exchange_params.qty_step,
+            )
+            if qty < exchange_params.min_qty:
+                return None
+            cost = qty * order_price * exchange_params.c_mult
+
+        if cost < exchange_params.min_cost:
+            return None
+
+        return Order(
+            symbol=symbol,
+            side=side,
+            price=order_price,
+            qty=qty,
+            source=OrderSource.GRID,
+        )
 
     def _panic_close(
         self,
