@@ -194,6 +194,23 @@ class Backtester:
                     ctx_short,
                 )
 
+                # Stage 8 trailing re-entries (passivbot-style two-stage
+                # trigger). No-op when entry_trailing_threshold_pct or
+                # retracement_pct is 0 — config opts in.
+                trailing_entries: list[Order] = []
+                trail_long = self.grid.compute_trailing_entry(
+                    s, Side.LONG, ss.position_long, ss.trailing_long,
+                    account.balance, we_long, ep, price, regime_view.long_mode,
+                )
+                if trail_long is not None:
+                    trailing_entries.append(trail_long)
+                trail_short = self.grid.compute_trailing_entry(
+                    s, Side.SHORT, ss.position_short, ss.trailing_short,
+                    account.balance, we_short, ep, price, regime_view.short_mode,
+                )
+                if trail_short is not None:
+                    trailing_entries.append(trail_short)
+
                 # Trend overlay — direct emission driven by the arbiter.
                 trend_entries = self._emit_trend_overlay(
                     s, regime_view, price, account, ep,
@@ -228,6 +245,7 @@ class Backtester:
 
                 all_orders.extend(grid_long)
                 all_orders.extend(grid_short)
+                all_orders.extend(trailing_entries)
                 all_orders.extend(trend_entries)
                 all_orders.extend(trend_exits_long)
                 all_orders.extend(trend_exits_short)
@@ -296,6 +314,13 @@ class Backtester:
             for pos in (ss.position_short, ss.trend_short):
                 if pos.is_open:
                     pos.update_best_price(c.low, Side.SHORT)
+            # Stage 8 trailing-entry price bundles. Only feed candle
+            # extremes while the position is open; bundles get re-seeded
+            # on each position open in _add_to_position.
+            if ss.position_long.is_open:
+                ss.trailing_long.update_long(c.high, c.low)
+            if ss.position_short.is_open:
+                ss.trailing_short.update_short(c.high, c.low)
 
     def _update_emas(self, account: AccountState, candles: dict[str, Candle]):
         for s, c in candles.items():
@@ -431,7 +456,21 @@ class Backtester:
                     pnl = close_qty * (pos.entry_price - fill_price) * ep.c_mult
                 self._reduce_position(pos, close_qty)
             else:
+                # Seed the trailing bundle on a fresh open of the grid
+                # bucket — this is the only entry path that drives the
+                # passivbot-style trailing re-entry, so we don't reset
+                # for trend-bucket fills.
+                fresh_grid_open = (
+                    not pos.is_open
+                    and order.source != OrderSource.TREND
+                )
                 self._add_to_position(pos, order.qty, fill_price)
+                if fresh_grid_open:
+                    bundle = (
+                        ss.trailing_long if order.side == Side.LONG
+                        else ss.trailing_short
+                    )
+                    bundle.reset(fill_price)
 
             step_fills.append(Fill(
                 timestamp=timestamp,
