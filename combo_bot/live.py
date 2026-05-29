@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from combo_bot.types import (
@@ -78,6 +79,15 @@ class LiveTrader:
         self._running = False
         self._open_orders: dict[str, list[dict]] = {}
         self._funding_rates: dict[str, float] = {}
+        # ── execution guards (modelled on passivbot executor / reconciler) ──
+        # Throttle re-creating the same order within a short window.
+        self._recent_creates: deque[tuple[float, str, float, float]] = deque(maxlen=32)
+        # Throttle re-cancelling the same order.
+        self._recent_cancels: deque[tuple[float, str]] = deque(maxlen=32)
+        # Symbols whose positions just changed — defer new entries one cycle.
+        self._state_change_symbols: set[str] = set()
+        # Max age for recent-order dedup (ms).
+        self._recent_order_window_ms: int = 15_000
 
     async def start(self):
         logger.info("Starting live trader (dry_run=%s)", self.config.dry_run)
@@ -302,13 +312,20 @@ class LiveTrader:
                 # bucket. This means on a cold start the entire position
                 # goes into the grid bucket — trend bookkeeping is rebuilt
                 # only by subsequent overlay entries.
+                prev_size: float = 0.0
                 if side == "long":
                     tracked_trend = abs(ss.trend_long.size)
                     grid_size = max(size - tracked_trend, 0.0)
+                    prev_size = ss.position_long.size
+                    if abs(grid_size - prev_size) > 1e-10:
+                        self._state_change_symbols.add(symbol)
                     ss.position_long = Position(size=grid_size, entry_price=entry)
                 elif side == "short":
                     tracked_trend = abs(ss.trend_short.size)
                     grid_size = max(size - tracked_trend, 0.0)
+                    prev_size = ss.position_short.size
+                    if abs(grid_size - prev_size) > 1e-10:
+                        self._state_change_symbols.add(symbol)
                     ss.position_short = Position(size=grid_size, entry_price=entry)
                 ss.last_price = float(p.get("markPrice", 0) or ss.last_price)
         except Exception:
@@ -388,12 +405,23 @@ class LiveTrader:
                 logger.exception("Failed to fetch candles for %s", symbol)
 
     async def _reconcile_orders(self, desired: list[Order]):
+        now_ms = int(time.time() * 1000)
+        # ── prune stale dedup entries ──────────────────────────────
+        cutoff = now_ms - self._recent_order_window_ms
+        while self._recent_creates and self._recent_creates[0][0] < cutoff:
+            self._recent_creates.popleft()
+        while self._recent_cancels and self._recent_cancels[0][0] < cutoff:
+            self._recent_cancels.popleft()
+
         for symbol in self.config.symbols:
             try:
                 existing = await self.exchange.fetch_open_orders(symbol)
             except Exception:
                 existing = []
             self._open_orders[symbol] = existing
+
+        recent_create_keys = {(p, q) for (_, _, p, q) in self._recent_creates}
+        recent_cancel_ids = {oid for (_, oid) in self._recent_cancels}
 
         to_cancel = []
         to_create = []
@@ -416,16 +444,36 @@ class LiveTrader:
 
             for j, e in enumerate(existing):
                 if j not in matched_existing:
+                    eid = e.get("id")
+                    if eid and eid in recent_cancel_ids:
+                        continue  # already cancelled this window
                     to_cancel.append(e)
 
             for i, d in enumerate(symbol_desired):
                 if i not in matched_desired:
+                    # Skip new entries for symbols whose position just
+                    # changed — stale exchange state could cause a double.
+                    if symbol in self._state_change_symbols and not d.reduce_only:
+                        continue
+                    # Skip if we recently created this exact (price, qty).
+                    key = (round(d.price, 6), round(d.qty, 8))
+                    if key in recent_create_keys:
+                        continue
                     to_create.append(d)
+
+        # Clear state-change set after reconciliation so next tick can
+        # create orders again for those symbols.
+        self._state_change_symbols.clear()
 
         for e in to_cancel[:self.config.max_orders_per_batch]:
             await self._cancel_order(e)
 
         for d in to_create[:self.config.max_orders_per_batch]:
+            # Record BEFORE the API call so the next tick dedup sees it
+            # even if the exchange hasn't confirmed yet.
+            self._recent_creates.append(
+                (now_ms, d.symbol, round(d.price, 6), round(d.qty, 8))
+            )
             await self._create_order(d)
 
     def _orders_match(self, desired: Order, existing: dict) -> bool:
@@ -455,6 +503,7 @@ class LiveTrader:
             return
         try:
             await self.exchange.cancel_order(order_id, symbol)
+            self._recent_cancels.append((int(time.time() * 1000), order_id))
             logger.info("Cancelled %s %s", symbol, order_id)
         except Exception:
             logger.exception("Failed to cancel %s %s", symbol, order_id)
@@ -481,12 +530,28 @@ class LiveTrader:
             result = await self.exchange.create_order(
                 order.symbol, order_type, side, order.qty, price, params
             )
-            logger.info(
-                "Created %s %s %s %.4f @ %s → %s",
-                order_type, side, order.symbol, order.qty,
-                f"{order.price:.2f}" if not order.is_market else "MKT",
-                result.get("id", "?"),
-            )
+            status = str(result.get("status", "")).lower()
+            oid = result.get("id", "?")
+            if status in ("expired", "rejected"):
+                logger.warning(
+                    "Order %s %s %s %.4f @ %s → %s (status=%s)",
+                    order_type, side, order.symbol, order.qty,
+                    f"{order.price:.2f}" if not order.is_market else "MKT",
+                    oid, status,
+                )
+                # Remove from recent_creates so the next tick can retry.
+                key = (round(order.price, 6), round(order.qty, 8))
+                for i in range(len(self._recent_creates) - 1, -1, -1):
+                    if self._recent_creates[i][2] == key[0] and self._recent_creates[i][3] == key[1]:
+                        del self._recent_creates[i]
+                        break
+            else:
+                logger.info(
+                    "Created %s %s %s %.4f @ %s → %s",
+                    order_type, side, order.symbol, order.qty,
+                    f"{order.price:.2f}" if not order.is_market else "MKT",
+                    oid,
+                )
         except Exception:
             logger.exception(
                 "Failed to create %s %s %s %.4f @ %.2f",
@@ -559,6 +624,11 @@ class LiveTrader:
             "equity": self.account.equity,
             "equity_peak": self.account.equity_peak,
             "timestamp": int(time.time() * 1000),
+            # ── risk-tier persistence (survives restart) ──
+            "risk_tier": self.risk.tier.value,
+            "risk_red_latched": self.risk.red_latched,
+            "risk_red_cooldown_until": self.risk.red_cooldown_until,
+            "risk_dd_ema": self.risk.dd_ema,
         }
         try:
             Path(self.config.state_file).write_text(json.dumps(state, indent=2))
@@ -569,5 +639,16 @@ class LiveTrader:
         try:
             data = json.loads(Path(self.config.state_file).read_text())
             self.account.equity_peak = data.get("equity_peak", 0)
+            # Restore risk state so a restart doesn't forget RED.
+            self.risk.tier = data.get("risk_tier", self.risk.tier)
+            self.risk.red_latched = data.get("risk_red_latched", False)
+            self.risk.red_cooldown_until = data.get("risk_red_cooldown_until", 0)
+            self.risk.dd_ema = data.get("risk_dd_ema", 0.0)
+            if self.risk.red_latched or self.risk.tier == "red":
+                logger.warning(
+                    "[risk] restored RED/latched state from disk — bot will "
+                    "NOT open new positions until cooldown expires or latch "
+                    "is manually reset"
+                )
         except Exception:
             pass
