@@ -190,8 +190,18 @@ class LiveTrader:
                 + trend_exits_l + trend_exits_s + strategy_orders
             )
 
+        tick_ms = int(time.time() * 1000)
+        # Stage 5 unstuck — same call as Backtester. Wall-clock time
+        # drives both the 24h loss budget and any later staleness checks.
+        unstuck_orders = self.risk.compute_unstuck_orders(
+            self.account,
+            grid_wallet_exposure_limit=self.config.grid.wallet_exposure_limit,
+            now_ms=tick_ms,
+        )
+        all_desired_orders.extend(unstuck_orders)
+
         all_desired_orders = self.risk.filter_orders(
-            all_desired_orders, self.account, int(time.time() * 1000)
+            all_desired_orders, self.account, tick_ms,
         )
 
         await self._reconcile_orders(all_desired_orders)

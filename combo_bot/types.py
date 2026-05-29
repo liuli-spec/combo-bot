@@ -1,7 +1,13 @@
 from __future__ import annotations
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 import numpy as np
+
+# A day in milliseconds — used for the rolling-loss allowance window
+# that throttles the unstuck mechanism. Defined here (not in risk.py) so
+# AccountState can prune entries without importing the risk layer.
+_DAY_MS = 24 * 60 * 60 * 1000
 
 
 class Side(str, Enum):
@@ -232,6 +238,24 @@ class AccountState:
     equity_peak: float = 0.0
     pnl_cumsum: float = 0.0
     funding_cumsum: float = 0.0
+    # Stage 4: per-source bookkeeping so the risk layer can pause one
+    # source (e.g. trend overlay) without throttling the other. Each
+    # bucket tracks realized P&L, current marked-to-market equity, and
+    # its running peak — drawdowns are measured against the bucket's
+    # own peak, normalized to the wallet balance.
+    grid_realized_pnl: float = 0.0
+    trend_realized_pnl: float = 0.0
+    grid_equity: float = 0.0
+    trend_equity: float = 0.0
+    grid_equity_peak: float = 0.0
+    trend_equity_peak: float = 0.0
+    # Stage 5: rolling-24h realized losses per source, fed by every fill
+    # via add_realized_pnl. Used by the unstuck mechanism to cap the rate
+    # at which controlled exposure shedding can realize losses. Only
+    # negative deltas are recorded (we don't want gains offsetting the
+    # budget — that's a different decision than P&L bookkeeping).
+    grid_loss_log: deque[tuple[int, float]] = field(default_factory=deque)
+    trend_loss_log: deque[tuple[int, float]] = field(default_factory=deque)
     symbols: dict[str, SymbolState] = field(default_factory=dict)
 
     def total_wallet_exposure(self, side: Side) -> float:
@@ -244,15 +268,74 @@ class AccountState:
         return twe
 
     def update_equity(self):
-        upnl = 0.0
+        grid_upnl = 0.0
+        trend_upnl = 0.0
         for ss in self.symbols.values():
             price = ss.last_price
-            upnl += ss.position_long.unrealized_pnl(price, Side.LONG)
-            upnl += ss.position_short.unrealized_pnl(price, Side.SHORT)
-            upnl += ss.trend_long.unrealized_pnl(price, Side.LONG)
-            upnl += ss.trend_short.unrealized_pnl(price, Side.SHORT)
-        self.equity = self.balance + upnl
+            grid_upnl += ss.position_long.unrealized_pnl(price, Side.LONG)
+            grid_upnl += ss.position_short.unrealized_pnl(price, Side.SHORT)
+            trend_upnl += ss.trend_long.unrealized_pnl(price, Side.LONG)
+            trend_upnl += ss.trend_short.unrealized_pnl(price, Side.SHORT)
+        self.equity = self.balance + grid_upnl + trend_upnl
         self.equity_peak = max(self.equity_peak, self.equity)
+        self.grid_equity = self.grid_realized_pnl + grid_upnl
+        self.trend_equity = self.trend_realized_pnl + trend_upnl
+        self.grid_equity_peak = max(self.grid_equity_peak, self.grid_equity)
+        self.trend_equity_peak = max(self.trend_equity_peak, self.trend_equity)
+
+    def add_realized_pnl(
+        self, source: "OrderSource", amount: float, timestamp_ms: int = 0
+    ) -> None:
+        """Route a realized P&L delta to the bucket the fill belongs to.
+
+        RISK source closes the grid bucket (strategy ``custom_exit`` compat),
+        so it accrues to grid_realized_pnl too — matching the fill-routing
+        rule in :meth:`SymbolState.bucket`.
+
+        Negative deltas are also appended to the bucket's rolling-24h
+        loss log so the unstuck mechanism can see how much loss budget
+        has already been spent.
+        """
+        if source == OrderSource.TREND:
+            self.trend_realized_pnl += amount
+            if amount < 0:
+                self.trend_loss_log.append((timestamp_ms, amount))
+        else:
+            self.grid_realized_pnl += amount
+            if amount < 0:
+                self.grid_loss_log.append((timestamp_ms, amount))
+
+    def loss_24h(self, source: "OrderSource", now_ms: int) -> float:
+        """Sum of negative realized P&L for ``source`` in the last 24h.
+
+        Returns a non-positive number (zero if no losses, or losses are
+        outside the window). Prunes the bucket's log of entries older
+        than 24h as a side effect — keeps the deque bounded.
+        """
+        log = (
+            self.trend_loss_log
+            if source == OrderSource.TREND
+            else self.grid_loss_log
+        )
+        cutoff = now_ms - _DAY_MS
+        while log and log[0][0] < cutoff:
+            log.popleft()
+        return sum(amount for _, amount in log)
+
+    def source_drawdown_pct(self, source: "OrderSource") -> float:
+        """Bucket drawdown as a fraction of the wallet balance.
+
+        Normalized to ``balance`` (not to the bucket's own peak) so a
+        tiny bucket peak doesn't produce a misleadingly large fractional
+        drawdown. Returns 0 when peak is non-positive (nothing to draw
+        down from yet).
+        """
+        if source == OrderSource.TREND:
+            peak, eq = self.trend_equity_peak, self.trend_equity
+        else:
+            peak, eq = self.grid_equity_peak, self.grid_equity
+        denom = max(self.balance, 1e-12)
+        return max(0.0, (peak - eq) / denom)
 
     @staticmethod
     def _buckets_for_side(ss: "SymbolState", side: Side) -> tuple[Position, Position]:

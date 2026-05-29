@@ -86,8 +86,6 @@ class Backtester:
 
         fills: list[Fill] = []
         equity_log: list[tuple[int, float]] = []
-        grid_pnl = 0.0
-        trend_pnl = 0.0
 
         funding_hour_counter = 0
 
@@ -229,19 +227,30 @@ class Backtester:
                 all_orders.extend(trend_exits_short)
                 all_orders.extend(strategy_orders)
 
+            # Stage 5: passivbot-style unstuck — emit small controlled
+            # reduce-only limit orders for any bucket whose wallet
+            # exposure crosses the unstuck threshold. Runs alongside
+            # (not instead of) the regular close ladder; the fill
+            # simulator deduplicates by limit price.
+            unstuck_orders = self.risk.compute_unstuck_orders(
+                account,
+                grid_wallet_exposure_limit=self.config.grid.wallet_exposure_limit,
+                now_ms=ts,
+            )
+            all_orders.extend(unstuck_orders)
+
             all_orders = self.risk.filter_orders(all_orders, account, ts)
 
             step_fills = self._simulate_fills(all_orders, candles, account, exchange_params, ts)
             for f in step_fills:
                 fills.append(f)
                 account.balance += f.realized_pnl - f.fee
-                # GRID + RISK both touch the grid bucket; TREND touches the
-                # trend bucket. Attribute P&L by the bucket, not by who
-                # emitted the order.
-                if f.source == OrderSource.TREND:
-                    trend_pnl += f.realized_pnl - f.fee
-                else:
-                    grid_pnl += f.realized_pnl - f.fee
+                # Route P&L into the bucket the fill operated on. RISK
+                # source routes to the grid bucket (matches the
+                # fill-routing rule in SymbolState.bucket). Timestamp
+                # threads through so the rolling-24h loss budget can be
+                # measured against bar time, not wall-clock.
+                account.add_realized_pnl(f.source, f.realized_pnl - f.fee, ts)
 
             hours_elapsed = (step + 1) / 60.0
             if int(hours_elapsed / self.config.funding_interval_hours) > funding_hour_counter:
@@ -252,7 +261,10 @@ class Backtester:
             account.update_equity()
             equity_log.append((ts, account.equity))
 
-        return self._compile_result(fills, equity_log, account, grid_pnl, trend_pnl)
+        return self._compile_result(
+            fills, equity_log, account,
+            account.grid_realized_pnl, account.trend_realized_pnl,
+        )
 
     def _update_prices(self, account: AccountState, candles: dict[str, Candle]):
         for s, c in candles.items():
