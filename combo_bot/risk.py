@@ -71,25 +71,91 @@ class RiskManager:
         self.config = config or RiskConfig()
         self.tier = RiskTier.GREEN
         self.red_cooldown_until: int = 0
+        # Stage 6 HardStop state. ``dd_ema`` holds the time-decayed
+        # drawdown EMA; ``_dd_initialized`` lets the very first
+        # ``assess`` call short-circuit to raw drawdown so single-shot
+        # unit tests still produce a deterministic tier without needing
+        # to advance through multiple ticks. ``red_latched`` mirrors
+        # passivbot's latch — once RED, the tier returns RED until
+        # ``reset_red_latch`` is called.
+        self.dd_ema: float = 0.0
+        self.last_assess_minute: int = 0
+        self._dd_initialized: bool = False
+        self.red_latched: bool = False
 
-    def assess(self, account: AccountState) -> RiskTier:
-        dd = account.drawdown
+    def reset_red_latch(self) -> None:
+        """Clear the RED latch and any active cooldown.
 
-        if dd >= self.config.red_threshold:
-            self.tier = RiskTier.RED
-        elif dd >= self.config.orange_threshold:
-            self.tier = RiskTier.ORANGE
-        elif dd >= self.config.yellow_threshold:
-            self.tier = RiskTier.YELLOW
+        Intended for explicit operator action (or for tests). Re-entry
+        into RED requires the drawdown threshold to be crossed again.
+        Cooldown is reset too — an explicit reset means "fully clear",
+        otherwise the lingering cooldown would still block entries.
+        """
+        self.red_latched = False
+        self.red_cooldown_until = 0
+        self.tier = RiskTier.GREEN
+
+    def assess(
+        self, account: AccountState, timestamp_ms: int = 0
+    ) -> RiskTier:
+        raw = account.drawdown
+        score = self._update_dd_score(raw, timestamp_ms)
+
+        if score >= self.config.red_threshold:
+            base_tier = RiskTier.RED
+        elif score >= self.config.orange_threshold:
+            base_tier = RiskTier.ORANGE
+        elif score >= self.config.yellow_threshold:
+            base_tier = RiskTier.YELLOW
         else:
-            self.tier = RiskTier.GREEN
+            base_tier = RiskTier.GREEN
 
+        if base_tier == RiskTier.RED and self.config.red_latch_enabled:
+            self.red_latched = True
+
+        # Once latched, the tier is pinned at RED until reset, regardless
+        # of how far drawdown recovers.
+        self.tier = RiskTier.RED if self.red_latched else base_tier
         return self.tier
+
+    def _update_dd_score(self, raw: float, timestamp_ms: int) -> float:
+        """Return the drawdown score used for tier classification.
+
+        ``score = min(raw, ema)`` per passivbot's hard-stop design.
+        Disabled (returns raw) when ``dd_ema_span_minutes <= 0`` or on
+        the very first call (so single-shot tests still classify
+        deterministically without needing a tick history).
+        """
+        if self.config.dd_ema_span_minutes <= 0:
+            return raw
+
+        current_minute = timestamp_ms // 60_000
+        if not self._dd_initialized:
+            # Seed the EMA at the current raw drawdown so the next
+            # call's smoothing starts from a sane anchor, and use raw
+            # for this call.
+            self.dd_ema = raw
+            self.last_assess_minute = current_minute
+            self._dd_initialized = True
+            return raw
+
+        elapsed_minutes = max(0, current_minute - self.last_assess_minute)
+        if elapsed_minutes > 0:
+            alpha = 2.0 / (self.config.dd_ema_span_minutes + 1.0)
+            decay = (1.0 - alpha) ** elapsed_minutes
+            # raw + (ema - raw) * decay  ==  alpha-blended EMA, accounting
+            # for variable elapsed time between ticks.
+            self.dd_ema = raw + (self.dd_ema - raw) * decay
+            self.last_assess_minute = current_minute
+
+        # min(raw, ema) — see RiskConfig docstring for the two failure
+        # modes this guards against.
+        return min(raw, self.dd_ema)
 
     def filter_orders(
         self, orders: list[Order], account: AccountState, timestamp: int = 0
     ) -> list[Order]:
-        tier = self.assess(account)
+        tier = self.assess(account, timestamp)
 
         if tier == RiskTier.RED:
             self.red_cooldown_until = timestamp + self.config.cooldown_after_red_minutes * 60_000
