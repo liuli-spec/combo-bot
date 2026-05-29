@@ -203,13 +203,17 @@ class Backtester:
                     account.balance, we_long, ep, price, regime_view.long_mode,
                 )
                 if trail_long is not None:
-                    trailing_entries.append(trail_long)
+                    trailing_entries.extend(
+                        self.strategy_runner.filter_entries([trail_long], ctx_long)
+                    )
                 trail_short = self.grid.compute_trailing_entry(
                     s, Side.SHORT, ss.position_short, ss.trailing_short,
                     account.balance, we_short, ep, price, regime_view.short_mode,
                 )
                 if trail_short is not None:
-                    trailing_entries.append(trail_short)
+                    trailing_entries.extend(
+                        self.strategy_runner.filter_entries([trail_short], ctx_short)
+                    )
 
                 # Trend overlay — direct emission driven by the arbiter.
                 trend_entries = self._emit_trend_overlay(

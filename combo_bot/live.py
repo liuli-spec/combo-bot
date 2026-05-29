@@ -175,6 +175,26 @@ class LiveTrader:
                 self.strategy_runner.filter_entries(grid_short, ctx_short), ctx_short,
             )
 
+            # Stage 8 trailing re-entries (passivbot-style). No-op when
+            # entry_trailing_threshold_pct / retracement_pct are 0.
+            trailing_entries: list[Order] = []
+            trail_long = self.grid.compute_trailing_entry(
+                symbol, Side.LONG, ss.position_long, ss.trailing_long,
+                self.account.balance, we_long, ep, price, regime_view.long_mode,
+            )
+            if trail_long is not None:
+                trailing_entries.extend(
+                    self.strategy_runner.filter_entries([trail_long], ctx_long)
+                )
+            trail_short = self.grid.compute_trailing_entry(
+                symbol, Side.SHORT, ss.position_short, ss.trailing_short,
+                self.account.balance, we_short, ep, price, regime_view.short_mode,
+            )
+            if trail_short is not None:
+                trailing_entries.extend(
+                    self.strategy_runner.filter_entries([trail_short], ctx_short)
+                )
+
             trend_entries = self._emit_trend_overlay(symbol, regime_view, price, ep)
             trend_exits_l = self.merger.generate_trend_exit_orders(symbol, ss.trend_long, Side.LONG, price, ep)
             trend_exits_s = self.merger.generate_trend_exit_orders(symbol, ss.trend_short, Side.SHORT, price, ep)
@@ -194,7 +214,7 @@ class LiveTrader:
             ss.mode_short = regime_view.short_mode
 
             all_desired_orders.extend(
-                grid_long + grid_short + trend_entries
+                grid_long + grid_short + trailing_entries + trend_entries
                 + trend_exits_l + trend_exits_s + strategy_orders
             )
 
@@ -280,6 +300,25 @@ class LiveTrader:
                     last = ohlcv[-1]
                     ss = self.account.symbols[symbol]
                     ss.last_price = float(last[4])
+                    high = float(last[2])
+                    low = float(last[3])
+                    # Stage 8 trailing-entry bundle: seed on first sight
+                    # of an open grid bucket, invalidate when closed so
+                    # the next open re-seeds. Trend bucket positions
+                    # don't drive trailing re-entries (they're managed
+                    # by the overlay path).
+                    if ss.position_long.is_open:
+                        if not ss.trailing_long.initialized:
+                            ss.trailing_long.reset(ss.position_long.entry_price)
+                        ss.trailing_long.update_long(high, low)
+                    else:
+                        ss.trailing_long.initialized = False
+                    if ss.position_short.is_open:
+                        if not ss.trailing_short.initialized:
+                            ss.trailing_short.reset(ss.position_short.entry_price)
+                        ss.trailing_short.update_short(high, low)
+                    else:
+                        ss.trailing_short.initialized = False
                     # Ratchet trailing-stop high-water-marks across grid
                     # and trend buckets.
                     for pos in (ss.position_long, ss.trend_long):
