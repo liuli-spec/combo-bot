@@ -267,6 +267,20 @@ class Optimizer:
             if train_end - start < 2 or end - train_end < 2:
                 continue
 
+            # -- train sanity check: parameter set must produce at least
+            # one trade in-sample.  If it fails even on the data it
+            # "knows", the trial is hopeless — short-circuit to penalty.
+            train_candles = {
+                s: self._candle_data[s][start:train_end] for s in self._symbols
+            }
+            if len(next(iter(train_candles.values()))) >= 100:
+                train_result = Backtester(config).run(
+                    train_candles,
+                    exchange_params=self._exchange_params,
+                )
+                if train_result.n_trades == 0:
+                    return -1e6
+
             # -- test partition --
             test_candles = {
                 s: self._candle_data[s][train_end:end] for s in self._symbols

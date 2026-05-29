@@ -156,7 +156,20 @@ def walk_forward_score(
             continue
         sub = candle_array[start:end]
         train_end = start + int((end - start) * cfg.train_ratio)
+        train = candle_array[start:train_end]
         test = candle_array[train_end:end]
+
+        # Train sanity: parameter set must produce at least one trade in-sample.
+        if train.shape[0] >= 100:
+            try:
+                train_result = run_rust_backtest(
+                    train, grid_config, exchange_params, cfg.backtest_config,
+                )
+                if train_result.n_trades == 0:
+                    continue
+            except Exception:
+                continue
+
         if test.shape[0] < 500:
             continue
         try:
