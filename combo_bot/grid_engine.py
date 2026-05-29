@@ -59,9 +59,14 @@ class GridConfig:
 
 @dataclass
 class ForagerWeights:
-    volume: float = 0.23
-    volatility: float = 0.71
-    ema_readiness: float = 0.06
+    volume: float = 0.20
+    volatility: float = 0.55
+    ema_readiness: float = 0.05
+    # |trend.direction| × strength contribution to the score. Adds a
+    # "momentum" axis so the Forager prefers symbols with a clear
+    # directional regime over choppy / mean-reverting ones. Zero keeps
+    # the legacy volume/volatility/ema behaviour.
+    trend_conviction: float = 0.20
 
 
 def quantize_qty(qty: float, step: float) -> float:
@@ -481,27 +486,50 @@ class ForagerScorer:
         volatility_score: float,
         ema_readiness_score: float,
         weights: ForagerWeights,
+        trend_conviction: float = 0.0,
     ) -> float:
+        """Linear weighted score over [0, 1] inputs.
+
+        ``trend_conviction`` should be ``|direction| * strength`` from
+        a TrendSignal — high in clear regimes, low in choppy / NEUTRAL
+        ones. The high-risk profile uses this to bias selection toward
+        symbols with a real directional opinion.
+        """
         return (
             weights.volume * volume_score
             + weights.volatility * volatility_score
             + weights.ema_readiness * ema_readiness_score
+            + weights.trend_conviction * trend_conviction
         )
 
     @staticmethod
     def select_symbols(
-        candidates: dict[str, tuple[float, float, float]],
+        candidates: dict[str, tuple[float, float, float] | tuple[float, float, float, float]],
         n_positions: int,
         weights: ForagerWeights,
     ) -> list[str]:
         """DEPRECATED: Forager selection is handled in Rust
-        multi_symbol.rs.  Retained for reference / interactive use."""
+        multi_symbol.rs.  Retained for reference / interactive use.
+
+        Each candidate tuple is ``(volume, volatility, ema_readiness)``
+        or ``(volume, volatility, ema_readiness, trend_conviction)`` —
+        the 4-tuple form lets callers feed a per-symbol ``|direction|
+        * strength`` value derived from ``TrendSignal``. The 3-tuple
+        form is supported for backward compatibility (trend_conviction
+        defaults to 0).
+        """
         import warnings
         warnings.warn("ForagerScorer.select_symbols is unused; Forager runs in Rust multi_symbol.rs", DeprecationWarning, stacklevel=2)
         scored: list[tuple[str, float]] = []
-        for symbol, (vol_score, volatility_score, ema_score) in candidates.items():
+        for symbol, scores in candidates.items():
+            if len(scores) == 4:
+                vol_score, volatility_score, ema_score, trend_conv = scores
+            else:
+                vol_score, volatility_score, ema_score = scores  # type: ignore[misc]
+                trend_conv = 0.0
             total = ForagerScorer.score_symbol(
                 vol_score, volatility_score, ema_score, weights,
+                trend_conviction=trend_conv,
             )
             scored.append((symbol, total))
 

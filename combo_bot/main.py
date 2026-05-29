@@ -25,6 +25,7 @@ def cmd_backtest(args):
     from combo_bot.merger import MergerConfig
     from combo_bot.risk import RiskConfig
     from combo_bot.data import load_cached_data
+    from combo_bot.fusion_config import build_fusion, build_regime_config
 
     cfg = load_config(args.config)
 
@@ -52,6 +53,7 @@ def cmd_backtest(args):
         trend=TrendConfig(**cfg.get("trend", {})),
         merger=MergerConfig(**cfg.get("merger", {})),
         risk=RiskConfig(**cfg.get("risk", {})),
+        regime=build_regime_config(cfg),
     )
 
     candle_data = load_cached_data(bt_config.symbols, data_dir=cfg.get("data_dir", "data"))
@@ -62,7 +64,17 @@ def cmd_backtest(args):
     logger.info("Running backtest on %d symbols, %d candles each",
                 len(candle_data), min(len(v) for v in candle_data.values()))
 
-    bt = Backtester(bt_config)
+    fusion = build_fusion(cfg)
+    if any(fusion[k] for k in ("kelly_sizer", "correlation_gate", "vol_target_sizer")) \
+            or fusion["protections"]:
+        logger.info(
+            "Fusion layer active: kelly=%s correlation=%s vol_target=%s protections=%d",
+            fusion["kelly_sizer"] is not None,
+            fusion["correlation_gate"] is not None,
+            fusion["vol_target_sizer"] is not None,
+            len(fusion["protections"]),
+        )
+    bt = Backtester(bt_config, **fusion)
     result = bt.run(candle_data)
 
     print("\n" + "=" * 60)
@@ -163,6 +175,7 @@ def cmd_live(args):
     from combo_bot.trend_signal import TrendConfig
     from combo_bot.merger import MergerConfig
     from combo_bot.risk import RiskConfig
+    from combo_bot.fusion_config import build_fusion, build_regime_config
 
     cfg = load_config(args.config)
 
@@ -174,6 +187,7 @@ def cmd_live(args):
         trend=TrendConfig(**cfg.get("trend", {})),
         merger=MergerConfig(**cfg.get("merger", {})),
         risk=RiskConfig(**cfg.get("risk", {})),
+        regime=build_regime_config(cfg),
     )
 
     if args.real:
@@ -187,7 +201,17 @@ def cmd_live(args):
 
     exchange = create_exchange(testnet=args.testnet)
 
-    trader = LiveTrader(live_cfg, exchange)
+    fusion = build_fusion(cfg)
+    if any(fusion[k] for k in ("kelly_sizer", "correlation_gate", "vol_target_sizer")) \
+            or fusion["protections"]:
+        logger.info(
+            "Fusion layer active: kelly=%s correlation=%s vol_target=%s protections=%d",
+            fusion["kelly_sizer"] is not None,
+            fusion["correlation_gate"] is not None,
+            fusion["vol_target_sizer"] is not None,
+            len(fusion["protections"]),
+        )
+    trader = LiveTrader(live_cfg, exchange, **fusion)
 
     async def run():
         try:

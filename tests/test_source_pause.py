@@ -105,10 +105,14 @@ class TestAccountSourceBookkeeping:
 
 class TestTrendPause:
     def test_trend_overlay_entry_dropped_when_trend_bucket_in_dd(self):
+        # With tier=GREEN the source pause now applies a 1.5× relax
+        # to the configured threshold, so the bucket DD has to push
+        # past pause_trend_dd_pct * 1.5 (= 0.15) to fire. 16% trend
+        # drawdown is comfortably above that line.
         risk = _risk(pause_trend_dd_pct=0.10)
         acc = _account()
-        acc.trend_equity_peak = 1500.0
-        acc.trend_equity = 500.0  # 1000 dd / 10000 balance = 10%
+        acc.trend_equity_peak = 2000.0
+        acc.trend_equity = 400.0  # 1600 dd / 10000 balance = 16%
 
         orders = [
             Order("BTC", Side.LONG, 50_000, 0.01, OrderSource.TREND),
@@ -148,10 +152,11 @@ class TestTrendPause:
 
 class TestGridPause:
     def test_grid_entry_dropped_when_grid_bucket_in_dd(self):
+        # threshold 0.20 × GREEN relax 1.5 = 0.30 effective; push to 40%.
         risk = _risk(pause_grid_dd_pct=0.20)
         acc = _account()
-        acc.grid_equity_peak = 3000.0
-        acc.grid_equity = 500.0  # 25% dd
+        acc.grid_equity_peak = 4000.0
+        acc.grid_equity = 0.0  # 40% dd
 
         orders = [Order("BTC", Side.LONG, 49_000, 0.02, OrderSource.GRID)]
         filtered = risk.filter_orders(orders, acc)
@@ -189,16 +194,17 @@ class TestGridPause:
 
 class TestPauseReset:
     def test_pause_clears_when_bucket_returns_to_peak(self):
+        # threshold 0.10 × GREEN relax 1.5 = 0.15 effective; push to 20%.
         risk = _risk(pause_trend_dd_pct=0.10)
         acc = _account()
-        # Initially in drawdown — paused.
-        acc.trend_equity_peak = 1500.0
+        # Initially in drawdown well past the relax-adjusted line.
+        acc.trend_equity_peak = 2000.0
         acc.trend_equity = 0.0
         order = Order("BTC", Side.LONG, 50_000, 0.01, OrderSource.TREND)
         assert risk.filter_orders([order], acc) == []
 
         # Recovery: bucket climbs back to peak — pause clears.
-        acc.trend_equity = 1500.0
+        acc.trend_equity = 2000.0
         filtered = risk.filter_orders([order], acc)
         assert len(filtered) == 1
 

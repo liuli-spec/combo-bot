@@ -34,8 +34,16 @@ if TYPE_CHECKING:
 class RegimeArbiterConfig:
     # Signal strength above which the favored-side grid switches to AGGRESSIVE.
     aggressive_strength: float = 0.4
-    # Signal strength above which the trend overlay is activated.
-    overlay_strength: float = 0.6
+    # Minimum conviction below which the overlay is entirely off (a floor,
+    # not a step threshold). Above this floor the overlay scale grows
+    # continuously with conviction — no more 0.59 → off, 0.61 → full on
+    # cliff that the old ``overlay_strength`` hard gate produced.
+    overlay_min_conviction: float = 0.25
+    # Exponent applied to conviction in the overlay-scale formula.
+    # >1 → quiet at low conviction, ramps fast near 1.0 (high-risk default
+    # leans into strong signals); <1 → spreads exposure across the
+    # conviction range. 1.5 is the high-risk default.
+    overlay_conviction_curve: float = 1.5
     # In STRONG_BULL/BEAR, PANIC-close the opposite side. Set False to fall
     # back to TP_ONLY (passivbot-style — wait for the position to recover).
     panic_close_opposite_on_strong: bool = True
@@ -78,6 +86,19 @@ class RegimeArbiter:
         long_overlay_blocked = funding_rate > cfg.funding_overlay_veto_pct
         short_overlay_blocked = funding_rate < -cfg.funding_overlay_veto_pct
 
+        def _overlay_scale(conv: float) -> float:
+            """Continuous conviction → overlay scale mapping.
+
+            Returns 0 below the floor; ramps as ``conv**curve`` above,
+            capped at 1.0. This replaces the old hard ``overlay_strength``
+            gate so a marginal conviction shift no longer flips the
+            overlay between off and full-on.
+            """
+            if conv <= cfg.overlay_min_conviction:
+                return 0.0
+            ramp = (conv ** cfg.overlay_conviction_curve) * cfg.overlay_sizing_scale
+            return min(1.0, ramp)
+
         if regime == TrendRegime.STRONG_BULL:
             if cfg.panic_close_opposite_on_strong:
                 short_mode = TradingMode.PANIC
@@ -87,12 +108,13 @@ class RegimeArbiter:
             if conviction >= cfg.aggressive_strength:
                 long_mode = TradingMode.AGGRESSIVE
             close_aggr = cfg.strong_close_aggressiveness
-            if conviction >= cfg.overlay_strength:
+            scale = _overlay_scale(conviction)
+            if scale > 0:
                 if long_overlay_blocked:
                     veto.append(f"funding={funding_rate:.4f} vetoes long overlay")
                 else:
                     overlay = Side.LONG
-                    overlay_scale = min(1.0, conviction * cfg.overlay_sizing_scale)
+                    overlay_scale = scale
 
         elif regime == TrendRegime.STRONG_BEAR:
             if cfg.panic_close_opposite_on_strong:
@@ -103,12 +125,13 @@ class RegimeArbiter:
             if conviction >= cfg.aggressive_strength:
                 short_mode = TradingMode.AGGRESSIVE
             close_aggr = cfg.strong_close_aggressiveness
-            if conviction >= cfg.overlay_strength:
+            scale = _overlay_scale(conviction)
+            if scale > 0:
                 if short_overlay_blocked:
                     veto.append(f"funding={funding_rate:.4f} vetoes short overlay")
                 else:
                     overlay = Side.SHORT
-                    overlay_scale = min(1.0, conviction * cfg.overlay_sizing_scale)
+                    overlay_scale = scale
 
         elif regime == TrendRegime.BULL:
             short_mode = TradingMode.TP_ONLY

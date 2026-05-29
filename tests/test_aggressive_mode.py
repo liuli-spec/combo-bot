@@ -180,8 +180,14 @@ class TestRegimeOverlayEmission:
             starting_balance=10_000, symbols=["BTC"],
             grid=GridConfig(max_grid_levels=2),
             trend=TrendConfig(strong_threshold=0.4, weak_threshold=0.2),
-            # Disable overlay by setting threshold above max possible conviction
-            regime=RegimeArbiterConfig(overlay_strength=99.0, panic_close_opposite_on_strong=False),
+            # Disable overlay by setting the conviction floor above
+            # max possible conviction (1.0). The old hard-gate
+            # `overlay_strength` was replaced by a continuous ramp;
+            # `overlay_min_conviction` is the new disable knob.
+            regime=RegimeArbiterConfig(
+                overlay_min_conviction=99.0,
+                panic_close_opposite_on_strong=False,
+            ),
         )
         result = Backtester(cfg).run({"BTC": candles})
         overlay_entry_fills = [

@@ -63,3 +63,5 @@ optuna-journal*.log
 
 # Codegraph daemon runtime
 .codegraph/
+.codewhale/
+.deepseek/

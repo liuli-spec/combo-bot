@@ -1,65 +1,59 @@
-# Combo Futures
+# Project Instructions
 
-Combined grid + trend futures trading bot. Merges Passivbot-style grid logic with multi-indicator trend signals into a single decision engine, managed by layered risk controls.
+This file provides context for AI assistants working on this project.
 
-## Tech Stack
+## Project Type: Python
 
-- Python 3.11+
-- ccxt — exchange connectivity
-- numpy — numerical computation
-- optuna — hyperparameter optimization (optional)
+### Commands
+- Install: `pip install -e .`
+- Test: `pytest`
+- Format: `black .`
+- Lint: `ruff check .`
 
-## How to Run
+### Documentation
+See README.md for project overview.
 
-### Install dependencies
+### Version Control
+This project uses Git. See .gitignore for excluded files.
 
-```bash
-pip install -e .            # core only
-pip install -e ".[all]"     # core + pandas, pyarrow, optuna
-```
+## Agent Guidance
 
-### Download historical data
+<!-- How should an AI agent approach this project? Fill in tool gotchas, -->
+<!-- file patterns to avoid, and anything that helps a model navigate -->
+<!-- the codebase without reading every file. -->
 
-```bash
-combo-futures download --exchange binance --symbol BTC/USDT:USDT --timeframe 1h
-```
-
-### Backtest
-
-```bash
-combo-futures backtest --config config.json
-```
-
-### Optimize
-
-```bash
-combo-futures optimize --config config.json --trials 200
-```
-
-### Live trading
-
-```bash
-combo-futures live --config config.json
-```
+- **CodeWhale reads this file as:** <!-- WHALE.md (CodeWhale-native) or AGENTS.md (compatible with other agents) -->
+- **Read-only surface:** <!-- Which directories can the agent read but not write? -->
+- **Never edit:** <!-- Files that are generated, vendored, or owned by another tool -->
+- **Always test with:** <!-- The single command that validates a change (e.g. `cargo test -p foo`) -->
 
 ## Architecture
 
-| Module | Purpose |
-|--------|---------|
-| `grid_engine` | Passivbot-inspired grid order placement with EMA entry bands and wallet exposure limits |
-| `trend_signal` | Multi-indicator trend detection (EMA crossover, RSI, ADX, etc.) |
-| `merger` | Decision fusion — combines grid and trend signals into unified order intent |
-| `risk` | 4-tier drawdown guard with equity hard stop loss |
-| `backtest` | Event-driven backtesting engine |
-| `optimize` | NSGA-II multi-objective optimization via Optuna |
-| `live` | Live execution loop with exchange connectivity via ccxt |
+<!-- Describe the high-level structure. What are the key modules and how -->
+<!-- do they connect? Focus on the context a new contributor would need. -->
 
-## Tests
+### Entry Points
+<!-- Where does execution start? Binary entry, request handler, main loop? -->
 
-```bash
-python -m pytest tests/
-```
+### Key Modules
+<!-- List the 3-6 most important directories/files and their role -->
 
-## Important
+### Data Flow
+<!-- How does a request / event / input travel through the system? -->
 
-This is a trading bot. Do NOT commit API keys, secrets, or credentials. Use environment variables or a local `.env` file (which is gitignored).
+## Cache Stability
+
+<!-- DeepSeek V4 uses a byte-stable prefix cache (128-token granularity). -->
+<!-- Keeping these things stable turn-over-turn saves ~90% on input tokens. -->
+
+- **Frequently-rebuilt files:** <!-- Generated code, lockfiles, build artifacts → mark as cache-churn -->
+- **Stable scaffolding:** <!-- Config files, project instructions, model cards → keep byte-stable -->
+- **Append, don't reorder:** <!-- New context goes at the end of the request; reordering invalidates cache -->
+
+## Guidelines
+
+- Follow existing code style and patterns
+- Write tests for new functionality
+- Keep changes focused and atomic
+- Document public APIs
+- Update this file when project conventions change

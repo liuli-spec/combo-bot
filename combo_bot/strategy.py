@@ -55,6 +55,7 @@ class TradeContext:
     signal: TrendSignal | None
     current_time_ms: int
     exchange_params: ExchangeParams
+    source: OrderSource = OrderSource.GRID
 
     @property
     def current_price(self) -> float:
@@ -245,10 +246,10 @@ class StrategyRunner:
     ) -> list[Order]:
         """Apply entry-side strategy hooks to a list of orders.
 
-        Order processing:
-          1. ``confirm_trade_entry`` — drop vetoed orders.
+        Order processing mirrors freqtrade's final-confirm semantics:
+          1. ``custom_entry_price`` / ``adjust_entry_price`` — adjust price.
           2. ``custom_stake_amount`` — adjust qty for new entries.
-          3. ``custom_entry_price`` / ``adjust_entry_price`` — adjust price.
+          3. ``confirm_trade_entry`` — drop vetoed final orders.
         """
         result: list[Order] = []
         for order in orders:
@@ -258,9 +259,6 @@ class StrategyRunner:
                 continue
 
             ctx = self._ctx_for_order(context, order)
-            if not self.strategy.confirm_trade_entry(ctx, order.qty, order.price):
-                continue
-
             new_price = self.strategy.custom_entry_price(ctx, order.price)
             adjusted = self.strategy.adjust_entry_price(ctx, new_price)
             final_price = adjusted if adjusted is not None else new_price
@@ -272,6 +270,9 @@ class StrategyRunner:
                 ctx, proposed_stake, min_stake, max_stake
             )
             new_qty = new_stake / final_price if final_price > 0 else order.qty
+
+            if not self.strategy.confirm_trade_entry(ctx, new_qty, final_price):
+                continue
 
             result.append(replace(order, price=final_price, qty=new_qty))
 
@@ -334,16 +335,10 @@ class StrategyRunner:
     ) -> Order | None:
         """Call ``adjust_trade_position`` and turn its result into an order.
 
-        The emitted order targets the GRID bucket. ``ctx.position`` in
-        every current caller is the grid-bucket position
-        (``ss.position_long`` / ``ss.position_short``), and freqtrade's
-        ``adjust_trade_position`` is meant to manage the position the
-        strategy is reasoning about. Emitting ``OrderSource.GRID``
-        ensures ``SymbolState.bucket()`` routes the fill to the same
-        bucket whose state the strategy just inspected — a previous
-        hard-coded ``TREND`` source silently no-op'd here because it
-        targeted an empty trend bucket whenever the strategy was
-        managing the grid position.
+        The emitted order targets the same source bucket the strategy
+        inspected in ``ctx.position``. Grid contexts remain GRID; trend
+        contexts remain TREND so strategy-driven exits/adjustments do not
+        accidentally hit the grid bucket.
         """
         if not context.position.is_open:
             return None
@@ -365,7 +360,7 @@ class StrategyRunner:
             side=context.side,
             price=context.current_price,
             qty=abs(delta_qty),
-            source=OrderSource.GRID,
+            source=context.source,
             reduce_only=reduce_only,
         )
 
@@ -375,10 +370,14 @@ class StrategyRunner:
         self, base: TradeContext, order: Order
     ) -> TradeContext:
         """Build a per-order context (side may differ from the base context)."""
-        if order.side == base.side and order.symbol == base.symbol:
+        if (
+            order.side == base.side
+            and order.symbol == base.symbol
+            and order.source == base.source
+        ):
             return base
         symbol_state = base.account.symbols.get(order.symbol)
-        position = self._position_for(symbol_state, order.side)
+        position = self._position_for(symbol_state, order.source, order.side)
         return TradeContext(
             symbol=order.symbol,
             side=order.side,
@@ -388,19 +387,16 @@ class StrategyRunner:
             signal=base.signal,
             current_time_ms=base.current_time_ms,
             exchange_params=base.exchange_params,
+            source=order.source,
         )
 
     @staticmethod
     def _position_for(
-        symbol_state: SymbolState | None, side: Side
+        symbol_state: SymbolState | None, source: OrderSource, side: Side
     ) -> Position:
         if symbol_state is None:
             return Position()
-        return (
-            symbol_state.position_long
-            if side == Side.LONG
-            else symbol_state.position_short
-        )
+        return symbol_state.bucket(source, side)
 
     @staticmethod
     def _profit_pct(ctx: TradeContext) -> float:
@@ -429,12 +425,17 @@ class StrategyRunner:
     def _make_close_order(ctx: TradeContext, price: float) -> Order:
         # Strategy-triggered exits are taker market orders so they actually
         # fill on the current candle rather than waiting for a limit cross.
+        source = (
+            OrderSource.TREND
+            if ctx.source == OrderSource.TREND
+            else OrderSource.RISK
+        )
         return Order(
             symbol=ctx.symbol,
             side=ctx.side,
             price=price,
             qty=abs(ctx.position.size),
-            source=OrderSource.RISK,
+            source=source,
             reduce_only=True,
             is_market=True,
         )

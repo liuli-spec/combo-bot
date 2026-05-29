@@ -57,9 +57,8 @@ class Position:
     both long and short sides.  The direction is determined by the enclosing
     :class:`SymbolState` bucket (``position_long`` vs ``position_short``).
     Callers MUST pass the correct :class:`Side` to :meth:`unrealized_pnl`
-    and :meth:`update_best_price` — a missing ``side`` argument falls back
-    to a long-biased calculation and will produce wrong P&L for short
-    positions.
+    and :meth:`update_best_price`; a missing ``side`` argument raises because
+    the unsigned size alone cannot distinguish long from short P&L.
     """
     size: float = 0.0
     entry_price: float = 0.0
@@ -131,6 +130,7 @@ class Fill:
     fee: float
     realized_pnl: float
     source: OrderSource
+    reduce_only: bool = False
 
 
 @dataclass
@@ -304,6 +304,10 @@ class SymbolState:
     trailing_long: TrailingState = field(default_factory=TrailingState)
     trailing_short: TrailingState = field(default_factory=TrailingState)
     last_price: float = 0.0
+    # Contract multiplier for WE / equity calculations.
+    # Default 1.0 for USDT-margined linear contracts (the common case);
+    # must match the exchange's contractSize for accurate exposure math.
+    c_mult: float = 1.0
 
     def bucket(self, source: "OrderSource", side: Side) -> Position:
         """Return the position bucket targeted by an order's (source, side).
@@ -350,7 +354,7 @@ class AccountState:
         for ss in self.symbols.values():
             for pos in self._buckets_for_side(ss, side):
                 if pos.is_open:
-                    twe += abs(pos.size) * pos.entry_price / denom
+                    twe += abs(pos.size) * pos.entry_price * ss.c_mult / denom
         return twe
 
     def update_equity(self):
@@ -358,10 +362,11 @@ class AccountState:
         trend_upnl = 0.0
         for ss in self.symbols.values():
             price = ss.last_price
-            grid_upnl += ss.position_long.unrealized_pnl(price, Side.LONG)
-            grid_upnl += ss.position_short.unrealized_pnl(price, Side.SHORT)
-            trend_upnl += ss.trend_long.unrealized_pnl(price, Side.LONG)
-            trend_upnl += ss.trend_short.unrealized_pnl(price, Side.SHORT)
+            cm = ss.c_mult
+            grid_upnl += ss.position_long.unrealized_pnl(price, Side.LONG) * cm
+            grid_upnl += ss.position_short.unrealized_pnl(price, Side.SHORT) * cm
+            trend_upnl += ss.trend_long.unrealized_pnl(price, Side.LONG) * cm
+            trend_upnl += ss.trend_short.unrealized_pnl(price, Side.SHORT) * cm
         self.equity = self.balance + grid_upnl + trend_upnl
         self.equity_peak = max(self.equity_peak, self.equity)
         self.grid_equity = self.grid_realized_pnl + grid_upnl

@@ -92,6 +92,32 @@ class TestStrategyRunner:
         filtered = runner.filter_exits(orders, default_ctx)
         assert len(filtered) == 1
 
+    def test_confirm_trade_entry_sees_final_price_and_qty(self, default_ctx):
+        seen: list[tuple[float, float]] = []
+
+        class FinalOrderStrategy(DefaultStrategy):
+            def custom_entry_price(self, ctx, proposed_price):
+                return 100.0
+
+            def adjust_entry_price(self, ctx, current_order_price):
+                return 125.0
+
+            def custom_stake_amount(self, ctx, proposed_stake, min_stake, max_stake):
+                return 250.0
+
+            def confirm_trade_entry(self, ctx, qty, price):
+                seen.append((qty, price))
+                return price == 125.0 and qty == 2.0
+
+        runner = StrategyRunner(FinalOrderStrategy())
+        orders = [Order("BTC", Side.LONG, 49000, 0.01, OrderSource.GRID)]
+        filtered = runner.filter_entries(orders, default_ctx)
+
+        assert len(filtered) == 1
+        assert seen == [(2.0, 125.0)]
+        assert filtered[0].price == pytest.approx(125.0)
+        assert filtered[0].qty == pytest.approx(2.0)
+
 
 class TestCustomExit:
     def test_custom_exit_callback_triggers_close(self, default_account):
@@ -118,3 +144,60 @@ class TestCustomExit:
         order = runner.check_custom_exit(ctx)
         assert order is not None
         assert order.reduce_only
+
+    def test_trend_context_custom_exit_routes_to_trend_bucket(self, default_account):
+        class StopStrategy(DefaultStrategy):
+            def custom_exit(self, ctx, current_profit_pct):
+                return "trend_stop"
+
+        pos = Position(size=0.02, entry_price=51000)
+        ss = default_account.symbols["BTC"]
+        ss.trend_long = pos
+        candle = Candle(
+            timestamp=1700000000000, open=49500, high=49600,
+            low=49400, close=49000, volume=100,
+        )
+        ctx = TradeContext(
+            symbol="BTC", side=Side.LONG, position=pos,
+            account=default_account, candle=candle,
+            signal=None, current_time_ms=1700000000000,
+            exchange_params=ExchangeParams(),
+            source=OrderSource.TREND,
+        )
+
+        runner = StrategyRunner(StopStrategy())
+        order = runner.check_custom_exit(ctx)
+
+        assert order is not None
+        assert order.source == OrderSource.TREND
+        assert ss.bucket(order.source, order.side) is ss.trend_long
+
+
+class TestPositionAdjustment:
+    def test_trend_context_adjustment_routes_to_trend_bucket(self, default_account):
+        class TrimStrategy(DefaultStrategy):
+            def adjust_trade_position(self, ctx, current_profit_pct):
+                return -0.01
+
+        pos = Position(size=0.04, entry_price=51000)
+        ss = default_account.symbols["BTC"]
+        ss.trend_long = pos
+        candle = Candle(
+            timestamp=1700000000000, open=49500, high=49600,
+            low=49400, close=49000, volume=100,
+        )
+        ctx = TradeContext(
+            symbol="BTC", side=Side.LONG, position=pos,
+            account=default_account, candle=candle,
+            signal=None, current_time_ms=1700000000000,
+            exchange_params=ExchangeParams(),
+            source=OrderSource.TREND,
+        )
+
+        runner = StrategyRunner(TrimStrategy())
+        order = runner.check_position_adjustment(ctx)
+
+        assert order is not None
+        assert order.reduce_only
+        assert order.source == OrderSource.TREND
+        assert ss.bucket(order.source, order.side) is ss.trend_long

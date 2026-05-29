@@ -6,6 +6,7 @@ from combo_bot.types import (
     SymbolState, ExchangeParams,
 )
 from combo_bot.grid_engine import quantize_qty
+from combo_bot.hsl import HslConfig, HslSupervisor, HslTier
 
 
 class RiskTier(str, Enum):
@@ -70,19 +71,84 @@ class RiskConfig:
 class RiskManager:
     def __init__(self, config: RiskConfig | None = None):
         self.config = config or RiskConfig()
-        self.tier = RiskTier.GREEN
-        self.red_cooldown_until: int = 0
-        # Stage 6 HardStop state. ``dd_ema`` holds the time-decayed
-        # drawdown EMA; ``_dd_initialized`` lets the very first
-        # ``assess`` call short-circuit to raw drawdown so single-shot
-        # unit tests still produce a deterministic tier without needing
-        # to advance through multiple ticks. ``red_latched`` mirrors
-        # passivbot's latch — once RED, the tier returns RED until
-        # ``reset_red_latch`` is called.
-        self.dd_ema: float = 0.0
-        self.last_assess_minute: int = 0
-        self._dd_initialized: bool = False
-        self.red_latched: bool = False
+        # HSL tier classification is delegated to a standalone supervisor
+        # so the drawdown decision surface can be tested, persisted, and
+        # reasoned about independently of enforcement actions.
+        self._hsl = HslSupervisor(
+            HslConfig(
+                red_threshold=self.config.red_threshold,
+                yellow_threshold=self.config.yellow_threshold,
+                orange_threshold=self.config.orange_threshold,
+                dd_ema_span_minutes=self.config.dd_ema_span_minutes,
+                red_latch_enabled=self.config.red_latch_enabled,
+                cooldown_after_red_minutes=self.config.cooldown_after_red_minutes,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Backward-compatible properties (delegated to _hsl)
+    # ------------------------------------------------------------------
+    @property
+    def tier(self) -> RiskTier:
+        return RiskTier(self._hsl.tier.value)
+
+    @tier.setter
+    def tier(self, value: RiskTier) -> None:
+        # Allow external state restore (live._load_state, tests).
+        self._hsl.tier = HslTier(value.value)
+
+    @property
+    def red_latched(self) -> bool:
+        return self._hsl.red_latched
+
+    @red_latched.setter
+    def red_latched(self, value: bool) -> None:
+        self._hsl.red_latched = value
+
+    @property
+    def red_cooldown_until(self) -> int:
+        return self._hsl.red_cooldown_until
+
+    @red_cooldown_until.setter
+    def red_cooldown_until(self, value: int) -> None:
+        self._hsl.red_cooldown_until = value
+
+    @property
+    def red_latched_at_ms(self) -> int:
+        return self._hsl.red_latched_at_ms
+
+    @red_latched_at_ms.setter
+    def red_latched_at_ms(self, value: int) -> None:
+        self._hsl.red_latched_at_ms = value
+
+    @property
+    def dd_ema(self) -> float:
+        return self._hsl.dd_ema
+
+    @dd_ema.setter
+    def dd_ema(self, value: float) -> None:
+        self._hsl.dd_ema = value
+
+    @property
+    def last_assess_minute(self) -> int:
+        return self._hsl._last_assess_minute
+
+    @last_assess_minute.setter
+    def last_assess_minute(self, value: int) -> None:
+        self._hsl._last_assess_minute = value
+
+    # _dd_initialized is accessed by live._save_state / _load_state.
+    @property
+    def _dd_initialized(self) -> bool:
+        return self._hsl._dd_initialized
+
+    @_dd_initialized.setter
+    def _dd_initialized(self, value: bool) -> None:
+        self._hsl._dd_initialized = value
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def reset_red_latch(self) -> None:
         """Clear the RED latch and any active cooldown.
@@ -92,66 +158,19 @@ class RiskManager:
         Cooldown is reset too — an explicit reset means "fully clear",
         otherwise the lingering cooldown would still block entries.
         """
-        self.red_latched = False
-        self.red_cooldown_until = 0
-        self.tier = RiskTier.GREEN
+        self._hsl.reset_red_latch()
 
     def assess(
         self, account: AccountState, timestamp_ms: int = 0
     ) -> RiskTier:
-        raw = account.drawdown
-        score = self._update_dd_score(raw, timestamp_ms)
+        """Classify the current account drawdown.
 
-        if score >= self.config.red_threshold:
-            base_tier = RiskTier.RED
-        elif score >= self.config.orange_threshold:
-            base_tier = RiskTier.ORANGE
-        elif score >= self.config.yellow_threshold:
-            base_tier = RiskTier.YELLOW
-        else:
-            base_tier = RiskTier.GREEN
-
-        if base_tier == RiskTier.RED and self.config.red_latch_enabled:
-            self.red_latched = True
-
-        # Once latched, the tier is pinned at RED until reset, regardless
-        # of how far drawdown recovers.
-        self.tier = RiskTier.RED if self.red_latched else base_tier
-        return self.tier
-
-    def _update_dd_score(self, raw: float, timestamp_ms: int) -> float:
-        """Return the drawdown score used for tier classification.
-
-        ``score = min(raw, ema)`` per passivbot's hard-stop design.
-        Disabled (returns raw) when ``dd_ema_span_minutes <= 0`` or on
-        the very first call (so single-shot tests still classify
-        deterministically without needing a tick history).
+        Delegates to :class:`HslSupervisor.assess` and converts the
+        result to the legacy :class:`RiskTier` enum for backward
+        compatibility.
         """
-        if self.config.dd_ema_span_minutes <= 0:
-            return raw
-
-        current_minute = timestamp_ms // 60_000
-        if not self._dd_initialized:
-            # Seed the EMA at the current raw drawdown so the next
-            # call's smoothing starts from a sane anchor, and use raw
-            # for this call.
-            self.dd_ema = raw
-            self.last_assess_minute = current_minute
-            self._dd_initialized = True
-            return raw
-
-        elapsed_minutes = max(0, current_minute - self.last_assess_minute)
-        if elapsed_minutes > 0:
-            alpha = 2.0 / (self.config.dd_ema_span_minutes + 1.0)
-            decay = (1.0 - alpha) ** elapsed_minutes
-            # raw + (ema - raw) * decay  ==  alpha-blended EMA, accounting
-            # for variable elapsed time between ticks.
-            self.dd_ema = raw + (self.dd_ema - raw) * decay
-            self.last_assess_minute = current_minute
-
-        # min(raw, ema) — see RiskConfig docstring for the two failure
-        # modes this guards against.
-        return min(raw, self.dd_ema)
+        hsl_tier = self._hsl.assess(account, timestamp_ms)
+        return RiskTier(hsl_tier.value)
 
     def filter_orders(
         self, orders: list[Order], account: AccountState, timestamp: int = 0
@@ -168,10 +187,15 @@ class RiskManager:
         if tier == RiskTier.ORANGE:
             return [o for o in orders if o.reduce_only]
 
-        # Per-source circuit breakers run regardless of tier so the trend
-        # bucket can be paused for trend-specific drawdown even while the
-        # overall account is still GREEN.
-        orders = self._apply_source_pause(orders, account)
+        # Per-source circuit breakers, with thresholds RELAXED when the
+        # global tier is GREEN. Old behaviour treated source pause as
+        # tier-independent, so a 15% trend-bucket drawdown paused trend
+        # entries even with the account at all-time high — over-defensive
+        # for a high-conviction profile. With tier coupling: GREEN
+        # multiplies the pause threshold by 1.5 (let it drawdown more
+        # before pausing); YELLOW uses the configured value; ORANGE+
+        # already short-circuited above (no entries at all).
+        orders = self._apply_source_pause(orders, account, tier)
 
         if tier == RiskTier.YELLOW:
             # YELLOW: scale entries by 0.5, then STILL enforce the hard
@@ -185,19 +209,26 @@ class RiskManager:
         return self._enforce_exposure_limits(orders, account)
 
     def _apply_source_pause(
-        self, orders: list[Order], account: AccountState
+        self, orders: list[Order], account: AccountState,
+        tier: RiskTier = RiskTier.GREEN,
     ) -> list[Order]:
         """Drop new entries for any source whose bucket is in deep drawdown.
 
         Reduce-only orders always pass — the breaker is about preventing
         *new* exposure, not stranding existing positions. Trips when the
         bucket's drawdown (from its own peak, normalized to balance)
-        exceeds the configured threshold.
+        exceeds the configured threshold, scaled by tier-aware relax.
         """
+        # Tier-aware relax: when the account isn't showing distress
+        # (GREEN), let a bucket draw down further before pausing — the
+        # cross-bucket loss isolation still kicks in via Kelly / vol-
+        # target / correlation sizing, so the source pause is the
+        # last line of defense, not the first.
+        relax = 1.5 if tier == RiskTier.GREEN else 1.0
         trend_dd = account.source_drawdown_pct(OrderSource.TREND)
         grid_dd = account.source_drawdown_pct(OrderSource.GRID)
-        trend_paused = trend_dd >= self.config.pause_trend_dd_pct
-        grid_paused = grid_dd >= self.config.pause_grid_dd_pct
+        trend_paused = trend_dd >= self.config.pause_trend_dd_pct * relax
+        grid_paused = grid_dd >= self.config.pause_grid_dd_pct * relax
         if not (trend_paused or grid_paused):
             return orders
 
@@ -251,15 +282,13 @@ class RiskManager:
         now_ms: int,
         exchange_params: dict[str, ExchangeParams] | None = None,
     ) -> list[Order]:
-        """Per-bucket controlled exposure shedding.
+        """Controlled exposure shedding.
 
         Modeled on passivbot's ``calc_unstucking_action``: emit small
-        reduce-only limit orders priced outside the EMA band when a
-        bucket's wallet exposure crosses ``unstuck_threshold * WEL``,
-        and only when current price has rebounded across that band
-        (sell the bounce, not the bleed). Throttled by a 24h rolling
-        loss budget so a sustained drawdown can't realize unlimited
-        losses.
+        reduce-only limit orders when a bucket's wallet exposure crosses
+        ``unstuck_threshold * WEL`` and current price has reverted through
+        the appropriate EMA band. Like passivbot Rust, all candidates
+        compete and only the most stuck position emits in a tick.
 
         Parameters
         ----------
@@ -287,30 +316,44 @@ class RiskManager:
         grid_loss_spent = -account.loss_24h(OrderSource.GRID, now_ms)
         trend_loss_spent = -account.loss_24h(OrderSource.TREND, now_ms)
 
-        orders: list[Order] = []
+        candidates: list[tuple[float, float, Order]] = []
         for symbol, ss in account.symbols.items():
             ep = exchange_params.get(symbol) if exchange_params else None
-            orders.extend(self._unstuck_for_bucket(
+            candidate = self._unstuck_for_bucket(
                 symbol, ss, Side.LONG, OrderSource.GRID,
                 ss.position_long, grid_wallet_exposure_limit,
                 balance, allowance_budget - grid_loss_spent, ep,
-            ))
-            orders.extend(self._unstuck_for_bucket(
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+            candidate = self._unstuck_for_bucket(
                 symbol, ss, Side.SHORT, OrderSource.GRID,
                 ss.position_short, grid_wallet_exposure_limit,
                 balance, allowance_budget - grid_loss_spent, ep,
-            ))
-            orders.extend(self._unstuck_for_bucket(
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+            candidate = self._unstuck_for_bucket(
                 symbol, ss, Side.LONG, OrderSource.TREND,
                 ss.trend_long, self.config.trend_wallet_exposure_limit,
                 balance, allowance_budget - trend_loss_spent, ep,
-            ))
-            orders.extend(self._unstuck_for_bucket(
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+            candidate = self._unstuck_for_bucket(
                 symbol, ss, Side.SHORT, OrderSource.TREND,
                 ss.trend_short, self.config.trend_wallet_exposure_limit,
                 balance, allowance_budget - trend_loss_spent, ep,
-            ))
-        return orders
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+        if not candidates:
+            return []
+        # Lower profit_pct means more underwater; higher exposure ratio
+        # breaks ties. This mirrors passivbot's single "most stuck" pick
+        # without reimplementing its integer pprice-diff helpers.
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return [candidates[0][2]]
 
     def _unstuck_for_bucket(
         self,
@@ -323,43 +366,54 @@ class RiskManager:
         balance: float,
         allowance_remaining: float,
         ep: ExchangeParams | None = None,
-    ) -> list[Order]:
+    ) -> tuple[float, float, Order] | None:
         if not pos.is_open or wallet_exposure_limit <= 0:
-            return []
+            return None
         if allowance_remaining <= 0:
             # Out of loss budget — don't emit any new unstuck orders;
             # the existing close ladder still runs.
-            return []
+            return None
 
-        # we = notional / balance. Same formula as grid_engine.calc_wallet_exposure.
-        notional = abs(pos.size) * pos.entry_price
+        # we = notional / balance, with c_mult for contract-agnostic exposure.
+        cm = ep.c_mult if ep else ss.c_mult
+        notional = abs(pos.size) * pos.entry_price * cm
         we = notional / max(balance, 1e-12)
         if we / wallet_exposure_limit <= self.config.unstuck_threshold:
-            return []
+            return None
 
         ema = ss.ema
         if not ema.initialized or ema.upper <= 0 or ema.lower <= 0:
-            return []
+            return None
 
-        # Order price sits outside the EMA band by unstuck_ema_dist.
-        # passivbot only triggers when current price has reverted across
-        # that band — i.e. we sell into a bounce. Without this guard the
-        # bot just bleeds into adverse moves.
+        # passivbot Rust trigger bands:
+        #   long  → ema_band_upper * (1 + dist)
+        #   short → ema_band_lower * (1 - dist)
+        # Once triggered, passivbot returns the close at current price.
         last_price = ss.last_price
         if last_price <= 0:
-            return []
+            return None
         if side == Side.LONG:
-            order_price = ema.upper * (1.0 + self.config.unstuck_ema_dist)
-            if last_price < order_price:
-                return []
+            trigger_price = ema.upper * (1.0 + self.config.unstuck_ema_dist)
+            if trigger_price <= 0 or last_price < trigger_price:
+                return None
+            order_price = last_price
+            profit_pct = (last_price - pos.entry_price) / pos.entry_price
         else:
-            order_price = ema.lower * (1.0 - self.config.unstuck_ema_dist)
-            if last_price > order_price:
-                return []
+            trigger_price = ema.lower * (1.0 - self.config.unstuck_ema_dist)
+            if trigger_price <= 0 or last_price > trigger_price:
+                return None
+            order_price = last_price
+            profit_pct = (pos.entry_price - last_price) / pos.entry_price
 
-        close_qty = abs(pos.size) * self.config.unstuck_close_pct
+        close_qty = (
+            balance
+            * wallet_exposure_limit
+            * self.config.unstuck_close_pct
+            / max(last_price * cm, 1e-12)
+        )
+        close_qty = min(abs(pos.size), close_qty)
         if close_qty <= 0:
-            return []
+            return None
 
         # Project the realized P&L this unstuck would book if it filled
         # at order_price. If that's a LOSS, cap close_qty so the loss
@@ -374,11 +428,11 @@ class RiskManager:
         else:
             projected_pnl_per_unit = pos.entry_price - order_price
         if projected_pnl_per_unit < 0:
-            loss_per_unit = -projected_pnl_per_unit
+            loss_per_unit = -projected_pnl_per_unit * cm
             max_qty_by_allowance = allowance_remaining / max(loss_per_unit, 1e-12)
             if max_qty_by_allowance < close_qty:
                 if max_qty_by_allowance <= 0:
-                    return []
+                    return None
                 close_qty = max_qty_by_allowance
 
         # Quantize to qty_step and validate the exchange constraints
@@ -391,15 +445,15 @@ class RiskManager:
             if ep.qty_step > 0:
                 close_qty = quantize_qty(close_qty, ep.qty_step)
             if close_qty < ep.min_qty:
-                return []
+                return None
             cost = close_qty * order_price * ep.c_mult
             if cost < ep.min_cost:
-                return []
+                return None
 
         if close_qty <= 0:
-            return []
+            return None
 
-        return [Order(
+        order = Order(
             symbol=symbol,
             side=side,
             price=order_price,
@@ -409,7 +463,8 @@ class RiskManager:
             # Limit, not market — the whole point is to let the market
             # come to us at a controlled price above the EMA band.
             is_market=False,
-        )]
+        )
+        return (profit_pct, -(we / wallet_exposure_limit), order)
 
     def _limit_new_entries(
         self, orders: list[Order], account: AccountState, scale: float
@@ -460,13 +515,14 @@ class RiskManager:
                 filtered.append(o)
                 continue
 
-            cost = o.qty * o.price
+            ss = account.symbols.get(o.symbol)
+            cm = ss.c_mult if ss else 1.0
+            cost = o.qty * o.price * cm
             cost_we = cost / denom
 
             if base_twe + twe_added + cost_we > self.config.max_total_wallet_exposure:
                 continue
 
-            ss = account.symbols.get(o.symbol)
             if ss:
                 # Single-symbol exposure must sum grid + trend buckets —
                 # otherwise the trend overlay sneaks past the per-symbol
@@ -478,7 +534,7 @@ class RiskManager:
                     else:
                         buckets = (ss.position_short, ss.trend_short)
                     base_we_per_key[key] = sum(
-                        abs(p.size) * p.entry_price / denom
+                        abs(p.size) * p.entry_price * cm / denom
                         for p in buckets if p.is_open
                     )
                 base_we = base_we_per_key[key]

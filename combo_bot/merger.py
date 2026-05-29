@@ -10,8 +10,15 @@ from combo_bot.types import (
 class MergerConfig:
     trend_override_strong: bool = True
     grid_depth_limit_in_downtrend: int = 2
-    trend_position_max_pct: float = 0.15
-    trend_entry_qty_pct: float = 0.03
+    # Trend overlay sizing — re-tuned for high-conviction directional
+    # trades. Old defaults (0.15 × 0.03 = 0.45% per entry) were so
+    # conservative the overlay barely moved the needle even in
+    # STRONG_BULL/BEAR. New defaults (0.35 × 0.10 = 3.5% per entry)
+    # let the overlay actually express conviction; the upstream
+    # KellySizer / VolTargetSizer / RegimeArbiter conviction scale
+    # still throttle the final qty.
+    trend_position_max_pct: float = 0.35
+    trend_entry_qty_pct: float = 0.10
     mode_switch_strong_threshold: float = 0.6
     mode_switch_weak_threshold: float = 0.3
     trend_stop_loss_pct: float = 0.03

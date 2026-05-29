@@ -18,9 +18,11 @@ from pathlib import Path
 import pytest
 
 from combo_bot.live import LiveConfig, LiveTrader
+from combo_bot.regime import read_strategy_signals
 from combo_bot.risk import RiskTier
+from combo_bot.strategy import DefaultStrategy
 from combo_bot.types import (
-    ExchangeParams, Order, OrderSource, Position, Side, SymbolState,
+    Candle, ExchangeParams, Order, OrderSource, Position, Side, SymbolState,
 )
 
 
@@ -33,6 +35,8 @@ class _StubExchange:
         self.open_orders_by_symbol: dict[str, list[dict]] = {}
         self.next_status: str = "open"
         self.next_id: int = 0
+        self.balance_payload: dict = {"USDT": {"free": 10000.0}}
+        self.trades_per_call: list[list[dict]] = []
 
     async def load_markets(self):
         return {}
@@ -49,7 +53,7 @@ class _StubExchange:
         return self.open_orders_by_symbol.get(symbol, [])
 
     async def fetch_balance(self, _params=None):
-        return {"USDT": {"free": 10000.0}}
+        return self.balance_payload
 
     async def fetch_positions(self, _symbols):
         return []
@@ -58,6 +62,11 @@ class _StubExchange:
         return {"fundingRate": 0.0}
 
     async def fetch_ohlcv(self, _symbol, _tf, limit=100):
+        return []
+
+    async def fetch_my_trades(self, symbol, since=None, limit=None):
+        if self.trades_per_call:
+            return self.trades_per_call.pop(0)
         return []
 
     async def create_order(self, symbol, order_type, side, qty, price, params):
@@ -166,6 +175,30 @@ def test_risk_tier_load_ignores_unknown_value():
         assert trader.risk.tier == RiskTier.GREEN
 
 
+def test_fill_event_state_round_trips_through_live_state_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        trader_a, _ = _trader(["BTC/USDT:USDT"])
+        trader_a.config.state_file = str(state_path)
+        trader_a.fill_events.load_snapshot({
+            "last_ts_ms": {"BTC/USDT:USDT": 1234},
+            "seen_ids": {"BTC/USDT:USDT": ["fill-1"]},
+            "order_source": {"ord-trend": "trend"},
+            "order_meta": {
+                "ord-trend": {"side": "long", "reduce_only": False},
+            },
+        })
+        asyncio.run(trader_a._save_state())
+
+        trader_b, _ = _trader(["BTC/USDT:USDT"])
+        trader_b.config.state_file = str(state_path)
+        asyncio.run(trader_b._load_state())
+
+        snapshot = trader_b.fill_events.snapshot()
+        assert snapshot["last_ts_ms"]["BTC/USDT:USDT"] == 1234
+        assert snapshot["order_source"]["ord-trend"] == "trend"
+
+
 # ── #3: state-change defer is per (symbol, side) ────────────────────
 
 def test_state_change_defer_does_not_block_other_side():
@@ -224,3 +257,90 @@ def test_rejected_order_only_clears_its_own_symbol_record():
     remaining = list(trader._recent_creates)
     symbols_left = {s for (_, s, _, _) in remaining}
     assert symbols_left == {"ETH/USDT:USDT"}
+
+
+# ── #6: account balance must use wallet/total, not free margin ───────
+
+def test_refresh_account_uses_wallet_total_not_free_margin():
+    trader, ex = _trader(["BTC/USDT:USDT"])
+    ex.balance_payload = {
+        "USDT": {"free": 123.0, "total": 10_000.0},
+        "info": {"totalWalletBalance": "9999.5"},
+    }
+
+    asyncio.run(trader._refresh_account())
+
+    assert trader.account.balance == pytest.approx(9999.5)
+
+
+# ── #7: create_order ack is not a fill event ─────────────────────────
+
+def test_live_create_ack_does_not_update_trend_bucket_until_fill_event():
+    trader, ex = _trader(["BTC/USDT:USDT"])
+    order = Order(
+        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
+        source=OrderSource.TREND, is_market=True,
+    )
+
+    asyncio.run(trader._create_order(order))
+
+    ss = trader.account.symbols["BTC/USDT:USDT"]
+    assert ss.trend_long.size == 0.0
+
+    ex.trades_per_call = [[{
+        "id": "fill-1", "timestamp": 1_000, "side": "buy",
+        "price": 50_010.0, "amount": 0.01, "fee": {"cost": 0.1},
+        "order": "1", "info": {"realizedPnl": "0"},
+    }]]
+    asyncio.run(trader._refresh_fills())
+
+    assert ss.trend_long.size == pytest.approx(0.01)
+    assert ss.trend_long.entry_price == pytest.approx(50_010.0)
+
+
+def test_refresh_fills_does_not_mutate_exchange_authoritative_balance():
+    trader, ex = _trader(["BTC/USDT:USDT"])
+    trader.account.balance = 10_000.0
+    ex.trades_per_call = [[{
+        "id": "fill-1", "timestamp": 1_000, "side": "sell",
+        "price": 51_000.0, "amount": 0.01, "fee": {"cost": 1.0},
+        "order": "unknown", "info": {"realizedPnl": "50.0"},
+    }]]
+
+    asyncio.run(trader._refresh_fills())
+
+    assert trader.account.balance == pytest.approx(10_000.0)
+    assert trader.account.grid_realized_pnl == pytest.approx(49.0)
+
+
+# ── #8: DefaultStrategy subclasses still get populate_* in live ──────
+
+def test_live_runs_populate_for_default_strategy_subclass():
+    class SignalStrategy(DefaultStrategy):
+        def __init__(self):
+            self.calls = 0
+
+        def populate_entry_trend(self, dataframe, metadata):
+            self.calls += 1
+            dataframe["enter_long"] = 1
+            return dataframe
+
+    strategy = SignalStrategy()
+    trader, _ = _trader(["BTC/USDT:USDT"])
+    trader.strategy = strategy
+    trader.strategy_runner.strategy = strategy
+    trader.data_provider.append(
+        "BTC/USDT:USDT",
+        Candle(
+            timestamp=1_000, open=50_000, high=50_100, low=49_900,
+            close=50_000, volume=1,
+        ),
+    )
+
+    trader._apply_strategy_populates("BTC/USDT:USDT")
+
+    enter_long, _, _, _ = read_strategy_signals(
+        trader.data_provider, "BTC/USDT:USDT",
+    )
+    assert strategy.calls == 1
+    assert enter_long is True

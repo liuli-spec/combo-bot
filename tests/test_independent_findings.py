@@ -1228,6 +1228,174 @@ def test_simulate_fills_rejects_orders_below_min_cost():
     assert fills == [], "below-min_cost order must not fill in backtest"
 
 
+# ────────────────────────────────────────────────────────────────────
+# High-risk profile knobs (round 6) — DeepSeek's "open up the limiters"
+# critique. Verifies the four behavioral changes meant to convert the
+# bot from "over-defensive when stacked" to "actually leans into
+# conviction":
+#
+#   25. Trend overlay budget per-entry: was 0.45% of balance, now 3.5%.
+#   26. Overlay scaling is now continuous in conviction (no cliff at
+#       overlay_strength).
+#   27. Source pause is tier-aware: GREEN gets 1.5× threshold relax.
+#   28. RED latch auto-releases after a configurable wallclock window
+#       so the bot self-heals without operator intervention.
+# ────────────────────────────────────────────────────────────────────
+
+
+def test_trend_overlay_budget_was_bumped_for_high_risk_profile():
+    from combo_bot.merger import MergerConfig
+    cfg = MergerConfig()
+    per_entry_budget = cfg.trend_position_max_pct * cfg.trend_entry_qty_pct
+    assert per_entry_budget >= 0.02, (
+        f"trend overlay per-entry budget is {per_entry_budget:.4f}; "
+        f"high-risk profile expects >= 2% (8x the old 0.45%)"
+    )
+
+
+def test_overlay_scale_is_continuous_in_conviction():
+    from combo_bot.regime import RegimeArbiter, RegimeArbiterConfig
+    from combo_bot.types import TrendRegime, TrendSignal
+
+    arb = RegimeArbiter(RegimeArbiterConfig())
+    # Two convictions that straddle the OLD hard threshold (0.6) but
+    # both well above the new floor (0.25). Both must produce non-zero
+    # overlay scale, and the higher conviction must produce strictly
+    # more scale — i.e. a smooth ramp, not a step.
+    s_low = TrendSignal(direction=0.55, strength=0.55, regime=TrendRegime.STRONG_BULL)
+    s_high = TrendSignal(direction=0.65, strength=0.65, regime=TrendRegime.STRONG_BULL)
+    rv_low = arb.compute(s_low)
+    rv_high = arb.compute(s_high)
+    assert rv_low.trend_qty_scale > 0, (
+        f"conviction 0.55 must produce overlay > 0 under continuous "
+        f"mapping; got {rv_low.trend_qty_scale}"
+    )
+    assert rv_high.trend_qty_scale > rv_low.trend_qty_scale, (
+        f"overlay scale must increase smoothly with conviction; got "
+        f"low={rv_low.trend_qty_scale}, high={rv_high.trend_qty_scale}"
+    )
+
+
+def test_overlay_scale_floor_still_silences_low_conviction():
+    """Counter-check: conviction below floor still produces zero."""
+    from combo_bot.regime import RegimeArbiter, RegimeArbiterConfig
+    from combo_bot.types import TrendRegime, TrendSignal
+
+    arb = RegimeArbiter(RegimeArbiterConfig(overlay_min_conviction=0.5))
+    s = TrendSignal(direction=0.3, strength=0.3, regime=TrendRegime.STRONG_BULL)
+    rv = arb.compute(s)
+    assert rv.trend_qty_scale == 0.0
+
+
+def test_source_pause_threshold_relaxed_when_tier_green():
+    """When account is GREEN, source pause needs higher bucket DD to fire."""
+    from combo_bot.risk import RiskConfig, RiskManager
+    risk = RiskManager(RiskConfig(
+        pause_trend_dd_pct=0.10,
+        yellow_threshold=0.99,    # ensure tier stays GREEN
+        orange_threshold=0.99,
+        red_threshold=0.99,
+    ))
+    account = AccountState(balance=10_000, equity=10_000, equity_peak=10_000)
+    account.symbols["BTC"] = SymbolState(symbol="BTC")
+    # Trend bucket DD = 12% — above 0.10 strict, below 0.15 (the 1.5×
+    # GREEN relax). Pre-fix: paused. Post-fix: still trades.
+    account.trend_equity_peak = 2000.0
+    account.trend_equity = 800.0   # (2000-800)/10000 = 12%
+    orders = [Order("BTC", Side.LONG, 50_000, 0.01, OrderSource.TREND)]
+    out = risk.filter_orders(orders, account, timestamp=0)
+    assert len(out) == 1, (
+        "GREEN-tier source pause should be relaxed; 12% trend DD with "
+        "configured threshold 10% must NOT pause under high-risk profile"
+    )
+
+
+def test_red_latch_auto_releases_after_window():
+    from combo_bot.hsl import HslConfig, HslSupervisor
+
+    hsl = HslSupervisor(HslConfig(
+        red_threshold=0.20,
+        red_latch_enabled=True,
+        red_latch_auto_release_minutes=60,
+    ))
+    # Drive account into RED at t=0.
+    deep_dd = AccountState(balance=10_000, equity=7_500, equity_peak=10_000)
+    hsl.assess(deep_dd, timestamp_ms=0)
+    assert hsl.red_latched is True
+    # Sentinel: 0-timestamp is coerced to 1 so "has been set" stays true.
+    assert hsl.red_latched_at_ms == 1
+
+    # 30 minutes later, still recovering — latch held.
+    partial_recovery = AccountState(balance=10_000, equity=9_500, equity_peak=10_000)
+    hsl.assess(partial_recovery, timestamp_ms=30 * 60_000)
+    assert hsl.red_latched is True
+
+    # 61 minutes later — auto-release window crossed and dd recovered,
+    # latch clears, tier downgrades.
+    full_recovery = AccountState(balance=10_000, equity=10_000, equity_peak=10_000)
+    tier_after = hsl.assess(full_recovery, timestamp_ms=61 * 60_000)
+    assert hsl.red_latched is False, (
+        "RED latch must auto-release after the configured window if "
+        "drawdown has recovered"
+    )
+    from combo_bot.hsl import HslTier
+    assert tier_after == HslTier.GREEN
+
+
+def test_red_latch_auto_release_disabled_with_zero_minutes():
+    """Setting release_minutes=0 restores passivbot-style manual reset."""
+    from combo_bot.hsl import HslConfig, HslSupervisor
+    hsl = HslSupervisor(HslConfig(
+        red_threshold=0.20,
+        red_latch_enabled=True,
+        red_latch_auto_release_minutes=0,    # disabled
+    ))
+    bad = AccountState(balance=10_000, equity=7_500, equity_peak=10_000)
+    hsl.assess(bad, timestamp_ms=0)
+    assert hsl.red_latched is True
+    # Even after 1000 minutes with full recovery — latch persists.
+    ok = AccountState(balance=10_000, equity=10_000, equity_peak=10_000)
+    hsl.assess(ok, timestamp_ms=1000 * 60_000)
+    assert hsl.red_latched is True
+
+
+# ────────────────────────────────────────────────────────────────────
+# Forager scoring now includes trend conviction (DeepSeek #3).
+# Two symbols with identical vol/volatility/ema profiles should be
+# differentiated by their |direction| * strength.
+# ────────────────────────────────────────────────────────────────────
+
+
+def test_forager_prefers_high_conviction_when_other_features_tie():
+    from combo_bot.grid_engine import ForagerScorer, ForagerWeights
+
+    weights = ForagerWeights()
+    base = (0.5, 0.5, 0.5)  # volume, volatility, ema_readiness
+    s_choppy = ForagerScorer.score_symbol(*base, weights, trend_conviction=0.0)
+    s_directional = ForagerScorer.score_symbol(*base, weights, trend_conviction=0.8)
+    assert s_directional > s_choppy, (
+        "Forager should rank a symbol with strong directional conviction "
+        "above an identically-vol/volatility/ema-ready but choppy one"
+    )
+
+
+def test_forager_select_symbols_accepts_4_tuple_with_conviction():
+    import warnings
+
+    from combo_bot.grid_engine import ForagerScorer, ForagerWeights
+
+    # Two symbols, identical first three components; differ only in
+    # trend conviction. The high-conviction one must win.
+    candidates = {
+        "CHOPPY": (0.5, 0.5, 0.5, 0.0),
+        "TRENDY": (0.5, 0.5, 0.5, 0.9),
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        ranked = ForagerScorer.select_symbols(candidates, 1, ForagerWeights())
+    assert ranked == ["TRENDY"]
+
+
 def test_volatility_alpha_respects_bar_interval():
     """1m: alpha ~= 2/(60*N+1); 60m: alpha ~= 2/(N+1). They should differ
     by ~60×.  After 60× as many updates, the 1m EMA reaches roughly

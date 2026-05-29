@@ -21,6 +21,9 @@ from combo_bot.protections import IProtection, ProtectionManager
 from combo_bot.sizing import KellySizer
 from combo_bot.correlation import CorrelationGate
 from combo_bot.vol_target import VolTargetSizer
+from combo_bot.fill_events_manager import (
+    FillEventManager, FillEventManagerConfig,
+)
 from combo_bot.types import RegimeView
 
 logger = logging.getLogger(__name__)
@@ -53,6 +56,7 @@ class LiveTrader:
         kelly_sizer: KellySizer | None = None,
         correlation_gate: CorrelationGate | None = None,
         vol_target_sizer: VolTargetSizer | None = None,
+        fill_events_config: FillEventManagerConfig | None = None,
     ):
         self.config = config
         self.exchange = exchange
@@ -65,10 +69,14 @@ class LiveTrader:
         self.strategy_runner = StrategyRunner(self.strategy)
         self.data_provider = DataProvider(max_rows=1000)
         self.protections = ProtectionManager(protections or [])
-        # Stage 9 — optional fractional-Kelly trend overlay throttle.
-        # The reconcile path doesn't surface fills yet (TODO with the
-        # protections wiring), so on live the sizer stays cold-start
-        # at fraction 1.0 until that's hooked up.
+        # Fill event manager — polls fetch_my_trades, dedups by trade
+        # ID, attributes source via the order_id we record at create
+        # time, and feeds the result to protections / kelly_sizer /
+        # account.add_realized_pnl. Without this layer the Stage 7-11
+        # bookkeeping silently no-ops in live (backtest still works).
+        self.fill_events = FillEventManager(exchange, fill_events_config)
+        # Stage 9 — fractional-Kelly trend overlay throttle. Now live
+        # too: fills surfaced by FillEventManager are routed in.
         self.kelly_sizer = kelly_sizer
         # Stage 10 — optional cross-symbol correlation gate.
         self.correlation_gate = correlation_gate
@@ -130,10 +138,12 @@ class LiveTrader:
                 price_step=float(market.get("precision", {}).get("price", 0.01)),
                 min_qty=float(market.get("limits", {}).get("amount", {}).get("min", 0.001)),
                 min_cost=float(market.get("limits", {}).get("cost", {}).get("min", 5.0)),
+                c_mult=float(market.get("contractSize", 1.0)),
                 maker_fee=float(market.get("maker", 0.0002)),
                 taker_fee=float(market.get("taker", 0.0005)),
             )
-            self.account.symbols[symbol] = SymbolState(symbol=symbol)
+            ep = self.exchange_params[symbol]
+            self.account.symbols[symbol] = SymbolState(symbol=symbol, c_mult=ep.c_mult)
 
             if not self.config.dry_run:
                 try:
@@ -146,6 +156,10 @@ class LiveTrader:
                     logger.warning("Could not set leverage/margin for %s", symbol)
 
     async def _tick(self):
+        # Pull fills first so source-isolated buckets (especially TREND)
+        # are updated before aggregate exchange positions are split into
+        # grid-vs-trend in _refresh_account.
+        await self._refresh_fills()
         await self._refresh_account()
         await self._refresh_candles()
 
@@ -251,6 +265,7 @@ class LiveTrader:
                     symbol=symbol, side=overlay_side, position=overlay_pos,
                     account=self.account, candle=last_candle, signal=signal,
                     current_time_ms=now_ms, exchange_params=ep,
+                    source=OrderSource.TREND,
                 )
                 trend_entries = self.strategy_runner.filter_entries(
                     trend_entries, ctx_overlay,
@@ -259,6 +274,8 @@ class LiveTrader:
             trend_exits_s = self.merger.generate_trend_exit_orders(symbol, ss.trend_short, Side.SHORT, price, ep)
 
             strategy_orders: list[Order] = []
+
+            # ── grid-bucket strategy callbacks ────────────────────
             for ctx, pos in ((ctx_long, ss.position_long), (ctx_short, ss.position_short)):
                 if not pos.is_open:
                     continue
@@ -266,6 +283,29 @@ class LiveTrader:
                 if fx is not None:
                     strategy_orders.append(fx)
                 adj = self.strategy_runner.check_position_adjustment(ctx)
+                if adj is not None:
+                    strategy_orders.append(adj)
+
+            # ── trend-bucket strategy callbacks ───────────────────
+            # Trend positions are also strategy-managed: custom_stoploss,
+            # custom_exit, and adjust_trade_position can all override
+            # the fixed-% SL/TP from MergerConfig.
+            for side, trend_pos in (
+                (Side.LONG, ss.trend_long),
+                (Side.SHORT, ss.trend_short),
+            ):
+                if not trend_pos.is_open:
+                    continue
+                ctx_trend = TradeContext(
+                    symbol=symbol, side=side, position=trend_pos,
+                    account=self.account, candle=last_candle, signal=signal,
+                    current_time_ms=now_ms, exchange_params=ep,
+                    source=OrderSource.TREND,
+                )
+                fx = self.strategy_runner.check_custom_exit(ctx_trend)
+                if fx is not None:
+                    strategy_orders.append(fx)
+                adj = self.strategy_runner.check_position_adjustment(ctx_trend)
                 if adj is not None:
                     strategy_orders.append(adj)
 
@@ -330,7 +370,7 @@ class LiveTrader:
     async def _refresh_account(self):
         try:
             balance = await self.exchange.fetch_balance({"type": "future"})
-            self.account.balance = float(balance.get("USDT", {}).get("free", 0))
+            self.account.balance = self._extract_wallet_balance(balance, "USDT")
 
             positions = await self.exchange.fetch_positions(self.config.symbols)
             for p in positions:
@@ -387,6 +427,44 @@ class LiveTrader:
                 self._funding_rates[symbol] = float(fr.get("fundingRate", 0) or 0)
             except Exception:
                 self._funding_rates.setdefault(symbol, 0.0)
+
+    @staticmethod
+    def _extract_wallet_balance(balance: dict, currency: str) -> float:
+        """Extract futures wallet balance, never free margin when avoidable.
+
+        ``free`` is available margin and shrinks as positions consume
+        margin; WE/HSL/sizing need the wallet/equity denominator. Binance
+        futures exposes this in ``info.totalWalletBalance`` while ccxt's
+        normalized payload often also carries ``USDT.total``.
+        """
+        info = balance.get("info") or {}
+        for key in ("totalWalletBalance", "walletBalance"):
+            try:
+                value = float(info.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                return value
+
+        currency_block = balance.get(currency) or {}
+        for key in ("total", "walletBalance", "balance"):
+            try:
+                value = float(currency_block.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                return value
+        totals = balance.get("total") or {}
+        try:
+            total_value = float(totals.get(currency, 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            total_value = 0.0
+        if total_value > 0:
+            return total_value
+        try:
+            return float(currency_block.get("free", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
 
     async def _refresh_candles(self):
         for symbol in self.config.symbols:
@@ -476,13 +554,59 @@ class LiveTrader:
             except Exception:
                 logger.exception("Failed to fetch candles for %s", symbol)
 
+    async def _refresh_fills(self) -> None:
+        """Poll exchange trade history for new fills and fan them out
+        to protections / kelly_sizer / source-PnL bookkeeping. This is
+        the live counterpart of Backtester's per-tick fill loop —
+        before this method existed those subsystems silently received
+        zero fills in live and behaved as if the bot never traded.
+        """
+        now_ms = int(time.time() * 1000)
+
+        def _sink(fills: list[Fill]) -> None:
+            if not fills:
+                return
+            # 1) Per-source realized PnL ledger (drives source_drawdown_pct).
+            for f in fills:
+                if f.source == OrderSource.TREND:
+                    self._apply_fill_to_trend_bucket(
+                        Order(
+                            symbol=f.symbol,
+                            side=f.side,
+                            price=f.price,
+                            qty=f.qty,
+                            source=f.source,
+                            reduce_only=f.reduce_only,
+                        ),
+                        f.qty,
+                    )
+                net = f.realized_pnl - f.fee
+                self.account.add_realized_pnl(f.source, net, f.timestamp)
+            # 2) Protections: stoploss-guard, cooldown, anything plugged in.
+            self.protections.update(fills, self.account, now_ms)
+            # 3) Kelly: feed closing fills so the rolling edge estimate
+            # actually moves in live.
+            if self.kelly_sizer is not None:
+                self.kelly_sizer.record_fills(fills)
+
+        for symbol in self.config.symbols:
+            try:
+                await self.fill_events.poll(symbol, now_ms, _sink)
+            except Exception:
+                logger.exception("fill-event poll failed for %s", symbol)
+
     def _apply_strategy_populates(self, symbol: str) -> None:
         """Mirror of Backtester._apply_strategy_populates — call the
         strategy's populate_indicators / populate_entry_trend /
         populate_exit_trend hooks on the cached DataFrame so signal
         columns become available for read_strategy_signals.
         """
-        if isinstance(self.strategy, DefaultStrategy):
+        strategy_type = type(self.strategy)
+        if (
+            strategy_type.populate_indicators is DefaultStrategy.populate_indicators
+            and strategy_type.populate_entry_trend is DefaultStrategy.populate_entry_trend
+            and strategy_type.populate_exit_trend is DefaultStrategy.populate_exit_trend
+        ):
             return  # DefaultStrategy.populate_* are no-ops — skip the work.
         try:
             df = self.data_provider.get_dataframe(symbol)
@@ -694,6 +818,10 @@ class LiveTrader:
                 order_type, side, order.symbol, send_qty, order.price,
                 order.source.value, " reduce" if order.reduce_only else "",
             )
+            # Trend bucket bookkeeping: even in dry-run the local state
+            # must stay consistent so the next tick's overlay decision
+            # doesn't duplicate an entry the "exchange" already has.
+            self._apply_fill_to_trend_bucket(order, send_qty)
             return
 
         try:
@@ -729,6 +857,12 @@ class LiveTrader:
                     order_type, side, order.symbol, order.qty,
                     f"{order.price:.2f}" if not order.is_market else "MKT",
                     oid,
+                )
+                # Register the outgoing order's source/side/reduce_only
+                # metadata so when the fill arrives via fetch_my_trades
+                # we can attribute it to the right bucket.
+                self.fill_events.register_outgoing(
+                    str(oid), order.source, order.side, order.reduce_only,
                 )
         except Exception:
             logger.exception(
@@ -779,6 +913,43 @@ class LiveTrader:
             source=OrderSource.TREND,
             is_market=True,
         )]
+
+    def _apply_fill_to_trend_bucket(self, order: Order, filled_qty: float) -> None:
+        """Update the local trend bucket after a confirmed trend order.
+
+        The exchange reports a single aggregate position per (symbol, side),
+        so we must track the trend bucket locally and subtract it when
+        rebuilding the grid bucket from the exchange total. Without this,
+        a filled trend-market entry would silently flow into the grid
+        bucket and the overlay would try to enter again on the next tick.
+        """
+        if order.source != OrderSource.TREND:
+            return
+        ss = self.account.symbols.get(order.symbol)
+        if ss is None:
+            return
+        bucket = ss.trend_long if order.side == Side.LONG else ss.trend_short
+        if order.reduce_only:
+            close_qty = min(filled_qty, abs(bucket.size))
+            if abs(bucket.size) <= close_qty + 1e-12:
+                bucket.size = 0.0
+                bucket.entry_price = 0.0
+                bucket.best_price = 0.0
+            else:
+                delta = close_qty if bucket.size > 0 else -close_qty
+                bucket.size -= delta
+        else:
+            if not bucket.is_open:
+                bucket.size = filled_qty
+                bucket.entry_price = order.price
+                bucket.best_price = order.price
+            else:
+                new_size = bucket.size + filled_qty
+                if abs(new_size) > 1e-12:
+                    bucket.entry_price = (
+                        bucket.size * bucket.entry_price + filled_qty * order.price
+                    ) / new_size
+                bucket.size = new_size
 
     def _latest_candle(self, symbol: str, price: float, now_ms: int) -> Candle:
         """Return the most recent candle for `symbol`, or a degenerate one
@@ -835,8 +1006,17 @@ class LiveTrader:
             # drawdown via the "first call" branch of _update_dd_score.
             "risk_dd_initialized": self.risk._dd_initialized,
             "risk_last_assess_minute": self.risk.last_assess_minute,
+            # Auto-release wallclock marker. Without persisting this, a
+            # restart with red_latched=True would either lose the
+            # auto-release timer (release_minutes=0 → never auto-clears)
+            # or reset the countdown (red_latched_at_ms=0 → next assess
+            # rewrites it to now). Either way the operator-visible
+            # behavior diverges from the running bot.
+            "risk_red_latched_at_ms": self.risk.red_latched_at_ms,
             # ── trend bucket persistence ──
             "trend_buckets": trend_buckets,
+            # ── fill-event watermarks / order attribution ──
+            "fill_events": self.fill_events.snapshot(),
         }
         try:
             Path(self.config.state_file).write_text(json.dumps(state, indent=2))
@@ -870,6 +1050,10 @@ class LiveTrader:
             self.risk.last_assess_minute = data.get(
                 "risk_last_assess_minute", self.risk.last_assess_minute,
             )
+            self.risk.red_latched_at_ms = data.get(
+                "risk_red_latched_at_ms", self.risk.red_latched_at_ms,
+            )
+            self.fill_events.load_snapshot(data.get("fill_events", {}))
             now_ms = int(time.time() * 1000)
             in_cooldown = self.risk.red_cooldown_until > now_ms
             if self.risk.red_latched or in_cooldown:

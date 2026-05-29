@@ -114,7 +114,8 @@ class Backtester:
             equity_peak=self.config.starting_balance,
         )
         for s in symbols:
-            account.symbols[s] = SymbolState(symbol=s)
+            ep = exchange_params.get(s, ExchangeParams())
+            account.symbols[s] = SymbolState(symbol=s, c_mult=ep.c_mult)
 
         fills: list[Fill] = []
         equity_log: list[tuple[int, float]] = []
@@ -294,6 +295,7 @@ class Backtester:
                         symbol=s, side=overlay_side, position=overlay_pos,
                         account=account, candle=candle, signal=signal,
                         current_time_ms=ts, exchange_params=ep,
+                        source=OrderSource.TREND,
                     )
                     trend_entries = self.strategy_runner.filter_entries(
                         trend_entries, ctx_overlay,
@@ -306,13 +308,12 @@ class Backtester:
                 )
 
                 strategy_orders: list[Order] = []
+
+                # ── grid-bucket strategy callbacks ────────────────────
                 if ss.position_long.is_open:
                     fx = self.strategy_runner.check_custom_exit(ctx_long)
                     if fx is not None:
                         strategy_orders.append(fx)
-                    # ctx.position is the grid bucket; the runner emits
-                    # source=GRID so the fill lands in the same bucket
-                    # the strategy is reasoning about.
                     adj = self.strategy_runner.check_position_adjustment(ctx_long)
                     if adj is not None:
                         strategy_orders.append(adj)
@@ -321,6 +322,43 @@ class Backtester:
                     if fx is not None:
                         strategy_orders.append(fx)
                     adj = self.strategy_runner.check_position_adjustment(ctx_short)
+                    if adj is not None:
+                        strategy_orders.append(adj)
+
+                # ── trend-bucket strategy callbacks ───────────────────
+                # Trend positions were previously only managed by the
+                # fixed-% SL/TP in MergerConfig. Strategy authors can now
+                # override with custom_stoploss / custom_exit / adjust
+                # on the trend bucket — the context's position is the
+                # trend bucket so the strategy sees the correct state.
+                if ss.trend_long.is_open:
+                    ctx_trend_long = TradeContext(
+                        symbol=s, side=Side.LONG, position=ss.trend_long,
+                        account=account, candle=candle, signal=signal,
+                        current_time_ms=ts, exchange_params=ep,
+                        source=OrderSource.TREND,
+                    )
+                    fx = self.strategy_runner.check_custom_exit(ctx_trend_long)
+                    if fx is not None:
+                        strategy_orders.append(fx)
+                    adj = self.strategy_runner.check_position_adjustment(
+                        ctx_trend_long,
+                    )
+                    if adj is not None:
+                        strategy_orders.append(adj)
+                if ss.trend_short.is_open:
+                    ctx_trend_short = TradeContext(
+                        symbol=s, side=Side.SHORT, position=ss.trend_short,
+                        account=account, candle=candle, signal=signal,
+                        current_time_ms=ts, exchange_params=ep,
+                        source=OrderSource.TREND,
+                    )
+                    fx = self.strategy_runner.check_custom_exit(ctx_trend_short)
+                    if fx is not None:
+                        strategy_orders.append(fx)
+                    adj = self.strategy_runner.check_position_adjustment(
+                        ctx_trend_short,
+                    )
                     if adj is not None:
                         strategy_orders.append(adj)
 
@@ -682,7 +720,7 @@ class Backtester:
                 (Side.SHORT, ss.trend_short),
             ):
                 if pos.is_open:
-                    notional = abs(pos.size) * ss.last_price
+                    notional = abs(pos.size) * ss.last_price * ss.c_mult
                     cost = notional * rate
                     if side == Side.SHORT:
                         cost = -cost

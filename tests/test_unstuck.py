@@ -7,9 +7,10 @@ source-isolated buckets:
     ``unstuck_threshold * WEL``;
   * only when current price has reverted across the EMA band by
     ``unstuck_ema_dist`` (sell into the bounce, not into the bleed);
-  * emits small reduce-only **limit** orders, not market;
+  * emits one reduce-only **limit** order at current price, not market;
   * throttled by a 24h rolling realized-loss budget;
-  * each bucket evaluated independently.
+  * all stuck candidates compete for the same tick and only the most stuck
+    candidate is emitted.
 """
 
 from __future__ import annotations
@@ -102,10 +103,9 @@ def _account_with_grid_long(*, balance, qty, entry, last_price, ema) -> AccountS
 
 class TestUnstuckTrigger:
     def test_fires_when_stuck_and_bounce_above_ema_band(self):
-        risk = _risk()
-        # Grid bucket: 10 BTC @ 50k = 500_000 notional / 1_000 balance = WE 500.
-        # WEL 600 → we/wel = 0.833... hmm, below 0.9. Let me size it past.
-        # 5.5 BTC @ 50k = 275_000 / 1_000 = WE 275. WEL 300 → ratio 0.916.
+        risk = _risk(daily_loss_allowance_pct=0.15)
+        # Grid bucket: 5.5 BTC @ 50k = 275_000 notional / 1_000 balance = WE 275.
+        # WEL 300 → ratio 0.916 > 0.90 → stuck.
         acc = _account_with_grid_long(
             balance=1_000.0, qty=5.5, entry=50_000.0,
             last_price=50_300.0,  # > upper(49_500) * 1.01 = 49_995
@@ -122,10 +122,11 @@ class TestUnstuckTrigger:
         assert o.is_market is False
         assert o.source == OrderSource.GRID
         assert o.side == Side.LONG
-        # Price = ema.upper * (1 + dist)
-        assert o.price == pytest.approx(49_500 * 1.01)
-        # qty = position size * close_pct
-        assert o.qty == pytest.approx(5.5 * 0.05)
+        # Passivbot returns the close at current price after the EMA-band
+        # trigger fires, not at the band target itself.
+        assert o.price == pytest.approx(50_300.0)
+        # qty = balance * WEL * close_pct / current_price, capped by position size.
+        assert o.qty == pytest.approx(1_000.0 * 300.0 * 0.05 / 50_300.0)
 
     def test_does_not_fire_when_we_below_threshold(self):
         risk = _risk()
@@ -143,7 +144,7 @@ class TestUnstuckTrigger:
         """passivbot only sells the bounce — if we're still bleeding,
         keep holding."""
         risk = _risk(unstuck_ema_dist=0.02)
-        # Stuck (we/wel 0.916) but price still below ema.upper * 1.02.
+        # Stuck (we/wel 0.916) but price still below upper(49_500) * 1.02 = 50_490.
         acc = _account_with_grid_long(
             balance=1_000.0, qty=5.5, entry=50_000.0,
             last_price=49_500.0,  # below 49_500 * 1.02 = 50_490
@@ -155,11 +156,14 @@ class TestUnstuckTrigger:
         assert orders == []
 
     def test_short_bucket_uses_lower_band(self):
-        risk = _risk()
+        # Realistic stuck SHORT: price trending UP (EMA bands above entry),
+        # position is underwater. Lower-band trigger buys the dip.
+        # Allowance must cover the projected loss.
+        risk = _risk(daily_loss_allowance_pct=0.15)
         acc = AccountState(balance=1_000.0)
-        ss = SymbolState("BTC", last_price=48_500.0)
-        ss.ema = _ema_state(lower=49_000.0, upper=49_500.0)
-        ss.position_short = Position(5.5, 50_000.0)
+        ss = SymbolState("BTC", last_price=50_480.0)  # dipped below 51_000*0.99
+        ss.ema = _ema_state(lower=51_000.0, upper=51_500.0)
+        ss.position_short = Position(5.5, 50_000.0)  # WE=275, WEL=300 → stuck
         acc.symbols["BTC"] = ss
 
         orders = risk.compute_unstuck_orders(
@@ -168,8 +172,7 @@ class TestUnstuckTrigger:
         assert len(orders) == 1
         o = orders[0]
         assert o.side == Side.SHORT
-        # price = lower * (1 - dist)
-        assert o.price == pytest.approx(49_000 * 0.99)
+        assert o.price == pytest.approx(50_480.0)
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +215,22 @@ class TestBucketIndependence:
         assert OrderSource.GRID in sources
         assert OrderSource.TREND not in sources
 
+    def test_only_most_stuck_candidate_fires(self):
+        risk = _risk(trend_wallet_exposure_limit=0.15)
+        acc = AccountState(balance=1_000.0)
+        ss = SymbolState("BTC", last_price=50_300.0)
+        ss.ema = _ema_state(lower=49_000.0, upper=49_500.0)
+        ss.position_long = Position(5.5, 50_000.0)
+        ss.trend_long = Position(0.01, 65_000.0)
+        acc.symbols["BTC"] = ss
+
+        orders = risk.compute_unstuck_orders(
+            acc, grid_wallet_exposure_limit=300.0, now_ms=0,
+        )
+
+        assert len(orders) == 1
+        assert orders[0].source == OrderSource.TREND
+
 
 # ---------------------------------------------------------------------------
 # 24h loss-allowance throttle
@@ -222,8 +241,8 @@ class TestAllowanceThrottle:
     def test_allowance_exhausted_blocks_unstuck(self):
         risk = _risk(daily_loss_allowance_pct=0.01)  # $10 of $1000 balance
         acc = _account_with_grid_long(
-            balance=1_000.0, qty=5.5, entry=50_000.0, last_price=50_300.0,
-            ema=_ema_state(),
+            balance=1_000.0, qty=5.5, entry=50_000.0, last_price=49_500.0,
+            ema=_ema_state(lower=48_000.0, upper=49_000.0),
         )
         # Spent the entire grid loss budget already.
         acc.add_realized_pnl(OrderSource.GRID, -20.0, 0)
@@ -253,8 +272,8 @@ class TestAllowanceThrottle:
     def test_allowance_window_rolls_off(self):
         risk = _risk(daily_loss_allowance_pct=0.01)
         acc = _account_with_grid_long(
-            balance=1_000.0, qty=5.5, entry=50_000.0, last_price=50_300.0,
-            ema=_ema_state(),
+            balance=1_000.0, qty=5.5, entry=50_000.0, last_price=49_500.0,
+            ema=_ema_state(lower=48_000.0, upper=49_000.0),
         )
         # Loss recorded 25h ago — outside the window.
         acc.add_realized_pnl(OrderSource.GRID, -50.0, 0)
