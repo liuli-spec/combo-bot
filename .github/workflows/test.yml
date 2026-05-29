@@ -85,7 +85,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           pip install rust/target/wheels/*.whl
-          pip install pytest numpy optuna ccxt
+          pip install pytest numpy pandas optuna ccxt
 
       - name: Install wheel and Python dependencies (Windows)
         if: runner.os == 'Windows'
@@ -93,7 +93,7 @@ jobs:
         run: |
           $wheel = Get-ChildItem rust/target/wheels/*.whl | Select-Object -First 1
           pip install $wheel.FullName
-          pip install pytest numpy optuna ccxt
+          pip install pytest numpy pandas optuna ccxt
 
       - name: Python tests (pytest)
         run: python -m pytest tests/ -v

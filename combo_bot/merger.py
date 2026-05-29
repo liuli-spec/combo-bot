@@ -82,7 +82,10 @@ class DecisionMerger:
 
         if signal.regime == TrendRegime.STRONG_BULL:
             ss = account.symbols.get(symbol)
-            if ss and ss.position_long.is_open:
+            # After Stage 3 source isolation, the overlay co-exists with
+            # the grid bucket — we only skip when the *trend* bucket is
+            # already populated to avoid pyramiding the overlay.
+            if ss and ss.trend_long.is_open:
                 return []
             orders.append(Order(
                 symbol=symbol,
@@ -94,7 +97,7 @@ class DecisionMerger:
 
         elif signal.regime == TrendRegime.STRONG_BEAR:
             ss = account.symbols.get(symbol)
-            if ss and ss.position_short.is_open:
+            if ss and ss.trend_short.is_open:
                 return []
             orders.append(Order(
                 symbol=symbol,

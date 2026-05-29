@@ -106,10 +106,22 @@ class TestTrendOrders:
         )
         assert len(orders) == 0
 
-    def test_no_duplicate_long_if_already_open(self, merger, account_state, exchange_params):
-        account_state.symbols["BTC/USDT:USDT"].position_long = Position(0.01, 50000.0)
+    def test_no_duplicate_long_if_trend_bucket_already_open(self, merger, account_state, exchange_params):
+        # Stage 3: overlay only skips when its own trend bucket is populated.
+        # A grid bucket on the same side is fine — overlay can co-exist.
+        account_state.symbols["BTC/USDT:USDT"].trend_long = Position(0.01, 50000.0)
         signal = TrendSignal(direction=0.8, strength=0.8, regime=TrendRegime.STRONG_BULL)
         orders = merger.generate_trend_orders(
             "BTC/USDT:USDT", signal, 50000.0, account_state, exchange_params,
         )
         assert len(orders) == 0
+
+    def test_overlay_emitted_even_with_grid_position_open(self, merger, account_state, exchange_params):
+        """Stage 3: a grid long doesn't block the trend overlay long."""
+        account_state.symbols["BTC/USDT:USDT"].position_long = Position(0.01, 50000.0)
+        signal = TrendSignal(direction=0.8, strength=0.8, regime=TrendRegime.STRONG_BULL)
+        orders = merger.generate_trend_orders(
+            "BTC/USDT:USDT", signal, 50000.0, account_state, exchange_params,
+        )
+        assert len(orders) == 1
+        assert orders[0].source == OrderSource.TREND
