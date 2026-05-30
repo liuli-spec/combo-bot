@@ -23,7 +23,6 @@ from combo_bot.types import (
     Position,
     Side,
     SymbolState,
-    TradingMode,
     TrendRegime,
     TrendSignal,
 )
@@ -142,9 +141,7 @@ class IStrategy(ABC):
 
     # --- price / size adjustment --------------------------------------------
 
-    def custom_entry_price(
-        self, ctx: TradeContext, proposed_price: float
-    ) -> float:
+    def custom_entry_price(self, ctx: TradeContext, proposed_price: float) -> float:
         """Adjust the entry price. Default: passthrough."""
         return proposed_price
 
@@ -175,9 +172,7 @@ class IStrategy(ABC):
         """Return an absolute stoploss price, or ``None`` to skip. Default: ``None``."""
         return None
 
-    def custom_exit(
-        self, ctx: TradeContext, current_profit_pct: float
-    ) -> str | None:
+    def custom_exit(self, ctx: TradeContext, current_profit_pct: float) -> str | None:
         """Return an exit reason to trigger a close, or ``None`` to skip."""
         return None
 
@@ -215,15 +210,11 @@ class IStrategy(ABC):
         """Set leverage for a new position. Default: passthrough, capped."""
         return min(proposed_leverage, max_leverage)
 
-    def check_entry_timeout(
-        self, ctx: TradeContext, order_age_seconds: int
-    ) -> bool:
+    def check_entry_timeout(self, ctx: TradeContext, order_age_seconds: int) -> bool:
         """Return ``True`` to cancel a stale pending entry. Default: never."""
         return False
 
-    def check_exit_timeout(
-        self, ctx: TradeContext, order_age_seconds: int
-    ) -> bool:
+    def check_exit_timeout(self, ctx: TradeContext, order_age_seconds: int) -> bool:
         """Return ``True`` to cancel a stale pending exit. Default: never."""
         return False
 
@@ -241,9 +232,7 @@ class StrategyRunner:
 
     # --- entry filtering ----------------------------------------------------
 
-    def filter_entries(
-        self, orders: list[Order], context: TradeContext
-    ) -> list[Order]:
+    def filter_entries(self, orders: list[Order], context: TradeContext) -> list[Order]:
         """Apply entry-side strategy hooks to a list of orders.
 
         Order processing mirrors freqtrade's final-confirm semantics:
@@ -260,9 +249,7 @@ class StrategyRunner:
 
             ctx = self._ctx_for_order(context, order)
             c_mult = (
-                ctx.exchange_params.c_mult
-                if ctx.exchange_params is not None
-                else 1.0
+                ctx.exchange_params.c_mult if ctx.exchange_params is not None else 1.0
             )
 
             if order.is_market:
@@ -275,9 +262,7 @@ class StrategyRunner:
                 # fallback) so confirm sees the number it actually
                 # transacts near.
                 final_price = (
-                    ctx.current_price
-                    if ctx.current_price > 0
-                    else order.price
+                    ctx.current_price if ctx.current_price > 0 else order.price
                 )
             else:
                 new_price = self.strategy.custom_entry_price(ctx, order.price)
@@ -314,9 +299,7 @@ class StrategyRunner:
 
     # --- exit filtering -----------------------------------------------------
 
-    def filter_exits(
-        self, orders: list[Order], context: TradeContext
-    ) -> list[Order]:
+    def filter_exits(self, orders: list[Order], context: TradeContext) -> list[Order]:
         """Apply exit-side strategy hooks to a list of orders.
 
         Order matches Freqtrade's lifecycle (freqtradebot.py:2106 area):
@@ -352,16 +335,13 @@ class StrategyRunner:
                 # exchange fills near current — surfacing the threshold
                 # to confirm would mislead the strategy.
                 final_price = (
-                    ctx.current_price if ctx.current_price > 0
-                    else order.price
+                    ctx.current_price if ctx.current_price > 0 else order.price
                 )
             else:
                 new_price = self.strategy.custom_exit_price(
                     ctx, order.price, exit_reason
                 )
-                adjusted = self.strategy.adjust_exit_price(
-                    ctx, new_price, exit_reason
-                )
+                adjusted = self.strategy.adjust_exit_price(ctx, new_price, exit_reason)
                 final_price = adjusted if adjusted is not None else new_price
 
             if not self.strategy.confirm_trade_exit(
@@ -400,9 +380,7 @@ class StrategyRunner:
 
         return None
 
-    def check_position_adjustment(
-        self, context: TradeContext
-    ) -> Order | None:
+    def check_position_adjustment(self, context: TradeContext) -> Order | None:
         """Call ``adjust_trade_position`` and turn its result into an order.
 
         The emitted order targets the same source bucket the strategy
@@ -414,16 +392,13 @@ class StrategyRunner:
             return None
 
         current_profit_pct = self._profit_pct(context)
-        delta_qty = self.strategy.adjust_trade_position(
-            context, current_profit_pct
-        )
+        delta_qty = self.strategy.adjust_trade_position(context, current_profit_pct)
         if delta_qty is None or abs(delta_qty) < 1e-12:
             return None
 
         # Positive delta = add to position; negative = trim.
-        reduce_only = (
-            (context.side == Side.LONG and delta_qty < 0)
-            or (context.side == Side.SHORT and delta_qty > 0)
+        reduce_only = (context.side == Side.LONG and delta_qty < 0) or (
+            context.side == Side.SHORT and delta_qty > 0
         )
         return Order(
             symbol=context.symbol,
@@ -436,9 +411,7 @@ class StrategyRunner:
 
     # --- internal helpers ---------------------------------------------------
 
-    def _ctx_for_order(
-        self, base: TradeContext, order: Order
-    ) -> TradeContext:
+    def _ctx_for_order(self, base: TradeContext, order: Order) -> TradeContext:
         """Build a per-order context (side may differ from the base context)."""
         if (
             order.side == base.side
@@ -496,9 +469,7 @@ class StrategyRunner:
         # Strategy-triggered exits are taker market orders so they actually
         # fill on the current candle rather than waiting for a limit cross.
         source = (
-            OrderSource.TREND
-            if ctx.source == OrderSource.TREND
-            else OrderSource.RISK
+            OrderSource.TREND if ctx.source == OrderSource.TREND else OrderSource.RISK
         )
         return Order(
             symbol=ctx.symbol,
@@ -645,15 +616,9 @@ class ExampleTrendStrategy(IStrategy):
         if ctx.signal.strength < self.min_signal_strength:
             return False
         # In strong counter-trend regimes, avoid adding to the dominant side.
-        if (
-            ctx.side == Side.LONG
-            and ctx.signal.regime == TrendRegime.STRONG_BEAR
-        ):
+        if ctx.side == Side.LONG and ctx.signal.regime == TrendRegime.STRONG_BEAR:
             return False
-        if (
-            ctx.side == Side.SHORT
-            and ctx.signal.regime == TrendRegime.STRONG_BULL
-        ):
+        if ctx.side == Side.SHORT and ctx.signal.regime == TrendRegime.STRONG_BULL:
             return False
         return True
 

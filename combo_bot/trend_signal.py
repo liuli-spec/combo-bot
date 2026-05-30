@@ -1,6 +1,6 @@
 from __future__ import annotations
 import numpy as np
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from combo_bot.types import TrendRegime, TrendSignal
 
 
@@ -28,12 +28,15 @@ class TrendEngine:
         if symbol not in self._history:
             self._history[symbol] = []
         self._history[symbol].append(close)
-        max_needed = max(
-            self.config.macd_slow + self.config.macd_signal,
-            self.config.bb_period,
-            self.config.ema_slow,
-            self.config.atr_period + 1,
-        ) + 10
+        max_needed = (
+            max(
+                self.config.macd_slow + self.config.macd_signal,
+                self.config.bb_period,
+                self.config.ema_slow,
+                self.config.atr_period + 1,
+            )
+            + 10
+        )
         # Prune infrequently to avoid EMA re-seed jumps (each truncation
         # resets the seeding index of _ema(), producing a signal artefact).
         # 20× leaves ~920 bars (≈15 hours of 1m data) between truncations
@@ -74,7 +77,9 @@ class TrendEngine:
         strength = float(min(abs(direction), 1.0))
         direction = float(np.clip(direction, -1.0, 1.0))
 
-        regime = _classify_regime(direction, self.config.strong_threshold, self.config.weak_threshold)
+        regime = _classify_regime(
+            direction, self.config.strong_threshold, self.config.weak_threshold
+        )
         return TrendSignal(direction=direction, strength=strength, regime=regime)
 
     def reset(self, symbol: str | None = None):
@@ -121,7 +126,9 @@ def _ema(arr: np.ndarray, span: int) -> np.ndarray:
     return out
 
 
-def _calc_macd_histogram(prices: np.ndarray, fast: int, slow: int, signal: int) -> float:
+def _calc_macd_histogram(
+    prices: np.ndarray, fast: int, slow: int, signal: int
+) -> float:
     if len(prices) < slow + signal:
         return np.nan
     ema_fast = _ema(prices, fast)

@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 from combo_bot.grid_engine import GridConfig
-from combo_bot.types import Candle, ExchangeParams
+from combo_bot.types import Candle
 
 rust_backtest = pytest.importorskip("combo_bot.rust_backtest")
 if not rust_backtest.RUST_AVAILABLE:
@@ -14,13 +14,15 @@ def make_oscillating(n: int, base: float = 50000.0, amp: float = 500.0) -> np.nd
     t = np.arange(n)
     close = base + amp * np.sin(t / 80 * 2 * np.pi)
     spread = amp * 0.05
-    return np.column_stack([
-        close,
-        close + spread,
-        close - spread,
-        close,
-        np.full(n, 100.0),
-    ])
+    return np.column_stack(
+        [
+            close,
+            close + spread,
+            close - spread,
+            close,
+            np.full(n, 100.0),
+        ]
+    )
 
 
 class TestRustBacktestBasic:
@@ -40,7 +42,8 @@ class TestRustBacktestBasic:
             close_grid_markup_end=0.008,
             close_grid_qty_pct=0.6,
             wallet_exposure_limit=0.5,
-            ema_span_0=30, ema_span_1=60,
+            ema_span_0=30,
+            ema_span_1=60,
         )
         result = rust_backtest.run_rust_backtest(arr, cfg)
         assert result.final_balance > 10000
@@ -73,10 +76,14 @@ class TestRustBacktestVsPython:
         n = 5000
         arr = make_oscillating(n)
         py_candles = [
-            Candle(timestamp=1700000000000 + i * 60000,
-                   open=float(arr[i, 0]), high=float(arr[i, 1]),
-                   low=float(arr[i, 2]), close=float(arr[i, 3]),
-                   volume=float(arr[i, 4]))
+            Candle(
+                timestamp=1700000000000 + i * 60000,
+                open=float(arr[i, 0]),
+                high=float(arr[i, 1]),
+                low=float(arr[i, 2]),
+                close=float(arr[i, 3]),
+                volume=float(arr[i, 4]),
+            )
             for i in range(n)
         ]
 

@@ -125,9 +125,7 @@ class KellySizer:
             return
         return_pct = net_pnl / notional
         bucket = (
-            OrderSource.TREND
-            if fill.source == OrderSource.TREND
-            else OrderSource.GRID
+            OrderSource.TREND if fill.source == OrderSource.TREND else OrderSource.GRID
         )
         self._returns[bucket].append(return_pct)
 
@@ -137,11 +135,7 @@ class KellySizer:
 
     def fraction(self, source: OrderSource) -> float:
         """Current sizing multiplier in [0, max_fraction]."""
-        bucket = (
-            OrderSource.TREND
-            if source == OrderSource.TREND
-            else OrderSource.GRID
-        )
+        bucket = OrderSource.TREND if source == OrderSource.TREND else OrderSource.GRID
         returns = self._returns[bucket]
         n = len(returns)
         if n < self.config.min_samples:
@@ -167,11 +161,7 @@ class KellySizer:
 
         Useful for surfacing "cold start vs warm" to dashboards.
         """
-        bucket = (
-            OrderSource.TREND
-            if source == OrderSource.TREND
-            else OrderSource.GRID
-        )
+        bucket = OrderSource.TREND if source == OrderSource.TREND else OrderSource.GRID
         return len(self._returns[bucket])
 
 

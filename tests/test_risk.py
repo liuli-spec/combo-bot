@@ -1,18 +1,27 @@
 from __future__ import annotations
 import pytest
-from combo_bot.types import AccountState, Order, OrderSource, Position, Side, SymbolState
+from combo_bot.types import (
+    AccountState,
+    Order,
+    OrderSource,
+    Position,
+    Side,
+    SymbolState,
+)
 from combo_bot.risk import RiskConfig, RiskManager, RiskTier
 
 
 @pytest.fixture
 def risk():
-    return RiskManager(RiskConfig(
-        yellow_threshold=0.10,
-        orange_threshold=0.18,
-        red_threshold=0.25,
-        max_total_wallet_exposure=3.0,
-        max_single_exposure=0.5,
-    ))
+    return RiskManager(
+        RiskConfig(
+            yellow_threshold=0.10,
+            orange_threshold=0.18,
+            red_threshold=0.25,
+            max_total_wallet_exposure=3.0,
+            max_single_exposure=0.5,
+        )
+    )
 
 
 class TestRiskTier:

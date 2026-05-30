@@ -2,7 +2,15 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict
 from combo_bot.types import (
-    EMAState, ExchangeParams, Order, OrderSource, Position, Side, TradingMode, TrailingState, VolatilityState,
+    EMAState,
+    ExchangeParams,
+    Order,
+    OrderSource,
+    Position,
+    Side,
+    TradingMode,
+    TrailingState,
+    VolatilityState,
 )
 from combo_bot.grid_engine import GridConfig
 
@@ -10,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 try:
     import combo_futures_core as _rust
+
     RUST_AVAILABLE = True
 except ImportError:
     _rust = None
@@ -74,6 +83,7 @@ def _trailing_to_dict(trailing: TrailingState, side: Side) -> dict:
     * SHORT: extreme = running maximum, recovery = running minimum after extreme.
     """
     import sys
+
     if not trailing.initialized:
         return {
             "min_since_open": sys.float_info.max,
@@ -85,13 +95,13 @@ def _trailing_to_dict(trailing: TrailingState, side: Side) -> dict:
         return {
             "min_since_open": trailing.extreme,
             "max_since_min": trailing.recovery,
-            "max_since_open": trailing.recovery,   # best-effort: no independent max_since_open
-            "min_since_max": trailing.extreme,      # best-effort
+            "max_since_open": trailing.recovery,  # best-effort: no independent max_since_open
+            "min_since_max": trailing.extreme,  # best-effort
         }
     else:
         return {
-            "min_since_open": trailing.recovery,    # best-effort
-            "max_since_min": trailing.extreme,      # best-effort
+            "min_since_open": trailing.recovery,  # best-effort
+            "max_since_min": trailing.extreme,  # best-effort
             "max_since_open": trailing.extreme,
             "min_since_max": trailing.recovery,
         }
@@ -103,14 +113,16 @@ def _rust_orders_to_python(
     result = []
     for o in rust_orders:
         source = _RUST_OT_TO_SOURCE.get(o["order_type"], OrderSource.GRID)
-        result.append(Order(
-            symbol=symbol,
-            side=side,
-            price=float(o["price"]),
-            qty=float(o["qty"]),
-            source=source,
-            reduce_only=reduce_only,
-        ))
+        result.append(
+            Order(
+                symbol=symbol,
+                side=side,
+                price=float(o["price"]),
+                qty=float(o["qty"]),
+                source=source,
+                reduce_only=reduce_only,
+            )
+        )
     return result
 
 
@@ -146,17 +158,27 @@ def compute_grid_orders_rust(
 
     if mode == TradingMode.PANIC:
         if position.is_open:
-            orders.append(Order(
-                symbol=symbol, side=side, price=bid if side == Side.LONG else ask,
-                qty=abs(position.size), source=OrderSource.RISK, reduce_only=True,
-            ))
+            orders.append(
+                Order(
+                    symbol=symbol,
+                    side=side,
+                    price=bid if side == Side.LONG else ask,
+                    qty=abs(position.size),
+                    source=OrderSource.RISK,
+                    reduce_only=True,
+                )
+            )
         return orders
 
     if position.is_open and mode != TradingMode.PANIC:
         if side == Side.LONG:
-            closes = _rust.calc_closes_long(bp_dict, ep_dict, sp_dict, pos_dict, trail_dict)
+            closes = _rust.calc_closes_long(
+                bp_dict, ep_dict, sp_dict, pos_dict, trail_dict
+            )
         else:
-            closes = _rust.calc_closes_short(bp_dict, ep_dict, sp_dict, pos_dict, trail_dict)
+            closes = _rust.calc_closes_short(
+                bp_dict, ep_dict, sp_dict, pos_dict, trail_dict
+            )
         orders.extend(_rust_orders_to_python(closes, symbol, side, reduce_only=True))
 
     # NORMAL and AGGRESSIVE both emit entries; TP_ONLY / GRACEFUL_STOP
@@ -170,11 +192,23 @@ def compute_grid_orders_rust(
         wel_cap = grid_config.wallet_exposure_limit
         if side == Side.LONG:
             entries = _rust.calc_entries_long(
-                bp_dict, ep_dict, sp_dict, pos_dict, trail_dict, wel_cap, max_levels,
+                bp_dict,
+                ep_dict,
+                sp_dict,
+                pos_dict,
+                trail_dict,
+                wel_cap,
+                max_levels,
             )
         else:
             entries = _rust.calc_entries_short(
-                bp_dict, ep_dict, sp_dict, pos_dict, trail_dict, wel_cap, max_levels,
+                bp_dict,
+                ep_dict,
+                sp_dict,
+                pos_dict,
+                trail_dict,
+                wel_cap,
+                max_levels,
             )
         orders.extend(_rust_orders_to_python(entries, symbol, side, reduce_only=False))
 
@@ -209,15 +243,33 @@ def benchmark_rust_vs_python(n_iterations: int = 10000) -> dict:
     t0 = time.perf_counter()
     for _ in range(n_iterations):
         py_engine.compute_orders(
-            "BTC", Side.LONG, pos, ema, vol, 10000.0, 0.0, ep, TradingMode.NORMAL,
+            "BTC",
+            Side.LONG,
+            pos,
+            ema,
+            vol,
+            10000.0,
+            0.0,
+            ep,
+            TradingMode.NORMAL,
         )
     py_time = time.perf_counter() - t0
 
     t0 = time.perf_counter()
     for _ in range(n_iterations):
         compute_grid_orders_rust(
-            "BTC", Side.LONG, pos, ema, vol, 10000.0, 49900.0, 50000.0, ep, config,
-            TradingMode.NORMAL, max_levels=5,
+            "BTC",
+            Side.LONG,
+            pos,
+            ema,
+            vol,
+            10000.0,
+            49900.0,
+            50000.0,
+            ep,
+            config,
+            TradingMode.NORMAL,
+            max_levels=5,
         )
     rust_time = time.perf_counter() - t0
 

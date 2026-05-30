@@ -4,6 +4,7 @@
 * Same-ms-stuck pagination escalates to a parked symbol after N polls.
 * strategy config supports ``params`` kwargs.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +12,6 @@ import tempfile
 from pathlib import Path
 
 import pytest
-
 
 # ────────────────────────────────────────────────────────────────────
 # P0 — incomplete RVF marker not aged out
@@ -32,9 +32,9 @@ def test_incomplete_rvf_marker_survives_ttl_age_out():
         "incomplete marker must survive TTL — delayed trades still need "
         "the dedup guard"
     )
-    assert LiveTrader._rvf_marker_alive(complete, cutoff) is False, (
-        "fully-resolved marker should age out normally"
-    )
+    assert (
+        LiveTrader._rvf_marker_alive(complete, cutoff) is False
+    ), "fully-resolved marker should age out normally"
 
 
 def test_incomplete_marker_via_sink_after_long_delay():
@@ -43,40 +43,72 @@ def test_incomplete_marker_via_sink_after_long_delay():
     T=1h, the trade would have written the bucket → double position."""
     from combo_bot.fill_events_manager import FillEventManagerConfig
     from combo_bot.live import LiveConfig, LiveTrader
-    from combo_bot.types import ExchangeParams, Position, Side, SymbolState
+    from combo_bot.types import ExchangeParams, Position, SymbolState
 
     class _Stub:
         def __init__(self):
             self.trades_by_call: list[list[dict]] = []
-        async def load_markets(self): return {}
-        def market(self, _): return {
-            "precision": {"amount": 0.001, "price": 0.01},
-            "limits": {"amount": {"min": 0.001}, "cost": {"min": 5.0}},
-            "maker": 0.0002, "taker": 0.0005,
-        }
-        async def fetch_balance(self, _=None): return {"USDT": {"total": 10_000.0}}
-        async def fetch_positions(self, _): return []
-        async def fetch_funding_rate(self, _): return {"fundingRate": 0.0}
-        async def fetch_ohlcv(self, *a, **k): return []
+
+        async def load_markets(self):
+            return {}
+
+        def market(self, _):
+            return {
+                "precision": {"amount": 0.001, "price": 0.01},
+                "limits": {"amount": {"min": 0.001}, "cost": {"min": 5.0}},
+                "maker": 0.0002,
+                "taker": 0.0005,
+            }
+
+        async def fetch_balance(self, _=None):
+            return {"USDT": {"total": 10_000.0}}
+
+        async def fetch_positions(self, _):
+            return []
+
+        async def fetch_funding_rate(self, _):
+            return {"fundingRate": 0.0}
+
+        async def fetch_ohlcv(self, *a, **k):
+            return []
+
         async def fetch_my_trades(self, *a, **k):
             return self.trades_by_call.pop(0) if self.trades_by_call else []
-        async def fetch_open_orders(self, _): return []
+
+        async def fetch_open_orders(self, _):
+            return []
+
         async def create_order(self, *a, **k):
             return {"id": "ex-1", "status": "open"}
-        async def cancel_order(self, *a, **k): return {}
-        async def set_leverage(self, *a, **k): return {}
-        async def set_margin_mode(self, *a, **k): return {}
+
+        async def cancel_order(self, *a, **k):
+            return {}
+
+        async def set_leverage(self, *a, **k):
+            return {}
+
+        async def set_margin_mode(self, *a, **k):
+            return {}
 
     with tempfile.TemporaryDirectory() as tmp:
         ex = _Stub()
-        cfg = LiveConfig(symbols=["BTC/USDT:USDT"], dry_run=False,
-                          state_file=str(Path(tmp) / "state.json"))
-        trader = LiveTrader(cfg, ex,
-                            fill_events_config=FillEventManagerConfig(
-                                poll_interval_ms=0,
-                            ))
+        cfg = LiveConfig(
+            symbols=["BTC/USDT:USDT"],
+            dry_run=False,
+            state_file=str(Path(tmp) / "state.json"),
+        )
+        trader = LiveTrader(
+            cfg,
+            ex,
+            fill_events_config=FillEventManagerConfig(
+                poll_interval_ms=0,
+            ),
+        )
         trader.exchange_params["BTC/USDT:USDT"] = ExchangeParams(
-            qty_step=0.001, price_step=0.01, min_qty=0.001, min_cost=5.0,
+            qty_step=0.001,
+            price_step=0.01,
+            min_qty=0.001,
+            min_cost=5.0,
         )
         trader.account.symbols["BTC/USDT:USDT"] = SymbolState(
             symbol="BTC/USDT:USDT",
@@ -88,23 +120,34 @@ def test_incomplete_marker_via_sink_after_long_delay():
         trader._resolved_via_fetch["cb-delayed"] = marker
         trader._resolved_via_fetch["ex-delayed"] = marker
         trader.account.symbols["BTC/USDT:USDT"].trend_long = Position(
-            size=0.05, entry_price=50_000.0,
+            size=0.05,
+            entry_price=50_000.0,
         )
 
         # Trade finally arrives a long time after the marker's ts.
-        ex.trades_by_call = [[{
-            "id": "t-late", "timestamp": 10_000_000,
-            "side": "buy", "price": 50_000.0, "amount": 0.05,
-            "fee": {"cost": 0.0}, "order": "ex-delayed",
-            "clientOrderId": "cb-delayed", "info": {},
-        }]]
+        ex.trades_by_call = [
+            [
+                {
+                    "id": "t-late",
+                    "timestamp": 10_000_000,
+                    "side": "buy",
+                    "price": 50_000.0,
+                    "amount": 0.05,
+                    "fee": {"cost": 0.0},
+                    "order": "ex-delayed",
+                    "clientOrderId": "cb-delayed",
+                    "info": {},
+                }
+            ]
+        ]
         asyncio.run(trader._refresh_fills())
         # Bucket must still be 0.05, NOT 0.10.
-        assert (
-            trader.account.symbols["BTC/USDT:USDT"].trend_long.size
-            == pytest.approx(0.05)
-        ), "incomplete marker must survive arbitrary TTL so the late " \
-           "trade doesn't double the bucket"
+        assert trader.account.symbols["BTC/USDT:USDT"].trend_long.size == pytest.approx(
+            0.05
+        ), (
+            "incomplete marker must survive arbitrary TTL so the late "
+            "trade doesn't double the bucket"
+        )
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -114,7 +157,8 @@ def test_incomplete_marker_via_sink_after_long_delay():
 
 def test_stuck_pagination_parks_symbol_after_escalation():
     from combo_bot.fill_events_manager import (
-        FillEventManager, FillEventManagerConfig,
+        FillEventManager,
+        FillEventManagerConfig,
     )
 
     burst_ts = 1_000
@@ -130,9 +174,16 @@ def test_stuck_pagination_parks_symbol_after_escalation():
         async def fetch_my_trades(self, symbol, since=None, limit=None, params=None):
             self.calls += 1
             return [
-                {"id": f"burst-{i}", "timestamp": burst_ts,
-                 "side": "buy", "price": 50.0, "amount": 0.001,
-                 "fee": {"cost": 0.0}, "order": "o", "info": {}}
+                {
+                    "id": f"burst-{i}",
+                    "timestamp": burst_ts,
+                    "side": "buy",
+                    "price": 50.0,
+                    "amount": 0.001,
+                    "fee": {"cost": 0.0},
+                    "order": "o",
+                    "info": {},
+                }
                 for i in range(2)
             ]
 
@@ -160,9 +211,9 @@ def test_stuck_pagination_parks_symbol_after_escalation():
     captured: list = []
     asyncio.run(mgr.poll(sym, now_ms=3, sink=captured.extend))
     assert captured == []
-    assert mgr.exchange.calls == pre_call_count, (
-        "stuck symbol must not be polled again until clear_stuck"
-    )
+    assert (
+        mgr.exchange.calls == pre_call_count
+    ), "stuck symbol must not be polled again until clear_stuck"
 
     # clear_stuck unblocks the next poll.
     mgr.clear_stuck(sym)
@@ -173,7 +224,8 @@ def test_stuck_count_resets_on_normal_short_page_progress():
     """A clean drain (short page) should clear the consecutive-stuck
     counter so a single transient blip doesn't escalate."""
     from combo_bot.fill_events_manager import (
-        FillEventManager, FillEventManagerConfig,
+        FillEventManager,
+        FillEventManagerConfig,
     )
 
     class _MixedEx:
@@ -186,20 +238,35 @@ def test_stuck_count_resets_on_normal_short_page_progress():
         async def fetch_my_trades(self, symbol, since=None, limit=None, params=None):
             if self.phase == "stuck":
                 return [
-                    {"id": f"stuck-{i}", "timestamp": 1_000, "side": "buy",
-                     "price": 50.0, "amount": 0.001, "fee": {"cost": 0.0},
-                     "order": "o", "info": {}}
+                    {
+                        "id": f"stuck-{i}",
+                        "timestamp": 1_000,
+                        "side": "buy",
+                        "price": 50.0,
+                        "amount": 0.001,
+                        "fee": {"cost": 0.0},
+                        "order": "o",
+                        "info": {},
+                    }
                     for i in range(2)
                 ]
             return [
-                {"id": "drain-1", "timestamp": 2_000, "side": "buy",
-                 "price": 50.0, "amount": 0.001, "fee": {"cost": 0.0},
-                 "order": "o", "info": {}}
+                {
+                    "id": "drain-1",
+                    "timestamp": 2_000,
+                    "side": "buy",
+                    "price": 50.0,
+                    "amount": 0.001,
+                    "fee": {"cost": 0.0},
+                    "order": "o",
+                    "info": {},
+                }
             ]
 
     ex = _MixedEx()
     mgr = FillEventManager(
-        ex, FillEventManagerConfig(poll_interval_ms=0, page_size=2),
+        ex,
+        FillEventManagerConfig(poll_interval_ms=0, page_size=2),
     )
     mgr._stuck_escalate_after = 10  # plenty of headroom
     sym = "BTC/USDT:USDT"
@@ -210,9 +277,9 @@ def test_stuck_count_resets_on_normal_short_page_progress():
     # Exchange now drains cleanly via a short page.
     ex.phase = "drain"
     asyncio.run(mgr.poll(sym, now_ms=1, sink=lambda fs: None))
-    assert sym not in mgr._stuck_count, (
-        f"clean drain must reset stuck counter; got {mgr._stuck_count!r}"
-    )
+    assert (
+        sym not in mgr._stuck_count
+    ), f"clean drain must reset stuck counter; got {mgr._stuck_count!r}"
     assert sym not in mgr._stuck_symbols
 
 
@@ -231,20 +298,28 @@ def test_build_strategy_passes_params_kwargs():
             self.rsi_period = rsi_period
             self.threshold = threshold
 
-        def populate_indicators(self, df, m): return df
-        def populate_entry_trend(self, df, m): return df
-        def populate_exit_trend(self, df, m): return df
+        def populate_indicators(self, df, m):
+            return df
+
+        def populate_entry_trend(self, df, m):
+            return df
+
+        def populate_exit_trend(self, df, m):
+            return df
 
     # Register class so the dotted-path lookup works.
     import combo_bot.fusion_config as fc
+
     fc._STRATEGY_REGISTRY["_ParamStrategy"] = _ParamStrategy
     try:
-        built = build_strategy({
-            "strategy": {
-                "class": "_ParamStrategy",
-                "params": {"rsi_period": 21, "threshold": 0.75},
-            },
-        })
+        built = build_strategy(
+            {
+                "strategy": {
+                    "class": "_ParamStrategy",
+                    "params": {"rsi_period": 21, "threshold": 0.75},
+                },
+            }
+        )
         assert isinstance(built, _ParamStrategy)
         assert built.rsi_period == 21
         assert built.threshold == 0.75
@@ -265,19 +340,28 @@ def test_build_strategy_raises_on_bad_params():
     class _StrictStrategy(IStrategy):
         def __init__(self, rsi_period: int = 14):
             self.rsi_period = rsi_period
-        def populate_indicators(self, df, m): return df
-        def populate_entry_trend(self, df, m): return df
-        def populate_exit_trend(self, df, m): return df
+
+        def populate_indicators(self, df, m):
+            return df
+
+        def populate_entry_trend(self, df, m):
+            return df
+
+        def populate_exit_trend(self, df, m):
+            return df
 
     import combo_bot.fusion_config as fc
+
     fc._STRATEGY_REGISTRY["_StrictStrategy"] = _StrictStrategy
     try:
         with pytest.raises(TypeError):
-            build_strategy({
-                "strategy": {
-                    "class": "_StrictStrategy",
-                    "params": {"misspelled_key": 123},
-                },
-            })
+            build_strategy(
+                {
+                    "strategy": {
+                        "class": "_StrictStrategy",
+                        "params": {"misspelled_key": 123},
+                    },
+                }
+            )
     finally:
         fc._STRATEGY_REGISTRY.pop("_StrictStrategy", None)

@@ -89,40 +89,71 @@ class LiveObserver:
         self.tick_log = _CsvLog(
             out_dir / "tick.csv",
             [
-                "ts_iso", "tick_ms", "balance", "equity", "drawdown",
-                "risk_tier", "red_latched", "pending_overlay_count",
-                "cid_cache_size", "open_orders_count",
+                "ts_iso",
+                "tick_ms",
+                "balance",
+                "equity",
+                "drawdown",
+                "risk_tier",
+                "red_latched",
+                "pending_overlay_count",
+                "cid_cache_size",
+                "open_orders_count",
             ],
         )
         self.bucket_log = _CsvLog(
             out_dir / "buckets.csv",
             [
-                "ts_iso", "symbol", "side",
-                "grid_size", "grid_entry_price",
-                "trend_size", "trend_entry_price",
-                "local_total", "best_price",
+                "ts_iso",
+                "symbol",
+                "side",
+                "grid_size",
+                "grid_entry_price",
+                "trend_size",
+                "trend_entry_price",
+                "local_total",
+                "best_price",
             ],
         )
         self.fill_log = _CsvLog(
             out_dir / "fills.csv",
             [
-                "ts_iso", "fill_ts", "symbol", "side", "source",
-                "reduce_only", "price", "qty", "fee", "realized_pnl",
+                "ts_iso",
+                "fill_ts",
+                "symbol",
+                "side",
+                "source",
+                "reduce_only",
+                "price",
+                "qty",
+                "fee",
+                "realized_pnl",
             ],
         )
         self.pnl_log = _CsvLog(
             out_dir / "pnl.csv",
             [
-                "ts_iso", "grid_realized_pnl", "trend_realized_pnl",
-                "grid_equity_peak", "trend_equity_peak",
-                "grid_loss_24h", "trend_loss_24h",
+                "ts_iso",
+                "grid_realized_pnl",
+                "trend_realized_pnl",
+                "grid_equity_peak",
+                "trend_equity_peak",
+                "grid_loss_24h",
+                "trend_loss_24h",
             ],
         )
         self.reconcile_log = _CsvLog(
             out_dir / "reconcile.csv",
             [
-                "ts_iso", "symbol", "side", "source", "reduce_only",
-                "is_market", "price", "qty", "client_order_id",
+                "ts_iso",
+                "symbol",
+                "side",
+                "source",
+                "reduce_only",
+                "is_market",
+                "price",
+                "qty",
+                "client_order_id",
                 "decision",
             ],
         )
@@ -190,68 +221,97 @@ class LiveObserver:
             risk_tier = getattr(tr.risk.tier, "value", str(tr.risk.tier))
         except Exception:
             risk_tier = "?"
-        open_orders_count = sum(
-            len(v) for v in tr._open_orders.values()
+        open_orders_count = sum(len(v) for v in tr._open_orders.values())
+        self.tick_log.append(
+            [
+                ts_iso,
+                tr._now_ms(),
+                f"{tr.account.balance:.4f}",
+                f"{tr.account.equity:.4f}",
+                f"{tr.account.drawdown:.6f}",
+                risk_tier,
+                bool(getattr(tr.risk, "red_latched", False)),
+                len(tr._pending_overlay),
+                len(tr._cid_by_desired),
+                open_orders_count,
+            ]
         )
-        self.tick_log.append([
-            ts_iso, tr._now_ms(),
-            f"{tr.account.balance:.4f}",
-            f"{tr.account.equity:.4f}",
-            f"{tr.account.drawdown:.6f}",
-            risk_tier,
-            bool(getattr(tr.risk, "red_latched", False)),
-            len(tr._pending_overlay),
-            len(tr._cid_by_desired),
-            open_orders_count,
-        ])
 
         # Buckets — one row per symbol-side.
         for sym, ss in tr.account.symbols.items():
-            self.bucket_log.append([
-                ts_iso, sym, "long",
-                f"{ss.position_long.size:.8f}",
-                f"{ss.position_long.entry_price:.4f}",
-                f"{ss.trend_long.size:.8f}",
-                f"{ss.trend_long.entry_price:.4f}",
-                f"{ss.position_long.size + ss.trend_long.size:.8f}",
-                f"{ss.position_long.best_price:.4f}",
-            ])
-            self.bucket_log.append([
-                ts_iso, sym, "short",
-                f"{ss.position_short.size:.8f}",
-                f"{ss.position_short.entry_price:.4f}",
-                f"{ss.trend_short.size:.8f}",
-                f"{ss.trend_short.entry_price:.4f}",
-                f"{ss.position_short.size + ss.trend_short.size:.8f}",
-                f"{ss.position_short.best_price:.4f}",
-            ])
+            self.bucket_log.append(
+                [
+                    ts_iso,
+                    sym,
+                    "long",
+                    f"{ss.position_long.size:.8f}",
+                    f"{ss.position_long.entry_price:.4f}",
+                    f"{ss.trend_long.size:.8f}",
+                    f"{ss.trend_long.entry_price:.4f}",
+                    f"{ss.position_long.size + ss.trend_long.size:.8f}",
+                    f"{ss.position_long.best_price:.4f}",
+                ]
+            )
+            self.bucket_log.append(
+                [
+                    ts_iso,
+                    sym,
+                    "short",
+                    f"{ss.position_short.size:.8f}",
+                    f"{ss.position_short.entry_price:.4f}",
+                    f"{ss.trend_short.size:.8f}",
+                    f"{ss.trend_short.entry_price:.4f}",
+                    f"{ss.position_short.size + ss.trend_short.size:.8f}",
+                    f"{ss.position_short.best_price:.4f}",
+                ]
+            )
 
         # PnL ledger snapshot.
         try:
-            grid_l = -tr.account.loss_24h(__import__("combo_bot.types", fromlist=["OrderSource"]).OrderSource.GRID, tr._now_ms())
-            trend_l = -tr.account.loss_24h(__import__("combo_bot.types", fromlist=["OrderSource"]).OrderSource.TREND, tr._now_ms())
+            grid_l = -tr.account.loss_24h(
+                __import__(
+                    "combo_bot.types", fromlist=["OrderSource"]
+                ).OrderSource.GRID,
+                tr._now_ms(),
+            )
+            trend_l = -tr.account.loss_24h(
+                __import__(
+                    "combo_bot.types", fromlist=["OrderSource"]
+                ).OrderSource.TREND,
+                tr._now_ms(),
+            )
         except Exception:
             grid_l = trend_l = 0.0
-        self.pnl_log.append([
-            ts_iso,
-            f"{tr.account.grid_realized_pnl:.4f}",
-            f"{tr.account.trend_realized_pnl:.4f}",
-            f"{tr.account.grid_equity_peak:.4f}",
-            f"{tr.account.trend_equity_peak:.4f}",
-            f"{grid_l:.4f}",
-            f"{trend_l:.4f}",
-        ])
+        self.pnl_log.append(
+            [
+                ts_iso,
+                f"{tr.account.grid_realized_pnl:.4f}",
+                f"{tr.account.trend_realized_pnl:.4f}",
+                f"{tr.account.grid_equity_peak:.4f}",
+                f"{tr.account.trend_equity_peak:.4f}",
+                f"{grid_l:.4f}",
+                f"{trend_l:.4f}",
+            ]
+        )
 
     def _snapshot_reconcile(self, decision: str, order) -> None:
         """Per-order decision log. ``decision`` is the action the
         trader is about to take: ``create``, ``cancel``."""
         cid = getattr(order, "client_order_id", "") or ""
-        self.reconcile_log.append([
-            self._iso(), order.symbol, order.side.value, order.source.value,
-            bool(order.reduce_only), bool(order.is_market),
-            f"{order.price:.4f}", f"{order.qty:.8f}",
-            cid, decision,
-        ])
+        self.reconcile_log.append(
+            [
+                self._iso(),
+                order.symbol,
+                order.side.value,
+                order.source.value,
+                bool(order.reduce_only),
+                bool(order.is_market),
+                f"{order.price:.4f}",
+                f"{order.qty:.8f}",
+                cid,
+                decision,
+            ]
+        )
 
     def _snapshot_cancel(self, existing: dict) -> None:
         cid = (
@@ -259,32 +319,45 @@ class LiveObserver:
             or (existing.get("info") or {}).get("clientOrderId")
             or ""
         )
-        self.reconcile_log.append([
-            self._iso(),
-            existing.get("symbol", ""),
-            str(existing.get("side", "")).lower(),
-            "?",   # source unknown from exchange-side record
-            bool(existing.get("reduceOnly", False)),
-            False,
-            f"{float(existing.get('price', 0) or 0):.4f}",
-            f"{float(existing.get('amount', 0) or 0):.8f}",
-            str(cid),
-            "cancel",
-        ])
+        self.reconcile_log.append(
+            [
+                self._iso(),
+                existing.get("symbol", ""),
+                str(existing.get("side", "")).lower(),
+                "?",  # source unknown from exchange-side record
+                bool(existing.get("reduceOnly", False)),
+                False,
+                f"{float(existing.get('price', 0) or 0):.4f}",
+                f"{float(existing.get('amount', 0) or 0):.8f}",
+                str(cid),
+                "cancel",
+            ]
+        )
 
     def _snapshot_fill(self, fill) -> None:
         ts_iso = self._iso()
-        self.fill_log.append([
-            ts_iso, fill.timestamp, fill.symbol, fill.side.value,
-            fill.source.value, bool(fill.reduce_only),
-            f"{fill.price:.4f}", f"{fill.qty:.8f}",
-            f"{fill.fee:.4f}", f"{fill.realized_pnl:.4f}",
-        ])
+        self.fill_log.append(
+            [
+                ts_iso,
+                fill.timestamp,
+                fill.symbol,
+                fill.side.value,
+                fill.source.value,
+                bool(fill.reduce_only),
+                f"{fill.price:.4f}",
+                f"{fill.qty:.8f}",
+                f"{fill.fee:.4f}",
+                f"{fill.realized_pnl:.4f}",
+            ]
+        )
 
     def close(self) -> None:
         for log in (
-            self.tick_log, self.bucket_log, self.fill_log,
-            self.pnl_log, self.reconcile_log,
+            self.tick_log,
+            self.bucket_log,
+            self.fill_log,
+            self.pnl_log,
+            self.reconcile_log,
         ):
             log.close()
 
@@ -305,8 +378,14 @@ def _build_trader(cfg: dict[str, Any], dry_run_override: bool | None):
 
     timeframe = str(cfg.get("timeframe", "1m"))
     _TF_TO_MIN = {
-        "1m": 1.0, "3m": 3.0, "5m": 5.0, "15m": 15.0, "30m": 30.0,
-        "1h": 60.0, "2h": 120.0, "4h": 240.0,
+        "1m": 1.0,
+        "3m": 3.0,
+        "5m": 5.0,
+        "15m": 15.0,
+        "30m": 30.0,
+        "1h": 60.0,
+        "2h": 120.0,
+        "4h": 240.0,
     }
     bar_min = cfg.get("bar_interval_minutes") or _TF_TO_MIN.get(timeframe, 1.0)
 
@@ -321,18 +400,18 @@ def _build_trader(cfg: dict[str, Any], dry_run_override: bool | None):
         candle_timeframe=timeframe,
         bar_interval_minutes=float(bar_min),
         loop_interval_seconds=float(cfg.get("loop_interval_seconds", 60)),
-        grid=GridConfig(**{
-            k: v for k, v in cfg.get("grid", {}).items() if not k.startswith("_")
-        }),
-        trend=TrendConfig(**{
-            k: v for k, v in cfg.get("trend", {}).items() if not k.startswith("_")
-        }),
-        merger=MergerConfig(**{
-            k: v for k, v in cfg.get("merger", {}).items() if not k.startswith("_")
-        }),
-        risk=RiskConfig(**{
-            k: v for k, v in cfg.get("risk", {}).items() if not k.startswith("_")
-        }),
+        grid=GridConfig(
+            **{k: v for k, v in cfg.get("grid", {}).items() if not k.startswith("_")}
+        ),
+        trend=TrendConfig(
+            **{k: v for k, v in cfg.get("trend", {}).items() if not k.startswith("_")}
+        ),
+        merger=MergerConfig(
+            **{k: v for k, v in cfg.get("merger", {}).items() if not k.startswith("_")}
+        ),
+        risk=RiskConfig(
+            **{k: v for k, v in cfg.get("risk", {}).items() if not k.startswith("_")}
+        ),
         regime=build_regime_config(cfg),
     )
     fusion = build_fusion(cfg)
@@ -356,7 +435,8 @@ def main() -> int:
     parser.add_argument("-c", "--config", required=True)
     parser.add_argument("-o", "--out-dir", required=True)
     parser.add_argument(
-        "--force-dry-run", action="store_true",
+        "--force-dry-run",
+        action="store_true",
         help="ignore config.dry_run and force dry_run=True for safety.",
     )
     args = parser.parse_args()
@@ -371,7 +451,8 @@ def main() -> int:
     out_dir = Path(args.out_dir)
 
     trader = _build_trader(
-        cfg, dry_run_override=True if args.force_dry_run else None,
+        cfg,
+        dry_run_override=True if args.force_dry_run else None,
     )
     observer = LiveObserver(trader, out_dir)
 

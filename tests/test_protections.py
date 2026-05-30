@@ -38,16 +38,22 @@ def _fill(
 class TestProtectionManager:
     def test_filter_orders_drops_locked_entries_but_keeps_exits(self):
         manager = ProtectionManager()
-        manager.locks.append(ProtectionLock(
-            until_ms=10_000,
-            reason="test",
-            symbol="BTC",
-            side=Side.LONG,
-            source=OrderSource.GRID,
-        ))
+        manager.locks.append(
+            ProtectionLock(
+                until_ms=10_000,
+                reason="test",
+                symbol="BTC",
+                side=Side.LONG,
+                source=OrderSource.GRID,
+            )
+        )
         entry = Order("BTC", Side.LONG, 49_000, 0.01, OrderSource.GRID)
         exit_order = Order(
-            "BTC", Side.LONG, 51_000, 0.01, OrderSource.GRID,
+            "BTC",
+            Side.LONG,
+            51_000,
+            0.01,
+            OrderSource.GRID,
             reduce_only=True,
         )
         other_source = Order("BTC", Side.LONG, 49_000, 0.01, OrderSource.TREND)
@@ -66,11 +72,13 @@ class TestProtectionManager:
 
 class TestStoplossGuard:
     def test_global_lock_after_loss_cluster(self):
-        guard = StoplossGuard(StoplossGuardConfig(
-            lookback_period_ms=60_000,
-            trade_limit=2,
-            stop_duration_ms=30_000,
-        ))
+        guard = StoplossGuard(
+            StoplossGuardConfig(
+                lookback_period_ms=60_000,
+                trade_limit=2,
+                stop_duration_ms=30_000,
+            )
+        )
         locks = guard.evaluate(
             [_fill(timestamp=1_000, pnl=-10), _fill(timestamp=2_000, pnl=-5)],
             AccountState(balance=10_000),
@@ -83,13 +91,15 @@ class TestStoplossGuard:
         assert locks[0].source is None
 
     def test_scoped_lock_by_pair_side_and_source(self):
-        guard = StoplossGuard(StoplossGuardConfig(
-            lookback_period_ms=60_000,
-            trade_limit=1,
-            only_per_pair=True,
-            only_per_side=True,
-            only_per_source=True,
-        ))
+        guard = StoplossGuard(
+            StoplossGuardConfig(
+                lookback_period_ms=60_000,
+                trade_limit=1,
+                only_per_pair=True,
+                only_per_side=True,
+                only_per_source=True,
+            )
+        )
         locks = guard.evaluate(
             [_fill(timestamp=1_000, pnl=-10, source=OrderSource.TREND)],
             AccountState(balance=10_000),
@@ -101,10 +111,12 @@ class TestStoplossGuard:
         assert locks[0].source == OrderSource.TREND
 
     def test_old_losses_are_pruned(self):
-        guard = StoplossGuard(StoplossGuardConfig(
-            lookback_period_ms=1_000,
-            trade_limit=2,
-        ))
+        guard = StoplossGuard(
+            StoplossGuardConfig(
+                lookback_period_ms=1_000,
+                trade_limit=2,
+            )
+        )
         guard.evaluate([_fill(timestamp=0, pnl=-10)], AccountState(), now_ms=0)
         locks = guard.evaluate(
             [_fill(timestamp=2_000, pnl=-10)],
@@ -159,18 +171,21 @@ class TestBacktesterProtectionIntegration:
             ),
             protections=[_LockImmediately()],
         )
-        bt.protections.locks.append(ProtectionLock(
-            until_ms=10**18,
-            reason="integration_test",
-            symbol="BTC",
-            side=Side.LONG,
-            source=OrderSource.GRID,
-        ))
+        bt.protections.locks.append(
+            ProtectionLock(
+                until_ms=10**18,
+                reason="integration_test",
+                symbol="BTC",
+                side=Side.LONG,
+                source=OrderSource.GRID,
+            )
+        )
 
         result = bt.run({"BTC": candles})
 
         grid_long_entries = [
-            f for f in result.fills
+            f
+            for f in result.fills
             if f.source == OrderSource.GRID
             and f.side == Side.LONG
             and f.realized_pnl == 0
@@ -206,9 +221,12 @@ class TestStoplossGuardExtra:
         assert locks == []
 
     def test_only_per_pair_isolates_symbols(self):
-        guard = StoplossGuard(StoplossGuardConfig(
-            trade_limit=2, only_per_pair=True,
-        ))
+        guard = StoplossGuard(
+            StoplossGuardConfig(
+                trade_limit=2,
+                only_per_pair=True,
+            )
+        )
         fills = [
             _fill(timestamp=0, pnl=-5, symbol="BTC"),
             _fill(timestamp=0, pnl=-5, symbol="BTC"),
@@ -219,9 +237,12 @@ class TestStoplossGuardExtra:
         assert locks[0].symbol == "BTC"
 
     def test_only_per_side_isolates_long_short(self):
-        guard = StoplossGuard(StoplossGuardConfig(
-            trade_limit=2, only_per_side=True,
-        ))
+        guard = StoplossGuard(
+            StoplossGuardConfig(
+                trade_limit=2,
+                only_per_side=True,
+            )
+        )
         fills = [
             _fill(timestamp=0, pnl=-5, side=Side.LONG),
             _fill(timestamp=0, pnl=-5, side=Side.LONG),
@@ -232,9 +253,12 @@ class TestStoplossGuardExtra:
         assert locks[0].side == Side.LONG
 
     def test_only_per_source_isolates_buckets(self):
-        guard = StoplossGuard(StoplossGuardConfig(
-            trade_limit=2, only_per_source=True,
-        ))
+        guard = StoplossGuard(
+            StoplossGuardConfig(
+                trade_limit=2,
+                only_per_source=True,
+            )
+        )
         fills = [
             _fill(timestamp=0, pnl=-5, source=OrderSource.TREND),
             _fill(timestamp=0, pnl=-5, source=OrderSource.TREND),
@@ -249,19 +273,27 @@ class TestManagerLockLifecycle:
     def test_protection_emits_lock_via_update(self):
         """Driving the manager through fills should produce a lock from
         the StoplossGuard, not just from manually-injected ones."""
-        mgr = ProtectionManager([
-            StoplossGuard(StoplossGuardConfig(
-                trade_limit=2, stop_duration_ms=30_000,
-            )),
-        ])
+        mgr = ProtectionManager(
+            [
+                StoplossGuard(
+                    StoplossGuardConfig(
+                        trade_limit=2,
+                        stop_duration_ms=30_000,
+                    )
+                ),
+            ]
+        )
         mgr.update(
             [_fill(timestamp=1_000, pnl=-5), _fill(timestamp=1_000, pnl=-5)],
-            AccountState(), now_ms=1_000,
+            AccountState(),
+            now_ms=1_000,
         )
         assert len(mgr.locks) == 1
         # That global lock should block a new entry but pass a reduce_only.
         entry = Order("BTC", Side.LONG, 49_000, 0.01, OrderSource.GRID)
-        close = Order("BTC", Side.LONG, 51_000, 0.01, OrderSource.GRID, reduce_only=True)
+        close = Order(
+            "BTC", Side.LONG, 51_000, 0.01, OrderSource.GRID, reduce_only=True
+        )
         out = mgr.filter_orders([entry, close], now_ms=5_000)
         assert close in out
         assert entry not in out
@@ -279,9 +311,17 @@ class TestCooldownPeriodExtra:
     def test_default_scope_is_per_symbol_side_source(self):
         cd = CooldownPeriod()
         locks = cd.evaluate(
-            [_fill(timestamp=0, pnl=-1, symbol="BTC",
-                   side=Side.LONG, source=OrderSource.GRID)],
-            AccountState(), now_ms=0,
+            [
+                _fill(
+                    timestamp=0,
+                    pnl=-1,
+                    symbol="BTC",
+                    side=Side.LONG,
+                    source=OrderSource.GRID,
+                )
+            ],
+            AccountState(),
+            now_ms=0,
         )
         lock = locks[0]
         assert lock.symbol == "BTC"
@@ -289,14 +329,15 @@ class TestCooldownPeriodExtra:
         assert lock.source == OrderSource.GRID
 
     def test_disabling_all_scope_flags_creates_global_lock(self):
-        cd = CooldownPeriod(CooldownPeriodConfig(
-            only_per_pair=False,
-            only_per_side=False,
-            only_per_source=False,
-        ))
+        cd = CooldownPeriod(
+            CooldownPeriodConfig(
+                only_per_pair=False,
+                only_per_side=False,
+                only_per_source=False,
+            )
+        )
         locks = cd.evaluate([_fill(timestamp=0, pnl=-1)], AccountState(), now_ms=0)
         lock = locks[0]
         assert lock.symbol is None
         assert lock.side is None
         assert lock.source is None
-

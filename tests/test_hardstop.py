@@ -12,13 +12,14 @@ Mirrors passivbot's ``equity_hard_stop_loss.rs`` semantics:
 
 from __future__ import annotations
 
-import pytest
 
 from combo_bot.risk import RiskConfig, RiskManager, RiskTier
 from combo_bot.types import AccountState, Order, OrderSource, Side, SymbolState
 
 
-def _acc(equity: float, peak: float = 10_000.0, balance: float = 10_000.0) -> AccountState:
+def _acc(
+    equity: float, peak: float = 10_000.0, balance: float = 10_000.0
+) -> AccountState:
     return AccountState(balance=balance, equity=equity, equity_peak=peak)
 
 
@@ -159,6 +160,7 @@ class TestIntegration:
         acc = _acc(equity=7_000.0)
         acc.symbols["BTC"] = SymbolState("BTC", last_price=50_000.0)
         from combo_bot.types import Position
+
         acc.symbols["BTC"].position_long = Position(0.1, 50_000.0)
 
         # First call latches.
@@ -171,7 +173,8 @@ class TestIntegration:
         acc.equity_peak = 10_000.0
         out2 = risk.filter_orders(
             [Order("BTC", Side.LONG, 49_000, 0.01, OrderSource.GRID)],
-            acc, timestamp=60_000,
+            acc,
+            timestamp=60_000,
         )
         # Latched, so any non-reduce-only entry should be dropped via panic close.
         assert risk.tier == RiskTier.RED

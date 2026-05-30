@@ -19,7 +19,14 @@ from combo_bot.types import (
     Side,
     SymbolState,
 )
-from combo_bot.grid_engine import GridConfig, GridEngine, calc_wallet_exposure
+from combo_bot.grid_engine import (
+    ForagerScorer,
+    ForagerWeights,
+    GridConfig,
+    GridEngine,
+    build_forager_candidates,
+    calc_wallet_exposure,
+)
 from combo_bot.trend_signal import TrendConfig, TrendEngine
 from combo_bot.merger import MergerConfig, DecisionMerger
 from combo_bot.risk import RiskConfig, RiskManager, RiskTier
@@ -63,6 +70,7 @@ class LiveConfig:
     merger: MergerConfig = field(default_factory=MergerConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     regime: RegimeArbiterConfig = field(default_factory=RegimeArbiterConfig)
+    forager_weights: ForagerWeights = field(default_factory=ForagerWeights)
 
 
 class LiveTrader:
@@ -81,7 +89,13 @@ class LiveTrader:
         self.exchange = exchange
         self.grid = GridEngine(config.grid)
         self.trend = TrendEngine(config.trend)
-        self.merger = DecisionMerger(config.merger)
+        # Round-22: pass the canonical trend WEL so overlay sizing and
+        # risk unstuck stay in lockstep — no more drift between merger
+        # and risk configs.
+        self.merger = DecisionMerger(
+            config.merger,
+            trend_wallet_exposure_limit=config.risk.trend_wallet_exposure_limit,
+        )
         self.risk = RiskManager(config.risk)
         self.regime_arbiter = RegimeArbiter(config.regime)
         self.strategy: IStrategy = strategy or DefaultStrategy()
@@ -224,6 +238,24 @@ class LiveTrader:
         # fill from before the restart" guard inside FillEventManager.
         if self.fill_events._bot_start_ms <= 0:
             self.fill_events.set_bot_start(self._now_ms())
+        # Freqtrade-style lifecycle: one-shot startup hook for the
+        # strategy. Wrapped so a misbehaving strategy can't crash
+        # the trader at boot. informative_pairs() is logged (not yet
+        # acted on) so the strategy author sees the contract is real.
+        try:
+            self.strategy.bot_start()
+        except Exception:
+            logger.exception("[strategy] bot_start raised — continuing")
+        try:
+            extras = self.strategy.informative_pairs()
+            if extras:
+                logger.info(
+                    "[strategy] informative_pairs declared: %s "
+                    "(not yet loaded — extra-timeframe data infra pending)",
+                    extras,
+                )
+        except Exception:
+            logger.exception("[strategy] informative_pairs raised — ignored")
         self._running = True
 
         while self._running:
@@ -259,8 +291,28 @@ class LiveTrader:
             self.account.symbols[symbol] = SymbolState(symbol=symbol, c_mult=ep.c_mult)
 
             if not self.config.dry_run:
+                # Freqtrade-style leverage hook: strategy can shrink the
+                # configured leverage per-symbol (e.g. derate a volatile
+                # pair). Cap at the operator-supplied value — strategies
+                # can lower it, never raise it past the operator ceiling.
                 try:
-                    await self.exchange.set_leverage(self.config.leverage, symbol)
+                    desired_lev = float(
+                        self.strategy.leverage(
+                            ctx=None,
+                            proposed_leverage=float(self.config.leverage),
+                            max_leverage=float(self.config.leverage),
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "[strategy] leverage hook raised for %s — "
+                        "falling back to configured leverage",
+                        symbol,
+                    )
+                    desired_lev = float(self.config.leverage)
+                effective_lev = max(1.0, min(desired_lev, float(self.config.leverage)))
+                try:
+                    await self.exchange.set_leverage(effective_lev, symbol)
                     if self.config.margin_mode == "cross":
                         await self.exchange.set_margin_mode("cross", symbol)
                     else:
@@ -269,6 +321,15 @@ class LiveTrader:
                     logger.warning("Could not set leverage/margin for %s", symbol)
 
     async def _tick(self):
+        # Freqtrade-style per-tick hook — lets strategies refresh any
+        # external state (e.g. a remote signal feed) before the rest
+        # of the tick runs. Wrapped so it can't crash the tick.
+        try:
+            from datetime import datetime, timezone
+
+            self.strategy.bot_loop_start(current_time=datetime.now(tz=timezone.utc))
+        except Exception:
+            logger.exception("[strategy] bot_loop_start raised — continuing")
         # Pull fills first so source-isolated buckets (especially TREND)
         # are updated before aggregate exchange positions are split into
         # grid-vs-trend in _refresh_account.
@@ -292,10 +353,45 @@ class LiveTrader:
             self.vol_target_sizer.record_equity(self.account.equity)
         all_desired_orders: list[Order] = []
 
+        # Round-22 Forager: pick top-N active symbols once per tick;
+        # non-active symbols only get reduce-only treatment so existing
+        # exposure can wind down. Symbols already holding a position on
+        # any bucket stay active so the engine can keep managing them.
+        now_for_signals = self._now_ms()
+        tick_signals = {s: self.trend.compute(s) for s in self.config.symbols}
+        n_active = max(1, self.config.grid.n_positions)
+        if len(self.config.symbols) > n_active:
+            forced_active = {
+                s
+                for s in self.config.symbols
+                if (
+                    self.account.symbols[s].position_long.is_open
+                    or self.account.symbols[s].position_short.is_open
+                    or self.account.symbols[s].trend_long.is_open
+                    or self.account.symbols[s].trend_short.is_open
+                )
+            }
+            tick_candles = {
+                s: self._latest_candle(
+                    s, self.account.symbols[s].last_price, now_for_signals
+                )
+                for s in self.config.symbols
+            }
+            ranked = ForagerScorer.select_symbols(
+                build_forager_candidates(
+                    self.config.symbols, tick_candles, self.account, tick_signals
+                ),
+                n_active,
+                self.config.forager_weights,
+            )
+            active_set = set(ranked) | forced_active
+        else:
+            active_set = set(self.config.symbols)
+
         for symbol in self.config.symbols:
             ss = self.account.symbols[symbol]
             ep = self.exchange_params[symbol]
-            signal = self.trend.compute(symbol)
+            signal = tick_signals[symbol]
             price = ss.last_price
 
             strat_enter_long, strat_enter_short, strat_exit_long, strat_exit_short = (
@@ -559,7 +655,10 @@ class LiveTrader:
             ss.mode_long = regime_view.long_mode
             ss.mode_short = regime_view.short_mode
 
-            all_desired_orders.extend(
+            # Round-22 Forager gate: non-active symbols may still emit
+            # reduce-only orders so existing positions can wind down,
+            # but no new exposure is allowed this tick.
+            tick_bundle = (
                 grid_long
                 + grid_short
                 + trailing_entries
@@ -568,6 +667,10 @@ class LiveTrader:
                 + trend_exits_s
                 + strategy_orders
             )
+            if symbol in active_set:
+                all_desired_orders.extend(tick_bundle)
+            else:
+                all_desired_orders.extend(o for o in tick_bundle if o.reduce_only)
 
         tick_ms = self._now_ms()
         # Stage 10: feed the correlation tracker once per tick from
@@ -1318,6 +1421,68 @@ class LiveTrader:
                     if self._desired_identity(d) in recent_create_keys:
                         continue
                     to_create.append(d)
+
+        # Freqtrade-style stale-order timeouts: any pending exchange
+        # order whose age exceeds the strategy's policy gets appended
+        # to to_cancel. Built-in default returns False so non-overriding
+        # strategies pay nothing here.
+        timeout_cancel_ids: set[str] = set()
+        for symbol in self.config.symbols:
+            ss = self.account.symbols.get(symbol)
+            ep = self.exchange_params.get(symbol)
+            if ss is None or ep is None:
+                continue
+            existing = self._open_orders.get(symbol, [])
+            for e in existing:
+                ts_ms = e.get("timestamp")
+                if not ts_ms:
+                    continue
+                age_s = max(0, (now_ms - int(ts_ms)) // 1000)
+                side = (
+                    Side.LONG if str(e.get("side", "")).lower() == "buy" else Side.SHORT
+                )
+                reduce_only = bool(
+                    e.get("reduceOnly")
+                    or e.get("info", {}).get("reduceOnly") in (True, "true")
+                )
+                pos = ss.position_long if side == Side.LONG else ss.position_short
+                ctx = TradeContext(
+                    symbol=symbol,
+                    side=side,
+                    position=pos,
+                    account=self.account,
+                    candle=self._latest_candle(symbol, ss.last_price, now_ms),
+                    signal=None,
+                    current_time_ms=now_ms,
+                    exchange_params=ep,
+                )
+                try:
+                    if reduce_only:
+                        should_cancel = bool(
+                            self.strategy.check_exit_timeout(ctx, int(age_s))
+                        )
+                    else:
+                        should_cancel = bool(
+                            self.strategy.check_entry_timeout(ctx, int(age_s))
+                        )
+                except Exception:
+                    logger.exception(
+                        "[strategy] check_*_timeout raised for %s — ignored",
+                        symbol,
+                    )
+                    continue
+                if should_cancel:
+                    eid = e.get("id")
+                    if eid and eid not in recent_cancel_ids:
+                        timeout_cancel_ids.add(eid)
+        if timeout_cancel_ids:
+            already = {x.get("id") for x in to_cancel}
+            for symbol in self.config.symbols:
+                for e in self._open_orders.get(symbol, []):
+                    eid = e.get("id")
+                    if eid in timeout_cancel_ids and eid not in already:
+                        to_cancel.append(e)
+                        already.add(eid)
 
         # Clear state-change set after reconciliation so next tick can
         # create orders again on those (symbol, side) pairs.
@@ -2294,7 +2459,7 @@ class LiveTrader:
         effective_scale = regime.trend_qty_scale * kelly_scale
         if effective_scale <= 0:
             return []
-        budget = self.account.balance * merger_cfg.trend_position_max_pct
+        budget = self.account.balance * self.merger.effective_trend_wel
         notional = budget * merger_cfg.trend_entry_qty_pct * effective_scale
         qty = notional / max(price * exchange.c_mult, 1e-12)
         qty = max(qty, exchange.min_qty)

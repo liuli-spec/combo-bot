@@ -96,7 +96,7 @@ class RegimeArbiter:
             """
             if conv <= cfg.overlay_min_conviction:
                 return 0.0
-            ramp = (conv ** cfg.overlay_conviction_curve) * cfg.overlay_sizing_scale
+            ramp = (conv**cfg.overlay_conviction_curve) * cfg.overlay_sizing_scale
             return min(1.0, ramp)
 
         if regime == TrendRegime.STRONG_BULL:
@@ -146,10 +146,16 @@ class RegimeArbiter:
         # Strategy exit signals are the final word — they downgrade modes
         # to TP_ONLY (unless something stricter is already set) and drop the
         # trend overlay on the matching side.
-        if strategy_exit_long and long_mode not in (TradingMode.PANIC, TradingMode.GRACEFUL_STOP):
+        if strategy_exit_long and long_mode not in (
+            TradingMode.PANIC,
+            TradingMode.GRACEFUL_STOP,
+        ):
             long_mode = TradingMode.TP_ONLY
             veto.append("strategy exit_long")
-        if strategy_exit_short and short_mode not in (TradingMode.PANIC, TradingMode.GRACEFUL_STOP):
+        if strategy_exit_short and short_mode not in (
+            TradingMode.PANIC,
+            TradingMode.GRACEFUL_STOP,
+        ):
             short_mode = TradingMode.TP_ONLY
             veto.append("strategy exit_short")
         if strategy_exit_long and overlay == Side.LONG:
@@ -169,8 +175,11 @@ class RegimeArbiter:
         # not punch through a risk-driven graceful stop. Funding veto
         # still applies to the overlay activation.
         def _promote(
-            mode: TradingMode, side: Side, overlay_blocked: bool,
-            current_overlay: Side | None, current_scale: float,
+            mode: TradingMode,
+            side: Side,
+            overlay_blocked: bool,
+            current_overlay: Side | None,
+            current_scale: float,
         ) -> tuple[TradingMode, Side | None, float]:
             if mode in (
                 TradingMode.PANIC,
@@ -192,12 +201,20 @@ class RegimeArbiter:
 
         if strategy_enter_long and not strategy_exit_long:
             long_mode, overlay, overlay_scale = _promote(
-                long_mode, Side.LONG, long_overlay_blocked, overlay, overlay_scale,
+                long_mode,
+                Side.LONG,
+                long_overlay_blocked,
+                overlay,
+                overlay_scale,
             )
             veto.append("strategy enter_long → AGGRESSIVE")
         if strategy_enter_short and not strategy_exit_short:
             short_mode, overlay, overlay_scale = _promote(
-                short_mode, Side.SHORT, short_overlay_blocked, overlay, overlay_scale,
+                short_mode,
+                Side.SHORT,
+                short_overlay_blocked,
+                overlay,
+                overlay_scale,
             )
             veto.append("strategy enter_short → AGGRESSIVE")
 

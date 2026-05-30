@@ -10,7 +10,6 @@ Two layers under test:
 
 from __future__ import annotations
 
-import math
 
 import pytest
 
@@ -120,8 +119,7 @@ class TestCorrelationTracker:
 
 
 def _gate(**overrides) -> CorrelationGate:
-    defaults = dict(window=20, min_samples=5,
-                    soft_threshold=0.5, hard_threshold=0.9)
+    defaults = dict(window=20, min_samples=5, soft_threshold=0.5, hard_threshold=0.9)
     defaults.update(overrides)
     return CorrelationGate(CorrelationGateConfig(**defaults))
 
@@ -143,6 +141,7 @@ def _seed_anticorrelated(gate: CorrelationGate, n: int = 20):
     +r to BTC, -r to ETH.
     """
     import random
+
     rng = random.Random(0)
     btc, eth = 50_000.0, 50_000.0
     gate.update_prices([("BTC", btc), ("ETH", eth)])
@@ -169,10 +168,12 @@ class TestGateSameSidePenalty:
         # Seed low correlation: shared trend but independent noise — use
         # mostly-independent series.
         for i in range(30):
-            gate.update_prices([
-                ("BTC", 50_000.0 * (1.0 + 0.001 * (i % 3))),
-                ("ETH", 50_000.0 * (1.0 + 0.001 * ((i + 1) % 5))),
-            ])
+            gate.update_prices(
+                [
+                    ("BTC", 50_000.0 * (1.0 + 0.001 * (i % 3))),
+                    ("ETH", 50_000.0 * (1.0 + 0.001 * ((i + 1) % 5))),
+                ]
+            )
         acc = AccountState(balance=10_000)
         acc.symbols["BTC"] = _ss_with_long("BTC")
         acc.symbols["ETH"] = SymbolState("ETH", last_price=50_000.0)
@@ -218,10 +219,12 @@ class TestSoftScaling:
         _seed_correlated(gate)
         # Add some divergence into the tail so corr drops below 1.
         for i in range(5):
-            gate.update_prices([
-                ("BTC", 50_000.0 * (1.0 + 0.001 * i)),
-                ("ETH", 50_000.0 * (1.0 - 0.001 * i)),
-            ])
+            gate.update_prices(
+                [
+                    ("BTC", 50_000.0 * (1.0 + 0.001 * i)),
+                    ("ETH", 50_000.0 * (1.0 - 0.001 * i)),
+                ]
+            )
         acc = AccountState(balance=10_000)
         acc.symbols["BTC"] = _ss_with_long("BTC")
         acc.symbols["ETH"] = SymbolState("ETH", last_price=50_000.0)
@@ -307,7 +310,8 @@ class TestBacktesterIntegration:
 
         candles = make_candles([50_000 + i * 80 for i in range(200)])
         cfg = BacktestConfig(
-            starting_balance=10_000, symbols=["BTC"],
+            starting_balance=10_000,
+            symbols=["BTC"],
             grid=GridConfig(max_grid_levels=2),
         )
         r_off = Backtester(cfg).run({"BTC": candles})
@@ -331,18 +335,29 @@ class TestBacktesterIntegration:
             for c in candles_a
         ]
         cfg = BacktestConfig(
-            starting_balance=10_000, symbols=["BTC", "ETH"],
+            starting_balance=10_000,
+            symbols=["BTC", "ETH"],
             grid=GridConfig(max_grid_levels=2),
         )
-        gate = CorrelationGate(CorrelationGateConfig(
-            window=50, min_samples=20,
-            soft_threshold=0.3, hard_threshold=0.5,
-        ))
-        r_off = Backtester(cfg).run({
-            "BTC": candles_a, "ETH": candles_b,
-        })
-        r_on = Backtester(cfg, correlation_gate=gate).run({
-            "BTC": candles_a, "ETH": candles_b,
-        })
+        gate = CorrelationGate(
+            CorrelationGateConfig(
+                window=50,
+                min_samples=20,
+                soft_threshold=0.3,
+                hard_threshold=0.5,
+            )
+        )
+        r_off = Backtester(cfg).run(
+            {
+                "BTC": candles_a,
+                "ETH": candles_b,
+            }
+        )
+        r_on = Backtester(cfg, correlation_gate=gate).run(
+            {
+                "BTC": candles_a,
+                "ETH": candles_b,
+            }
+        )
         # Gate should have suppressed at least some entries.
         assert r_on.n_trades <= r_off.n_trades

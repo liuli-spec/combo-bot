@@ -27,11 +27,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable
 
 from combo_bot.types import AccountState, Fill, Order, OrderSource, Side
-
 
 # ---------------------------------------------------------------------------
 # Lock records
@@ -227,13 +226,15 @@ class StoplossGuard(IProtection):
         locks: list[ProtectionLock] = []
         for (symbol, side, source), count in groups.items():
             if count >= self.config.trade_limit:
-                locks.append(ProtectionLock(
-                    until_ms=now_ms + self.config.stop_duration_ms,
-                    reason=f"stoploss_guard:{count}_losses",
-                    symbol=symbol,
-                    side=side,
-                    source=source,
-                ))
+                locks.append(
+                    ProtectionLock(
+                        until_ms=now_ms + self.config.stop_duration_ms,
+                        reason=f"stoploss_guard:{count}_losses",
+                        symbol=symbol,
+                        side=side,
+                        source=source,
+                    )
+                )
         return locks
 
 
@@ -286,13 +287,15 @@ class CooldownPeriod(IProtection):
             net_pnl = fill.realized_pnl - fill.fee
             if net_pnl >= self.config.required_profit_pct:
                 continue
-            locks.append(ProtectionLock(
-                until_ms=now_ms + self.config.stop_duration_ms,
-                reason="cooldown_after_loss",
-                symbol=fill.symbol if self.config.only_per_pair else None,
-                side=fill.side if self.config.only_per_side else None,
-                source=fill.source if self.config.only_per_source else None,
-            ))
+            locks.append(
+                ProtectionLock(
+                    until_ms=now_ms + self.config.stop_duration_ms,
+                    reason="cooldown_after_loss",
+                    symbol=fill.symbol if self.config.only_per_pair else None,
+                    side=fill.side if self.config.only_per_side else None,
+                    source=fill.source if self.config.only_per_source else None,
+                )
+            )
         return locks
 
 

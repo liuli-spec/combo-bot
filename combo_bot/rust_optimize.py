@@ -2,7 +2,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 import numpy as np
 
 from combo_bot.grid_engine import GridConfig
@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 try:
     import optuna
     from optuna import Trial
+
     OPTUNA_AVAILABLE = True
 except ImportError:
     optuna = None
@@ -35,6 +36,7 @@ except ImportError:
 @dataclass
 class OptimizeBounds:
     """Parameter search bounds for grid optimization."""
+
     entry_initial_ema_dist: tuple[float, float] = (0.002, 0.02)
     entry_initial_qty_pct: tuple[float, float] = (0.005, 0.03)
     entry_grid_spacing_pct: tuple[float, float] = (0.008, 0.05)
@@ -72,7 +74,9 @@ def suggest_grid_config(trial: Trial, bounds: OptimizeBounds) -> GridConfig:
     )
     markup_end_low = max(bounds.close_grid_markup_end[0], markup_start + 0.001)
     markup_end_high = max(markup_end_low + 0.001, bounds.close_grid_markup_end[1])
-    markup_end = trial.suggest_float("close_grid_markup_end", markup_end_low, markup_end_high)
+    markup_end = trial.suggest_float(
+        "close_grid_markup_end", markup_end_low, markup_end_high
+    )
 
     ema_0 = trial.suggest_int("ema_span_0", *bounds.ema_span_0)
     ema_1_low = max(bounds.ema_span_1[0], ema_0 + 10)
@@ -145,7 +149,9 @@ def walk_forward_score(
     window = n // splits
     if window < 1000:
         # Too little data — score whole series once.
-        result = run_rust_backtest(candle_array, grid_config, exchange_params, cfg.backtest_config)
+        result = run_rust_backtest(
+            candle_array, grid_config, exchange_params, cfg.backtest_config
+        )
         return compute_score(result, cfg)
 
     scores = []
@@ -154,7 +160,6 @@ def walk_forward_score(
         end = min(start + window, n)
         if end - start < 500:
             continue
-        sub = candle_array[start:end]
         train_end = start + int((end - start) * cfg.train_ratio)
         train = candle_array[start:train_end]
         test = candle_array[train_end:end]
@@ -163,7 +168,10 @@ def walk_forward_score(
         if train.shape[0] >= 100:
             try:
                 train_result = run_rust_backtest(
-                    train, grid_config, exchange_params, cfg.backtest_config,
+                    train,
+                    grid_config,
+                    exchange_params,
+                    cfg.backtest_config,
                 )
                 if train_result.n_trades == 0:
                     continue
@@ -173,7 +181,9 @@ def walk_forward_score(
         if test.shape[0] < 500:
             continue
         try:
-            result = run_rust_backtest(test, grid_config, exchange_params, cfg.backtest_config)
+            result = run_rust_backtest(
+                test, grid_config, exchange_params, cfg.backtest_config
+            )
             scores.append(compute_score(result, cfg))
         except Exception as e:
             logger.debug("walk-forward window failed: %s", e)

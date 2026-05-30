@@ -3,8 +3,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from typing import TYPE_CHECKING
+
 from combo_bot.types import (
-    AccountState,
     EMAState,
     ExchangeParams,
     Order,
@@ -15,6 +16,9 @@ from combo_bot.types import (
     TrailingState,
     VolatilityState,
 )
+
+if TYPE_CHECKING:
+    from combo_bot.types import AccountState, Candle, TrendSignal
 
 
 @dataclass
@@ -119,7 +123,11 @@ class GridEngine:
 
         if position.is_open:
             close_orders = self._compute_close_orders(
-                symbol, side, position, exchange_params, mode,
+                symbol,
+                side,
+                position,
+                exchange_params,
+                mode,
                 close_markup_multiplier,
             )
             orders.extend(close_orders)
@@ -128,8 +136,15 @@ class GridEngine:
         # faster via a larger DDF and compressed spacing.
         if mode in (TradingMode.NORMAL, TradingMode.AGGRESSIVE):
             entry_orders = self._compute_entry_orders(
-                symbol, side, position, ema_state, volatility,
-                balance, wallet_exposure, exchange_params, mode,
+                symbol,
+                side,
+                position,
+                ema_state,
+                volatility,
+                balance,
+                wallet_exposure,
+                exchange_params,
+                mode,
             )
             orders.extend(entry_orders)
 
@@ -179,12 +194,10 @@ class GridEngine:
             return None
 
         if side == Side.LONG:
-            below_threshold = (
-                trailing.extreme < position.entry_price * (1.0 - threshold)
+            below_threshold = trailing.extreme < position.entry_price * (
+                1.0 - threshold
             )
-            bounced = (
-                trailing.recovery > trailing.extreme * (1.0 + retracement)
-            )
+            bounced = trailing.recovery > trailing.extreme * (1.0 + retracement)
             if not (below_threshold and bounced):
                 return None
             # Limit price sits between the extreme and the entry — a level
@@ -192,12 +205,10 @@ class GridEngine:
             raw_price = position.entry_price * (1.0 - threshold + retracement)
             order_price = min(mark_price, raw_price)
         else:
-            above_threshold = (
-                trailing.extreme > position.entry_price * (1.0 + threshold)
+            above_threshold = trailing.extreme > position.entry_price * (
+                1.0 + threshold
             )
-            retraced = (
-                trailing.recovery < trailing.extreme * (1.0 - retracement)
-            )
+            retraced = trailing.recovery < trailing.extreme * (1.0 - retracement)
             if not (above_threshold and retraced):
                 return None
             raw_price = position.entry_price * (1.0 + threshold - retracement)
@@ -315,7 +326,10 @@ class GridEngine:
                 break
 
             projected_we = calc_wallet_exposure(
-                balance, cumulative_size + qty, price, ep.c_mult,
+                balance,
+                cumulative_size + qty,
+                price,
+                ep.c_mult,
             )
             if projected_we > cfg.wallet_exposure_limit:
                 remaining_cost = (
@@ -323,7 +337,8 @@ class GridEngine:
                     - cumulative_size * price * ep.c_mult
                 )
                 capped_qty = quantize_qty(
-                    remaining_cost / (price * ep.c_mult), ep.qty_step,
+                    remaining_cost / (price * ep.c_mult),
+                    ep.qty_step,
                 )
                 if capped_qty >= ep.min_qty:
                     orders.append(self._make_entry(symbol, side, price, capped_qty))
@@ -336,9 +351,13 @@ class GridEngine:
             # wallet exposure grows — passivbot's `we_multiplier` does the
             # same. Without this the loop emits a constant-spacing ladder
             # regardless of how much commitment has stacked.
-            spacing = self._grid_spacing(
-                volatility.value, projected_we,
-            ) * spacing_compression
+            spacing = (
+                self._grid_spacing(
+                    volatility.value,
+                    projected_we,
+                )
+                * spacing_compression
+            )
             price = self._next_entry_price(price, spacing, side)
             qty *= ddf
 
@@ -374,9 +393,7 @@ class GridEngine:
             return []
 
         n_levels = max(1, int(math.ceil(1.0 / cfg.close_grid_qty_pct)))
-        markup_step = (
-            (markup_end - markup_start) / max(n_levels - 1, 1)
-        )
+        markup_step = (markup_end - markup_start) / max(n_levels - 1, 1)
 
         orders: list[Order] = []
         for i in range(n_levels):
@@ -386,7 +403,8 @@ class GridEngine:
 
             if i < n_levels - 1:
                 qty = quantize_qty(
-                    abs(position.size) * cfg.close_grid_qty_pct, ep.qty_step,
+                    abs(position.size) * cfg.close_grid_qty_pct,
+                    ep.qty_step,
                 )
                 qty = min(qty, remaining)
             else:
@@ -436,14 +454,20 @@ class GridEngine:
         return cfg.entry_grid_spacing_pct * (1.0 + vol_component + we_component)
 
     def _next_entry_price(
-        self, price: float, spacing: float, side: Side,
+        self,
+        price: float,
+        spacing: float,
+        side: Side,
     ) -> float:
         if side == Side.LONG:
             return price * (1.0 - spacing)
         return price * (1.0 + spacing)
 
     def _close_price(
-        self, entry_price: float, markup: float, side: Side,
+        self,
+        entry_price: float,
+        markup: float,
+        side: Side,
     ) -> float:
         if side == Side.LONG:
             return entry_price * (1.0 + markup)
@@ -451,7 +475,9 @@ class GridEngine:
 
     @staticmethod
     def _quantize_entry_price(
-        price: float, step: float, side: Side,
+        price: float,
+        step: float,
+        side: Side,
     ) -> float:
         # Long entries: round down to get a better fill price.
         # Short entries: round up.
@@ -459,7 +485,9 @@ class GridEngine:
 
     @staticmethod
     def _quantize_close_price(
-        price: float, step: float, side: Side,
+        price: float,
+        step: float,
+        side: Side,
     ) -> float:
         # Long closes (sells): round up for better fill.
         # Short closes (buys): round down.
@@ -467,7 +495,10 @@ class GridEngine:
 
     @staticmethod
     def _make_entry(
-        symbol: str, side: Side, price: float, qty: float,
+        symbol: str,
+        side: Side,
+        price: float,
+        qty: float,
     ) -> Order:
         return Order(
             symbol=symbol,
@@ -504,22 +535,27 @@ class ForagerScorer:
 
     @staticmethod
     def select_symbols(
-        candidates: dict[str, tuple[float, float, float] | tuple[float, float, float, float]],
+        candidates: dict[
+            str, tuple[float, float, float] | tuple[float, float, float, float]
+        ],
         n_positions: int,
         weights: ForagerWeights,
     ) -> list[str]:
-        """DEPRECATED: Forager selection is handled in Rust
-        multi_symbol.rs.  Retained for reference / interactive use.
+        """Pick the top-N symbols by weighted Forager score.
+
+        Round-22: the Python backtest and live paths now call this
+        directly to mirror Passivbot's ``multi_symbol.rs`` selection
+        before any per-symbol order generation; symbols outside the
+        active set only emit reduce-only orders so existing positions
+        wind down rather than getting stranded.
 
         Each candidate tuple is ``(volume, volatility, ema_readiness)``
         or ``(volume, volatility, ema_readiness, trend_conviction)`` —
         the 4-tuple form lets callers feed a per-symbol ``|direction|
         * strength`` value derived from ``TrendSignal``. The 3-tuple
-        form is supported for backward compatibility (trend_conviction
-        defaults to 0).
+        form is supported for callers that don't compute a trend
+        signal yet (defaults to 0).
         """
-        import warnings
-        warnings.warn("ForagerScorer.select_symbols is unused; Forager runs in Rust multi_symbol.rs", DeprecationWarning, stacklevel=2)
         scored: list[tuple[str, float]] = []
         for symbol, scores in candidates.items():
             if len(scores) == 4:
@@ -528,10 +564,74 @@ class ForagerScorer:
                 vol_score, volatility_score, ema_score = scores  # type: ignore[misc]
                 trend_conv = 0.0
             total = ForagerScorer.score_symbol(
-                vol_score, volatility_score, ema_score, weights,
+                vol_score,
+                volatility_score,
+                ema_score,
+                weights,
                 trend_conviction=trend_conv,
             )
             scored.append((symbol, total))
 
-        scored.sort(key=lambda x: x[1], reverse=True)
+        # Sort by descending score, then by symbol name as a deterministic
+        # tiebreaker so two symbols with identical scores produce a
+        # stable active set across ticks.
+        scored.sort(key=lambda x: (-x[1], x[0]))
         return [symbol for symbol, _ in scored[:n_positions]]
+
+
+def build_forager_candidates(
+    symbols: list[str],
+    candles: dict[str, "Candle"],
+    account: "AccountState",
+    signals: dict[str, "TrendSignal"],
+) -> dict[str, tuple[float, float, float, float]]:
+    """Build normalized Forager input tuples for the given symbols.
+
+    Each input axis is normalized into ``[0, 1]`` so the
+    ``ForagerWeights`` linear combination is comparable across runs:
+
+    * ``volume`` — current bar volume divided by the max volume in
+      ``candles``.
+    * ``volatility`` — ``ss.volatility.value`` divided by the max in
+      the universe.
+    * ``ema_readiness`` — how tight current price is to the EMA band
+      midpoint (1.0 means dead-on the band, 0.0 means far away). Uses
+      the *narrower* of the two EMA distances since either side can
+      trigger a grid entry.
+    * ``trend_conviction`` — ``|direction| × strength`` from the
+      ``TrendSignal``, already in ``[0, 1]``.
+
+    A symbol with no candle / no signal contributes zeros for those
+    axes — it just won't rank, rather than crashing the selector.
+    """
+    max_volume = max((candles[s].volume for s in symbols if s in candles), default=0.0)
+    max_volatility = max(
+        (account.symbols[s].volatility.value for s in symbols if s in account.symbols),
+        default=0.0,
+    )
+    out: dict[str, tuple[float, float, float, float]] = {}
+    for s in symbols:
+        c = candles.get(s)
+        ss = account.symbols.get(s)
+        sig = signals.get(s)
+        if c is None or ss is None:
+            continue
+        volume_score = (c.volume / max_volume) if max_volume > 0 else 0.0
+        volatility_score = (
+            ss.volatility.value / max_volatility if max_volatility > 0 else 0.0
+        )
+        ema_ready = 0.0
+        if ss.ema.initialized and c.close > 0:
+            d_lower = abs(c.close - ss.ema.lower) / c.close
+            d_upper = abs(c.close - ss.ema.upper) / c.close
+            ema_ready = max(0.0, 1.0 - min(d_lower, d_upper))
+        conviction = 0.0
+        if sig is not None:
+            conviction = min(1.0, abs(sig.direction) * sig.strength)
+        out[s] = (
+            min(1.0, volume_score),
+            min(1.0, volatility_score),
+            ema_ready,
+            conviction,
+        )
+    return out

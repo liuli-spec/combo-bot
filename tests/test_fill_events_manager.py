@@ -1,5 +1,6 @@
 """Tests for the live fill events manager — the bridge from exchange
 trade history to the bot's protections / kelly / source-PnL ledger."""
+
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +8,8 @@ import asyncio
 import pytest
 
 from combo_bot.fill_events_manager import (
-    FillEventManager, FillEventManagerConfig,
+    FillEventManager,
+    FillEventManagerConfig,
 )
 from combo_bot.types import Fill, OrderSource, Side
 
@@ -50,13 +52,15 @@ def _trade(
 
 
 def test_first_poll_returns_all_fresh_trades():
-    ex = _StubExchange([
+    ex = _StubExchange(
         [
-            _trade("t1", 1_000),
-            _trade("t2", 2_000),
-            _trade("t3", 3_000),
-        ],
-    ])
+            [
+                _trade("t1", 1_000),
+                _trade("t2", 2_000),
+                _trade("t3", 3_000),
+            ],
+        ]
+    )
     mgr = FillEventManager(ex, FillEventManagerConfig(poll_interval_ms=0))
     sink: list[Fill] = []
     fresh = asyncio.run(
@@ -82,10 +86,12 @@ def test_dedup_drops_repeated_trade_ids():
 
 def test_watermark_advances_past_latest_trade():
     """After ingesting up to ts=3000, the next poll's `since` is > 3000."""
-    ex = _StubExchange([
-        [_trade("t1", 1_000), _trade("t2", 3_000)],
-        [],
-    ])
+    ex = _StubExchange(
+        [
+            [_trade("t1", 1_000), _trade("t2", 3_000)],
+            [],
+        ]
+    )
     mgr = FillEventManager(ex, FillEventManagerConfig(poll_interval_ms=0))
     asyncio.run(mgr.poll("BTC/USDT:USDT", now_ms=10_000, sink=lambda _: None))
     asyncio.run(mgr.poll("BTC/USDT:USDT", now_ms=20_000, sink=lambda _: None))
@@ -107,7 +113,10 @@ def test_source_attribution_via_register_outgoing():
     ex = _StubExchange([[_trade("t1", 1_000, order_id="ord-trend-1")]])
     mgr = FillEventManager(ex, FillEventManagerConfig(poll_interval_ms=0))
     mgr.register_outgoing(
-        "ord-trend-1", OrderSource.TREND, Side.LONG, reduce_only=False,
+        "ord-trend-1",
+        OrderSource.TREND,
+        Side.LONG,
+        reduce_only=False,
     )
     captured: list[Fill] = []
     asyncio.run(mgr.poll("BTC/USDT:USDT", now_ms=0, sink=captured.extend))
@@ -119,15 +128,21 @@ def test_snapshot_restores_watermark_and_order_attribution():
     first = _StubExchange([[_trade("t1", 1_000, order_id="ord-trend-1")]])
     mgr = FillEventManager(first, FillEventManagerConfig(poll_interval_ms=0))
     mgr.register_outgoing(
-        "ord-trend-1", OrderSource.TREND, Side.LONG, reduce_only=False,
+        "ord-trend-1",
+        OrderSource.TREND,
+        Side.LONG,
+        reduce_only=False,
     )
     asyncio.run(mgr.poll("BTC/USDT:USDT", now_ms=0, sink=lambda _: None))
 
-    restored_exchange = _StubExchange([
-        [_trade("t2", 2_000, order_id="ord-trend-1")],
-    ])
+    restored_exchange = _StubExchange(
+        [
+            [_trade("t2", 2_000, order_id="ord-trend-1")],
+        ]
+    )
     restored = FillEventManager(
-        restored_exchange, FillEventManagerConfig(poll_interval_ms=0),
+        restored_exchange,
+        FillEventManagerConfig(poll_interval_ms=0),
     )
     restored.load_snapshot(mgr.snapshot())
 
@@ -140,12 +155,17 @@ def test_snapshot_restores_watermark_and_order_attribution():
 
 
 def test_fill_carries_reduce_only_metadata_from_order_registry():
-    ex = _StubExchange([
-        [_trade("t1", 1_000, side="sell", order_id="ord-long-close")],
-    ])
+    ex = _StubExchange(
+        [
+            [_trade("t1", 1_000, side="sell", order_id="ord-long-close")],
+        ]
+    )
     mgr = FillEventManager(ex, FillEventManagerConfig(poll_interval_ms=0))
     mgr.register_outgoing(
-        "ord-long-close", OrderSource.TREND, Side.LONG, reduce_only=True,
+        "ord-long-close",
+        OrderSource.TREND,
+        Side.LONG,
+        reduce_only=True,
     )
     captured: list[Fill] = []
     asyncio.run(mgr.poll("BTC/USDT:USDT", now_ms=0, sink=captured.extend))
@@ -162,9 +182,11 @@ def test_unknown_order_id_defaults_to_grid_source():
 
 def test_realized_pnl_extracted_from_info_field():
     """Binance puts realized PnL in info.realizedPnl; honor it."""
-    ex = _StubExchange([
-        [_trade("t1", 1_000, realized_pnl=12.5)],
-    ])
+    ex = _StubExchange(
+        [
+            [_trade("t1", 1_000, realized_pnl=12.5)],
+        ]
+    )
     mgr = FillEventManager(ex, FillEventManagerConfig(poll_interval_ms=0))
     captured: list[Fill] = []
     asyncio.run(mgr.poll("BTC/USDT:USDT", now_ms=0, sink=captured.extend))
@@ -173,12 +195,17 @@ def test_realized_pnl_extracted_from_info_field():
 
 def test_side_inference_for_buy_entry_vs_short_close():
     """A `buy` trade with reduce_only metadata must be a SHORT close."""
-    ex = _StubExchange([
-        [_trade("t1", 1_000, side="buy", order_id="ord-short-close")],
-    ])
+    ex = _StubExchange(
+        [
+            [_trade("t1", 1_000, side="buy", order_id="ord-short-close")],
+        ]
+    )
     mgr = FillEventManager(ex, FillEventManagerConfig(poll_interval_ms=0))
     mgr.register_outgoing(
-        "ord-short-close", OrderSource.GRID, Side.SHORT, reduce_only=True,
+        "ord-short-close",
+        OrderSource.GRID,
+        Side.SHORT,
+        reduce_only=True,
     )
     captured: list[Fill] = []
     asyncio.run(mgr.poll("BTC/USDT:USDT", now_ms=0, sink=captured.extend))

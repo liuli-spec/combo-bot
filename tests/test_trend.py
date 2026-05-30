@@ -1,19 +1,55 @@
 from __future__ import annotations
 import numpy as np
 import pytest
-from combo_bot.trend_signal import TrendConfig, TrendEngine, _calc_rsi, _calc_macd_histogram
+from combo_bot.trend_signal import TrendConfig, TrendEngine, _calc_rsi
 from combo_bot.types import TrendRegime
 
 
 class TestRSI:
     def test_all_gains_returns_100(self):
-        prices = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
-                           11.0, 12.0, 13.0, 14.0, 15.0, 16.0])
+        prices = np.array(
+            [
+                1.0,
+                2.0,
+                3.0,
+                4.0,
+                5.0,
+                6.0,
+                7.0,
+                8.0,
+                9.0,
+                10.0,
+                11.0,
+                12.0,
+                13.0,
+                14.0,
+                15.0,
+                16.0,
+            ]
+        )
         assert _calc_rsi(prices, 14) == 100.0
 
     def test_all_losses_returns_near_0(self):
-        prices = np.array([16.0, 15.0, 14.0, 13.0, 12.0, 11.0, 10.0, 9.0,
-                           8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0])
+        prices = np.array(
+            [
+                16.0,
+                15.0,
+                14.0,
+                13.0,
+                12.0,
+                11.0,
+                10.0,
+                9.0,
+                8.0,
+                7.0,
+                6.0,
+                5.0,
+                4.0,
+                3.0,
+                2.0,
+                1.0,
+            ]
+        )
         assert _calc_rsi(prices, 14) < 1.0
 
     def test_flat_returns_50(self):

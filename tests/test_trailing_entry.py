@@ -19,14 +19,12 @@ from combo_bot.backtest import Backtester, BacktestConfig
 from combo_bot.grid_engine import GridConfig, GridEngine
 from combo_bot.strategy import DefaultStrategy
 from combo_bot.types import (
-    Candle,
     EMAState,
     ExchangeParams,
     Position,
     Side,
     TradingMode,
     TrailingState,
-    VolatilityState,
 )
 
 
@@ -133,18 +131,28 @@ class TestTrailingEntryLong:
         trail.reset(50_000.0)
         trail.update_long(50_000.0, 48_500.0)
         result = engine.compute_trailing_entry(
-            "BTC", Side.LONG, pos, trail,
-            balance=10_000.0, wallet_exposure=0.5,
-            exchange_params=_ep(), mark_price=48_900.0,
+            "BTC",
+            Side.LONG,
+            pos,
+            trail,
+            balance=10_000.0,
+            wallet_exposure=0.5,
+            exchange_params=_ep(),
+            mark_price=48_900.0,
         )
         assert result is None
 
     def test_no_entry_when_position_empty(self):
         engine = _engine()
         result = engine.compute_trailing_entry(
-            "BTC", Side.LONG, Position(), TrailingState(),
-            balance=10_000.0, wallet_exposure=0.0,
-            exchange_params=_ep(), mark_price=50_000.0,
+            "BTC",
+            Side.LONG,
+            Position(),
+            TrailingState(),
+            balance=10_000.0,
+            wallet_exposure=0.0,
+            exchange_params=_ep(),
+            mark_price=50_000.0,
         )
         assert result is None
 
@@ -158,9 +166,14 @@ class TestTrailingEntryLong:
         # Bounce to 49_900 (would satisfy retracement)
         trail.update_long(49_900.0, 49_500.0)
         result = engine.compute_trailing_entry(
-            "BTC", Side.LONG, pos, trail,
-            balance=10_000.0, wallet_exposure=0.5,
-            exchange_params=_ep(), mark_price=49_700.0,
+            "BTC",
+            Side.LONG,
+            pos,
+            trail,
+            balance=10_000.0,
+            wallet_exposure=0.5,
+            exchange_params=_ep(),
+            mark_price=49_700.0,
         )
         assert result is None
 
@@ -172,9 +185,14 @@ class TestTrailingEntryLong:
         trail.update_long(50_000.0, 48_500.0)  # 3% drop
         # No bounce; recovery still at extreme.
         result = engine.compute_trailing_entry(
-            "BTC", Side.LONG, pos, trail,
-            balance=10_000.0, wallet_exposure=0.5,
-            exchange_params=_ep(), mark_price=48_500.0,
+            "BTC",
+            Side.LONG,
+            pos,
+            trail,
+            balance=10_000.0,
+            wallet_exposure=0.5,
+            exchange_params=_ep(),
+            mark_price=48_500.0,
         )
         assert result is None
 
@@ -188,9 +206,14 @@ class TestTrailingEntryLong:
         # Bounce 1% to 48_985, past the 0.5% retracement threshold.
         trail.update_long(48_985.0, 48_500.0)
         result = engine.compute_trailing_entry(
-            "BTC", Side.LONG, pos, trail,
-            balance=10_000.0, wallet_exposure=0.5,
-            exchange_params=_ep(), mark_price=48_985.0,
+            "BTC",
+            Side.LONG,
+            pos,
+            trail,
+            balance=10_000.0,
+            wallet_exposure=0.5,
+            exchange_params=_ep(),
+            mark_price=48_985.0,
         )
         assert result is not None
         assert result.side == Side.LONG
@@ -209,9 +232,14 @@ class TestTrailingEntryLong:
         trail.update_long(50_000.0, 48_500.0)
         trail.update_long(48_985.0, 48_500.0)
         result = engine.compute_trailing_entry(
-            "BTC", Side.LONG, pos, trail,
-            balance=10_000.0, wallet_exposure=0.5,
-            exchange_params=_ep(), mark_price=48_985.0,
+            "BTC",
+            Side.LONG,
+            pos,
+            trail,
+            balance=10_000.0,
+            wallet_exposure=0.5,
+            exchange_params=_ep(),
+            mark_price=48_985.0,
             mode=TradingMode.PANIC,
         )
         assert result is None
@@ -224,9 +252,14 @@ class TestTrailingEntryLong:
         trail.update_long(50_000.0, 48_500.0)
         trail.update_long(48_985.0, 48_500.0)
         result = engine.compute_trailing_entry(
-            "BTC", Side.LONG, pos, trail,
-            balance=10_000.0, wallet_exposure=0.6,
-            exchange_params=_ep(), mark_price=48_985.0,
+            "BTC",
+            Side.LONG,
+            pos,
+            trail,
+            balance=10_000.0,
+            wallet_exposure=0.6,
+            exchange_params=_ep(),
+            mark_price=48_985.0,
         )
         assert result is None
 
@@ -242,9 +275,14 @@ class TestTrailingEntryShort:
         # Retrace down 1% to 50_985, past the 0.5% retracement.
         trail.update_short(51_500.0, 50_985.0)
         result = engine.compute_trailing_entry(
-            "BTC", Side.SHORT, pos, trail,
-            balance=10_000.0, wallet_exposure=0.5,
-            exchange_params=_ep(), mark_price=50_985.0,
+            "BTC",
+            Side.SHORT,
+            pos,
+            trail,
+            balance=10_000.0,
+            wallet_exposure=0.5,
+            exchange_params=_ep(),
+            mark_price=50_985.0,
         )
         assert result is not None
         assert result.side == Side.SHORT
@@ -269,8 +307,8 @@ class TestBacktesterTrailingIntegration:
         # Phase 2: bounce from 48500 back to 49000 (1% retracement)
         # Phase 3: keep climbing slowly to give the one-bar-delayed
         # trailing re-entry room to fill (look-ahead fix).
-        prices = [50_000 - i * 50 for i in range(40)]     # 50000 -> 48000
-        prices += [48_000 + i * 25 for i in range(120)]   # 48000 -> 51000
+        prices = [50_000 - i * 50 for i in range(40)]  # 50000 -> 48000
+        prices += [48_000 + i * 25 for i in range(120)]  # 48000 -> 51000
         candles = make_candles(prices)
 
         base_cfg = dict(
@@ -281,7 +319,8 @@ class TestBacktesterTrailingIntegration:
         )
 
         cfg_off = BacktestConfig(
-            starting_balance=10_000, symbols=["BTC"],
+            starting_balance=10_000,
+            symbols=["BTC"],
             grid=GridConfig(
                 **base_cfg,
                 entry_trailing_threshold_pct=0.0,
@@ -289,7 +328,8 @@ class TestBacktesterTrailingIntegration:
             ),
         )
         cfg_on = BacktestConfig(
-            starting_balance=10_000, symbols=["BTC"],
+            starting_balance=10_000,
+            symbols=["BTC"],
             grid=GridConfig(
                 **base_cfg,
                 entry_trailing_threshold_pct=0.02,

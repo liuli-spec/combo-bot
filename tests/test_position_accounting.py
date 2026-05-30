@@ -3,7 +3,14 @@ from __future__ import annotations
 import pytest
 
 from combo_bot.backtest import BacktestConfig, Backtester
-from combo_bot.types import AccountState, Order, OrderSource, Position, Side, SymbolState
+from combo_bot.types import (
+    AccountState,
+    Order,
+    OrderSource,
+    Position,
+    Side,
+    SymbolState,
+)
 
 
 class TestShortAccounting:

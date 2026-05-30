@@ -3,10 +3,25 @@ import math
 import numpy as np
 from dataclasses import dataclass, field
 from combo_bot.types import (
-    AccountState, BacktestResult, Candle, ExchangeParams, Fill,
-    Order, OrderSource, Position, Side, SymbolState, TradingMode,
+    AccountState,
+    BacktestResult,
+    Candle,
+    ExchangeParams,
+    Fill,
+    Order,
+    OrderSource,
+    Position,
+    Side,
+    SymbolState,
 )
-from combo_bot.grid_engine import GridConfig, GridEngine, ForagerScorer, ForagerWeights, calc_wallet_exposure
+from combo_bot.grid_engine import (
+    GridConfig,
+    GridEngine,
+    ForagerScorer,
+    ForagerWeights,
+    build_forager_candidates,
+    calc_wallet_exposure,
+)
 from combo_bot.trend_signal import TrendConfig, TrendEngine
 from combo_bot.merger import MergerConfig, DecisionMerger
 from combo_bot.risk import RiskConfig, RiskManager
@@ -17,7 +32,7 @@ from combo_bot.protections import IProtection, ProtectionManager
 from combo_bot.sizing import KellySizer
 from combo_bot.correlation import CorrelationGate
 from combo_bot.vol_target import VolTargetSizer
-from combo_bot.types import RegimeView, TrendRegime, TrendSignal
+from combo_bot.types import RegimeView
 
 
 @dataclass
@@ -60,7 +75,13 @@ class Backtester:
         self.config = config
         self.grid = GridEngine(config.grid)
         self.trend = TrendEngine(config.trend)
-        self.merger = DecisionMerger(config.merger)
+        # Round-22: pass the canonical trend WEL so overlay sizing and
+        # risk unstuck stay in lockstep — no more drift between merger
+        # and risk configs.
+        self.merger = DecisionMerger(
+            config.merger,
+            trend_wallet_exposure_limit=config.risk.trend_wallet_exposure_limit,
+        )
         self.risk = RiskManager(config.risk)
         self.regime_arbiter = RegimeArbiter(config.regime)
         self.forager = ForagerScorer()
@@ -156,7 +177,11 @@ class Backtester:
 
             # ── fill pending orders from PREVIOUS tick ─────────────
             step_fills = self._simulate_fills(
-                pending_orders, candles, account, exchange_params, ts,
+                pending_orders,
+                candles,
+                account,
+                exchange_params,
+                ts,
             )
             for f in step_fills:
                 fills.append(f)
@@ -171,8 +196,13 @@ class Backtester:
             # bar_interval, 1h backtests would only trigger funding every
             # 480h instead of every 8h.
             hours_elapsed = (step + 1) * self.config.bar_interval_minutes / 60.0
-            if int(hours_elapsed / self.config.funding_interval_hours) > funding_hour_counter:
-                funding_hour_counter = int(hours_elapsed / self.config.funding_interval_hours)
+            if (
+                int(hours_elapsed / self.config.funding_interval_hours)
+                > funding_hour_counter
+            ):
+                funding_hour_counter = int(
+                    hours_elapsed / self.config.funding_interval_hours
+                )
                 fc = self._apply_funding(account, funding_rates, step, symbols)
                 account.funding_cumsum += fc
 
@@ -190,17 +220,47 @@ class Backtester:
             # ── compute orders for NEXT tick ──────────────────────
             all_orders: list[Order] = []
 
+            # Round-22: Forager symbol selection. When the universe is
+            # larger than the configured active-position count, only the
+            # top-scoring symbols receive new entries this tick;
+            # everything else still emits reduce-only closes so existing
+            # positions can wind down naturally. Symbols already holding
+            # a position on EITHER side stay active so the engine can
+            # keep managing them (closes, unstuck, trailing exits).
+            n_active = max(1, self.config.grid.n_positions)
+            tick_signals = {s: self.trend.compute(s) for s in symbols}
+            if len(symbols) > n_active:
+                forced = {
+                    s
+                    for s in symbols
+                    if account.symbols[s].position_long.is_open
+                    or account.symbols[s].position_short.is_open
+                    or account.symbols[s].trend_long.is_open
+                    or account.symbols[s].trend_short.is_open
+                }
+                ranked = ForagerScorer.select_symbols(
+                    build_forager_candidates(symbols, candles, account, tick_signals),
+                    n_active,
+                    self.config.forager_weights,
+                )
+                active_set = set(ranked) | forced
+            else:
+                active_set = set(symbols)
+
             for s in symbols:
                 ss = account.symbols[s]
-                signal = self.trend.compute(s)
+                signal = tick_signals[s]
                 ep = exchange_params[s]
                 candle = candles[s]
                 price = candle.close
 
                 if self._strategy_uses_dataframe:
-                    strat_enter_long, strat_enter_short, strat_exit_long, strat_exit_short = (
-                        read_strategy_signals(self.data_provider, s)
-                    )
+                    (
+                        strat_enter_long,
+                        strat_enter_short,
+                        strat_exit_long,
+                        strat_exit_short,
+                    ) = read_strategy_signals(self.data_provider, s)
                 else:
                     strat_enter_long = strat_enter_short = False
                     strat_exit_long = strat_exit_short = False
@@ -216,50 +276,98 @@ class Backtester:
                 ss.mode_long = regime_view.long_mode
                 ss.mode_short = regime_view.short_mode
 
-                we_long = calc_wallet_exposure(
-                    account.balance, abs(ss.position_long.size),
-                    ss.position_long.entry_price, ep.c_mult
-                ) if ss.position_long.is_open else 0.0
+                we_long = (
+                    calc_wallet_exposure(
+                        account.balance,
+                        abs(ss.position_long.size),
+                        ss.position_long.entry_price,
+                        ep.c_mult,
+                    )
+                    if ss.position_long.is_open
+                    else 0.0
+                )
                 grid_long = self.grid.compute_orders(
-                    symbol=s, side=Side.LONG, position=ss.position_long,
-                    ema_state=ss.ema, volatility=ss.volatility,
-                    balance=account.balance, wallet_exposure=we_long,
-                    exchange_params=ep, mode=regime_view.long_mode, mark_price=price,
+                    symbol=s,
+                    side=Side.LONG,
+                    position=ss.position_long,
+                    ema_state=ss.ema,
+                    volatility=ss.volatility,
+                    balance=account.balance,
+                    wallet_exposure=we_long,
+                    exchange_params=ep,
+                    mode=regime_view.long_mode,
+                    mark_price=price,
                     close_markup_multiplier=regime_view.close_aggressiveness,
                 )
-                we_short = calc_wallet_exposure(
-                    account.balance, abs(ss.position_short.size),
-                    ss.position_short.entry_price, ep.c_mult
-                ) if ss.position_short.is_open else 0.0
+                we_short = (
+                    calc_wallet_exposure(
+                        account.balance,
+                        abs(ss.position_short.size),
+                        ss.position_short.entry_price,
+                        ep.c_mult,
+                    )
+                    if ss.position_short.is_open
+                    else 0.0
+                )
                 grid_short = self.grid.compute_orders(
-                    symbol=s, side=Side.SHORT, position=ss.position_short,
-                    ema_state=ss.ema, volatility=ss.volatility,
-                    balance=account.balance, wallet_exposure=we_short,
-                    exchange_params=ep, mode=regime_view.short_mode, mark_price=price,
+                    symbol=s,
+                    side=Side.SHORT,
+                    position=ss.position_short,
+                    ema_state=ss.ema,
+                    volatility=ss.volatility,
+                    balance=account.balance,
+                    wallet_exposure=we_short,
+                    exchange_params=ep,
+                    mode=regime_view.short_mode,
+                    mark_price=price,
                     close_markup_multiplier=regime_view.close_aggressiveness,
                 )
                 ctx_long = TradeContext(
-                    symbol=s, side=Side.LONG, position=ss.position_long,
-                    account=account, candle=candle, signal=signal,
-                    current_time_ms=ts, exchange_params=ep,
+                    symbol=s,
+                    side=Side.LONG,
+                    position=ss.position_long,
+                    account=account,
+                    candle=candle,
+                    signal=signal,
+                    current_time_ms=ts,
+                    exchange_params=ep,
                 )
                 trailing_entries: list[Order] = []
                 ctx_short = TradeContext(
-                    symbol=s, side=Side.SHORT, position=ss.position_short,
-                    account=account, candle=candle, signal=signal,
-                    current_time_ms=ts, exchange_params=ep,
+                    symbol=s,
+                    side=Side.SHORT,
+                    position=ss.position_short,
+                    account=account,
+                    candle=candle,
+                    signal=signal,
+                    current_time_ms=ts,
+                    exchange_params=ep,
                 )
                 trail_long = self.grid.compute_trailing_entry(
-                    s, Side.LONG, ss.position_long, ss.trailing_long,
-                    account.balance, we_long, ep, price, regime_view.long_mode,
+                    s,
+                    Side.LONG,
+                    ss.position_long,
+                    ss.trailing_long,
+                    account.balance,
+                    we_long,
+                    ep,
+                    price,
+                    regime_view.long_mode,
                 )
                 if trail_long is not None:
                     trailing_entries.extend(
                         self.strategy_runner.filter_entries([trail_long], ctx_long)
                     )
                 trail_short = self.grid.compute_trailing_entry(
-                    s, Side.SHORT, ss.position_short, ss.trailing_short,
-                    account.balance, we_short, ep, price, regime_view.short_mode,
+                    s,
+                    Side.SHORT,
+                    ss.position_short,
+                    ss.trailing_short,
+                    account.balance,
+                    we_short,
+                    ep,
+                    price,
+                    regime_view.short_mode,
                 )
                 if trail_short is not None:
                     trailing_entries.extend(
@@ -275,7 +383,11 @@ class Backtester:
                 )
 
                 trend_entries = self._emit_trend_overlay(
-                    s, regime_view, price, account, ep,
+                    s,
+                    regime_view,
+                    price,
+                    account,
+                    ep,
                 )
                 # Run trend overlay entries through the strategy's veto
                 # / price / sizing pipeline using a context whose
@@ -288,23 +400,36 @@ class Backtester:
                 if trend_entries:
                     overlay_side = trend_entries[0].side
                     overlay_pos = (
-                        ss.trend_long if overlay_side == Side.LONG
-                        else ss.trend_short
+                        ss.trend_long if overlay_side == Side.LONG else ss.trend_short
                     )
                     ctx_overlay = TradeContext(
-                        symbol=s, side=overlay_side, position=overlay_pos,
-                        account=account, candle=candle, signal=signal,
-                        current_time_ms=ts, exchange_params=ep,
+                        symbol=s,
+                        side=overlay_side,
+                        position=overlay_pos,
+                        account=account,
+                        candle=candle,
+                        signal=signal,
+                        current_time_ms=ts,
+                        exchange_params=ep,
                         source=OrderSource.TREND,
                     )
                     trend_entries = self.strategy_runner.filter_entries(
-                        trend_entries, ctx_overlay,
+                        trend_entries,
+                        ctx_overlay,
                     )
                 trend_exits_long = self.merger.generate_trend_exit_orders(
-                    s, ss.trend_long, Side.LONG, price, ep,
+                    s,
+                    ss.trend_long,
+                    Side.LONG,
+                    price,
+                    ep,
                 )
                 trend_exits_short = self.merger.generate_trend_exit_orders(
-                    s, ss.trend_short, Side.SHORT, price, ep,
+                    s,
+                    ss.trend_short,
+                    Side.SHORT,
+                    price,
+                    ep,
                 )
                 # Run trend SL/TP exits through the strategy exit hook.
                 # Pre-fix this bypassed StrategyRunner.filter_exits, so
@@ -313,21 +438,33 @@ class Backtester:
                 # "every exit goes through the confirm hook" semantic.
                 if trend_exits_long:
                     ctx_trend_long = TradeContext(
-                        symbol=s, side=Side.LONG, position=ss.trend_long,
-                        account=account, candle=candle, signal=signal,
-                        current_time_ms=ts, exchange_params=ep,
+                        symbol=s,
+                        side=Side.LONG,
+                        position=ss.trend_long,
+                        account=account,
+                        candle=candle,
+                        signal=signal,
+                        current_time_ms=ts,
+                        exchange_params=ep,
                     )
                     trend_exits_long = self.strategy_runner.filter_exits(
-                        trend_exits_long, ctx_trend_long,
+                        trend_exits_long,
+                        ctx_trend_long,
                     )
                 if trend_exits_short:
                     ctx_trend_short = TradeContext(
-                        symbol=s, side=Side.SHORT, position=ss.trend_short,
-                        account=account, candle=candle, signal=signal,
-                        current_time_ms=ts, exchange_params=ep,
+                        symbol=s,
+                        side=Side.SHORT,
+                        position=ss.trend_short,
+                        account=account,
+                        candle=candle,
+                        signal=signal,
+                        current_time_ms=ts,
+                        exchange_params=ep,
                     )
                     trend_exits_short = self.strategy_runner.filter_exits(
-                        trend_exits_short, ctx_trend_short,
+                        trend_exits_short,
+                        ctx_trend_short,
                     )
 
                 strategy_orders: list[Order] = []
@@ -339,7 +476,7 @@ class Backtester:
                 # confirm_trade_entry for adjust adds). Pre-fix these
                 # bypassed the final safety hook, leaving the strategy
                 # author unable to veto its own SL trigger.
-                for (ss_open, ctx_apply) in (
+                for ss_open, ctx_apply in (
                     (ss.position_long.is_open, ctx_long),
                     (ss.position_short.is_open, ctx_short),
                 ):
@@ -369,19 +506,39 @@ class Backtester:
                 # trend bucket so the strategy sees the correct state.
                 trend_branches: list[tuple[bool, TradeContext]] = []
                 if ss.trend_long.is_open:
-                    trend_branches.append((True, TradeContext(
-                        symbol=s, side=Side.LONG, position=ss.trend_long,
-                        account=account, candle=candle, signal=signal,
-                        current_time_ms=ts, exchange_params=ep,
-                        source=OrderSource.TREND,
-                    )))
+                    trend_branches.append(
+                        (
+                            True,
+                            TradeContext(
+                                symbol=s,
+                                side=Side.LONG,
+                                position=ss.trend_long,
+                                account=account,
+                                candle=candle,
+                                signal=signal,
+                                current_time_ms=ts,
+                                exchange_params=ep,
+                                source=OrderSource.TREND,
+                            ),
+                        )
+                    )
                 if ss.trend_short.is_open:
-                    trend_branches.append((True, TradeContext(
-                        symbol=s, side=Side.SHORT, position=ss.trend_short,
-                        account=account, candle=candle, signal=signal,
-                        current_time_ms=ts, exchange_params=ep,
-                        source=OrderSource.TREND,
-                    )))
+                    trend_branches.append(
+                        (
+                            True,
+                            TradeContext(
+                                symbol=s,
+                                side=Side.SHORT,
+                                position=ss.trend_short,
+                                account=account,
+                                candle=candle,
+                                signal=signal,
+                                current_time_ms=ts,
+                                exchange_params=ep,
+                                source=OrderSource.TREND,
+                            ),
+                        )
+                    )
                 for _open, ctx_apply in trend_branches:
                     fx = self.strategy_runner.check_custom_exit(ctx_apply)
                     if fx is not None:
@@ -399,18 +556,34 @@ class Backtester:
                                 self.strategy_runner.filter_entries([adj], ctx_apply)
                             )
 
-                all_orders.extend(grid_long)
-                all_orders.extend(grid_short)
-                all_orders.extend(trailing_entries)
-                all_orders.extend(trend_entries)
-                all_orders.extend(trend_exits_long)
-                all_orders.extend(trend_exits_short)
-                all_orders.extend(strategy_orders)
+                # Round-22 Forager gate: non-active symbols may still
+                # emit reduce-only orders (closes, SL/TP, unstuck) so
+                # existing positions can wind down — but no new exposure.
+                if s in active_set:
+                    all_orders.extend(grid_long)
+                    all_orders.extend(grid_short)
+                    all_orders.extend(trailing_entries)
+                    all_orders.extend(trend_entries)
+                    all_orders.extend(trend_exits_long)
+                    all_orders.extend(trend_exits_short)
+                    all_orders.extend(strategy_orders)
+                else:
+                    for bucket in (
+                        grid_long,
+                        grid_short,
+                        trailing_entries,
+                        trend_entries,
+                        trend_exits_long,
+                        trend_exits_short,
+                        strategy_orders,
+                    ):
+                        all_orders.extend(o for o in bucket if o.reduce_only)
 
             all_orders = self.protections.filter_orders(all_orders, ts)
             if self.correlation_gate is not None:
                 all_orders = self.correlation_gate.filter_orders(
-                    all_orders, account,
+                    all_orders,
+                    account,
                 )
             if self.vol_target_sizer is not None:
                 all_orders = self.vol_target_sizer.filter_orders(all_orders)
@@ -422,14 +595,20 @@ class Backtester:
             )
             all_orders.extend(unstuck_orders)
             all_orders = self.risk.filter_orders(
-                all_orders, account, ts, exchange_params=exchange_params,
+                all_orders,
+                account,
+                ts,
+                exchange_params=exchange_params,
             )
 
             pending_orders = all_orders
 
         return self._compile_result(
-            fills, equity_log, account,
-            account.grid_realized_pnl, account.trend_realized_pnl,
+            fills,
+            equity_log,
+            account,
+            account.grid_realized_pnl,
+            account.trend_realized_pnl,
         )
 
     def _apply_strategy_populates(self, symbol: str) -> None:
@@ -452,10 +631,12 @@ class Backtester:
         try:
             out_ind = self.strategy.populate_indicators(df, meta)
             out_ent = self.strategy.populate_entry_trend(
-                out_ind if out_ind is not None else df, meta,
+                out_ind if out_ind is not None else df,
+                meta,
             )
             out_ext = self.strategy.populate_exit_trend(
-                out_ent if out_ent is not None else (out_ind or df), meta,
+                out_ent if out_ent is not None else (out_ind or df),
+                meta,
             )
         except Exception:
             # A misbehaving user strategy mustn't crash the backtest loop.
@@ -470,8 +651,12 @@ class Backtester:
         # the strategy's freshest decision was silently stuck on the
         # first value. Freqtrade semantics: returned df wins.
         for col in (
-            "enter_long", "enter_short", "exit_long", "exit_short",
-            "enter_tag", "exit_tag",
+            "enter_long",
+            "enter_short",
+            "exit_long",
+            "exit_short",
+            "enter_tag",
+            "exit_tag",
         ):
             if col in final.columns:
                 df[col] = final[col].reindex(df.index)
@@ -512,7 +697,9 @@ class Backtester:
         for s, c in candles.items():
             ss = account.symbols[s]
             if c.close > 0 and c.low > 0:
-                log_range = math.log(max(c.high, c.low + 1e-12) / c.low) if c.low > 0 else 0.0
+                log_range = (
+                    math.log(max(c.high, c.low + 1e-12) / c.low) if c.low > 0 else 0.0
+                )
             else:
                 log_range = 0.0
             if not ss.volatility.initialized:
@@ -557,8 +744,7 @@ class Backtester:
         ss = account.symbols.get(symbol)
         if ss is not None:
             existing = (
-                ss.trend_long if regime.trend_overlay == Side.LONG
-                else ss.trend_short
+                ss.trend_long if regime.trend_overlay == Side.LONG else ss.trend_short
             )
             # Don't double up the first trend entry. Pyramiding is Stage 5+.
             # Note: we check the trend bucket only — a co-existing grid
@@ -581,7 +767,7 @@ class Backtester:
         if effective_scale <= 0:
             return []
 
-        budget = account.balance * merger_cfg.trend_position_max_pct
+        budget = account.balance * self.merger.effective_trend_wel
         notional = budget * merger_cfg.trend_entry_qty_pct * effective_scale
         qty = notional / max(price * exchange.c_mult, 1e-12)
         qty = max(qty, exchange.min_qty)
@@ -596,14 +782,16 @@ class Backtester:
         # executor agree on the same semantics. (Previously is_market
         # was False but a special-case in the fill simulator filled at
         # close*slip anyway, so backtest and live diverged.)
-        return [Order(
-            symbol=symbol,
-            side=regime.trend_overlay,
-            price=price,
-            qty=qty,
-            source=OrderSource.TREND,
-            is_market=True,
-        )]
+        return [
+            Order(
+                symbol=symbol,
+                side=regime.trend_overlay,
+                price=price,
+                qty=qty,
+                source=OrderSource.TREND,
+                is_market=True,
+            )
+        ]
 
     def _simulate_fills(
         self,
@@ -638,6 +826,7 @@ class Backtester:
             if ep.qty_step > 0:
                 # Match live: floor to qty_step before validating.
                 import math
+
                 qstep_qty = math.floor(order.qty / ep.qty_step) * ep.qty_step
                 if qstep_qty < ep.min_qty:
                     continue
@@ -648,6 +837,7 @@ class Backtester:
                     # fill pipeline so fee / pnl / position math all
                     # use the same qty the live executor would send.
                     from dataclasses import replace
+
                     order = replace(order, qty=qstep_qty)
 
             # Market orders cross the book at close ± slippage with taker fee.
@@ -657,7 +847,12 @@ class Backtester:
             # that filled them at close*slip while is_market was False
             # has been removed.)
             if order.is_market:
-                slip_dir = 1 if (order.side == Side.LONG and not order.reduce_only) or (order.side == Side.SHORT and order.reduce_only) else -1
+                slip_dir = (
+                    1
+                    if (order.side == Side.LONG and not order.reduce_only)
+                    or (order.side == Side.SHORT and order.reduce_only)
+                    else -1
+                )
                 fill_price = c.close * (1.0 + self.config.slippage_pct * slip_dir)
                 fee_rate = self.config.taker_fee
             else:
@@ -684,29 +879,29 @@ class Backtester:
                 # bucket — this is the only entry path that drives the
                 # passivbot-style trailing re-entry, so we don't reset
                 # for trend-bucket fills.
-                fresh_grid_open = (
-                    not pos.is_open
-                    and order.source != OrderSource.TREND
-                )
+                fresh_grid_open = not pos.is_open and order.source != OrderSource.TREND
                 self._add_to_position(pos, order.qty, fill_price)
                 if fresh_grid_open:
                     bundle = (
-                        ss.trailing_long if order.side == Side.LONG
+                        ss.trailing_long
+                        if order.side == Side.LONG
                         else ss.trailing_short
                     )
                     bundle.reset(fill_price)
 
-            step_fills.append(Fill(
-                timestamp=timestamp,
-                symbol=order.symbol,
-                side=order.side,
-                price=fill_price,
-                qty=order.qty,
-                fee=fee,
-                realized_pnl=pnl,
-                source=order.source,
-                reduce_only=order.reduce_only,
-            ))
+            step_fills.append(
+                Fill(
+                    timestamp=timestamp,
+                    symbol=order.symbol,
+                    side=order.side,
+                    price=fill_price,
+                    qty=order.qty,
+                    fee=fee,
+                    realized_pnl=pnl,
+                    source=order.source,
+                    reduce_only=order.reduce_only,
+                )
+            )
 
         return step_fills
 
@@ -785,12 +980,22 @@ class Backtester:
         eq_arr = np.array(equity_log)
         if len(eq_arr) < 2:
             return BacktestResult(
-                fills=fills, equity_curve=eq_arr,
-                final_balance=account.balance, total_pnl=0, total_fees=0,
-                total_funding=account.funding_cumsum, n_trades=0,
-                win_rate=0, adg=0, max_drawdown=0, sharpe_ratio=0,
-                sortino_ratio=0, calmar_ratio=0, grid_pnl=grid_pnl,
-                trend_pnl=trend_pnl, duration_days=0,
+                fills=fills,
+                equity_curve=eq_arr,
+                final_balance=account.balance,
+                total_pnl=0,
+                total_fees=0,
+                total_funding=account.funding_cumsum,
+                n_trades=0,
+                win_rate=0,
+                adg=0,
+                max_drawdown=0,
+                sharpe_ratio=0,
+                sortino_ratio=0,
+                calmar_ratio=0,
+                grid_pnl=grid_pnl,
+                trend_pnl=trend_pnl,
+                duration_days=0,
             )
 
         equities = eq_arr[:, 1]
@@ -801,7 +1006,9 @@ class Backtester:
         total_pnl = sum(f.realized_pnl for f in fills)
         total_fees = sum(f.fee for f in fills)
         # Net PnL (after fees) determines win/loss, not gross.
-        winning = sum(1 for f in fills if f.realized_pnl > f.fee and f.realized_pnl != 0)
+        winning = sum(
+            1 for f in fills if f.realized_pnl > f.fee and f.realized_pnl != 0
+        )
         closing = sum(1 for f in fills if f.realized_pnl != 0)
         win_rate = winning / max(closing, 1)
 

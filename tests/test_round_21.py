@@ -12,7 +12,6 @@ import asyncio
 
 import pytest
 
-
 # ────────────────────────────────────────────────────────────────────
 # P0: sink failure rolls back
 # ────────────────────────────────────────────────────────────────────
@@ -45,7 +44,8 @@ def test_sink_failure_rolls_back_watermark_and_seen_and_marks_failed():
             ]
 
     mgr = FillEventManager(
-        _Ex(), FillEventManagerConfig(poll_interval_ms=0),
+        _Ex(),
+        FillEventManagerConfig(poll_interval_ms=0),
     )
     sym = "BTC/USDT:USDT"
 
@@ -61,8 +61,7 @@ def test_sink_failure_rolls_back_watermark_and_seen_and_marks_failed():
     )
     # Trade id must NOT be marked seen.
     assert "t-1" not in mgr._seen_ids.get(sym, []), (
-        "sink failure must NOT commit seen ids; got "
-        f"{mgr._seen_ids.get(sym)}"
+        "sink failure must NOT commit seen ids; got " f"{mgr._seen_ids.get(sym)}"
     )
     # last_poll_failed flags this tick fail-closed.
     assert mgr.last_poll_failed(sym) is True
@@ -93,10 +92,13 @@ def test_sink_failure_recovery_on_next_poll_does_not_double_send():
             ]
 
     mgr = FillEventManager(
-        _Ex(), FillEventManagerConfig(poll_interval_ms=0),
+        _Ex(),
+        FillEventManagerConfig(poll_interval_ms=0),
     )
     sym = "BTC/USDT:USDT"
-    asyncio.run(mgr.poll(sym, now_ms=0, sink=lambda _: (_ for _ in ()).throw(RuntimeError("x"))))
+    asyncio.run(
+        mgr.poll(sym, now_ms=0, sink=lambda _: (_ for _ in ()).throw(RuntimeError("x")))
+    )
     # Recovery: clean sink. Should see t-1 exactly once.
     captured = []
     asyncio.run(mgr.poll(sym, now_ms=1, sink=captured.extend))
@@ -115,7 +117,7 @@ def test_populate_signal_columns_refresh_when_returned_dataframe_changes_values(
     """Strategy returns a NEW dataframe; signal column values must
     REPLACE the cached values, not be silently dropped because the
     column already exists in the cache."""
-    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pandas")
     from combo_bot.backtest import BacktestConfig, Backtester
     from combo_bot.data_provider import DataProvider
     from combo_bot.strategy import IStrategy
@@ -142,22 +144,25 @@ def test_populate_signal_columns_refresh_when_returned_dataframe_changes_values(
     bt.data_provider = DataProvider()
     sym = "BTC/USDT:USDT"
     bt.data_provider.append(
-        sym, Candle(timestamp=1, open=100, high=101, low=99, close=100, volume=1),
+        sym,
+        Candle(timestamp=1, open=100, high=101, low=99, close=100, volume=1),
     )
     bt._apply_strategy_populates(sym)
     df1 = bt.data_provider.get_dataframe(sym)
     first = int(df1["enter_long"].iloc[-1])
     bt.data_provider.append(
-        sym, Candle(timestamp=2, open=100, high=101, low=99, close=100, volume=1),
+        sym,
+        Candle(timestamp=2, open=100, high=101, low=99, close=100, volume=1),
     )
     bt._apply_strategy_populates(sym)
     df2 = bt.data_provider.get_dataframe(sym)
     second = int(df2["enter_long"].iloc[-1])
     # Tick 1 returned 1; tick 2 returned 0. With the fix the cache
     # reflects the most recent populate's value on the latest row.
-    assert (first, second) == (1, 0), (
-        f"signal column must refresh; saw (first={first}, second={second})"
-    )
+    assert (first, second) == (
+        1,
+        0,
+    ), f"signal column must refresh; saw (first={first}, second={second})"
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -221,7 +226,9 @@ def test_market_entry_skips_custom_entry_price():
         is_market=True,
     )
     out = runner.filter_entries([market_entry], ctx)
-    assert called["price"] == 0, "custom_entry_price must NOT be invoked for market entries"
+    assert (
+        called["price"] == 0
+    ), "custom_entry_price must NOT be invoked for market entries"
     # The order's stated price stays put (not bumped by +999).
     assert out[0].price == pytest.approx(49_000.0)
 

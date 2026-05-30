@@ -46,13 +46,13 @@ class HslConfig:
     cooldown_after_red_minutes: int = 60
     # When > 0, the RED latch automatically releases after this many
     # MINUTES of wall-clock time since it was set. 0 = manual reset
-    # only (passivbot semantic). Default 240 = 4h, leaning toward the
-    # high-risk profile: after a deep drawdown the bot self-heals and
-    # resumes trading instead of needing operator intervention.
+    # only (passivbot semantic, the safe default for real money).
+    # Set to a positive value (e.g. 240 = 4h) on aggressive profiles
+    # where you want the bot to self-heal without operator action.
     # Re-entry into RED still requires drawdown to cross the threshold
     # again, so a flapping market can't infinitely re-latch unless the
     # account is genuinely bleeding.
-    red_latch_auto_release_minutes: int = 240
+    red_latch_auto_release_minutes: int = 0
 
 
 class HslSupervisor:
@@ -86,9 +86,7 @@ class HslSupervisor:
     # Public API
     # ------------------------------------------------------------------
 
-    def assess(
-        self, account: AccountState, timestamp_ms: int = 0
-    ) -> HslTier:
+    def assess(self, account: AccountState, timestamp_ms: int = 0) -> HslTier:
         """Classify the current account drawdown and return the tier.
 
         ``timestamp_ms`` drives the EMA decay AND the RED latch

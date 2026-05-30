@@ -6,6 +6,7 @@
 * realized PnL fallback from local bucket entry when info.realizedPnl missing
 * max_realized_loss_pct global gate trims/drops loss-realizing closes
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -18,7 +19,13 @@ import pytest
 from combo_bot.live import LiveConfig, LiveTrader
 from combo_bot.risk import RiskConfig, RiskManager
 from combo_bot.types import (
-    AccountState, ExchangeParams, Fill, Order, OrderSource, Position, Side,
+    AccountState,
+    ExchangeParams,
+    Fill,
+    Order,
+    OrderSource,
+    Position,
+    Side,
     SymbolState,
 )
 
@@ -36,7 +43,8 @@ class _Stub:
         return {
             "precision": {"amount": 0.001, "price": 0.01},
             "limits": {"amount": {"min": 0.001}, "cost": {"min": 5.0}},
-            "maker": 0.0002, "taker": 0.0005,
+            "maker": 0.0002,
+            "taker": 0.0005,
         }
 
     async def fetch_balance(self, _p=None):
@@ -60,10 +68,16 @@ class _Stub:
         return []
 
     async def create_order(self, sym, ot, side, qty, price, params):
-        self.created.append({
-            "symbol": sym, "type": ot, "side": side,
-            "qty": qty, "price": price, "params": params,
-        })
+        self.created.append(
+            {
+                "symbol": sym,
+                "type": ot,
+                "side": side,
+                "qty": qty,
+                "price": price,
+                "params": params,
+            }
+        )
         return {"id": str(len(self.created)), "status": "open"}
 
     async def cancel_order(self, *_a, **_k):
@@ -81,7 +95,10 @@ def _trader() -> LiveTrader:
     cfg = LiveConfig(symbols=["BTC/USDT:USDT"], dry_run=False)
     trader = LiveTrader(cfg, ex)
     trader.exchange_params["BTC/USDT:USDT"] = ExchangeParams(
-        qty_step=0.001, price_step=0.01, min_qty=0.001, min_cost=5.0,
+        qty_step=0.001,
+        price_step=0.01,
+        min_qty=0.001,
+        min_cost=5.0,
     )
     trader.account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
     return trader
@@ -99,10 +116,15 @@ def test_missing_side_clears_both_grid_and_trend_buckets():
     ss.trend_long = Position(size=0.2, entry_price=49_000.0)
 
     # Exchange returns NO long-side position. Both buckets must clear.
-    trader.exchange.positions = [{
-        "symbol": "BTC/USDT:USDT", "side": "short",
-        "contracts": 0.1, "entryPrice": 51_000.0, "markPrice": 50_500.0,
-    }]
+    trader.exchange.positions = [
+        {
+            "symbol": "BTC/USDT:USDT",
+            "side": "short",
+            "contracts": 0.1,
+            "entryPrice": 51_000.0,
+            "markPrice": 50_500.0,
+        }
+    ]
     asyncio.run(trader._refresh_account())
 
     assert ss.position_long.size == 0.0
@@ -123,11 +145,18 @@ def test_dedup_does_not_cross_block_long_close_and_short_entry():
     so this case silently dropped the SHORT entry."""
     trader = _trader()
     long_close = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
-        source=OrderSource.GRID, reduce_only=True,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
+        source=OrderSource.GRID,
+        reduce_only=True,
     )
     short_entry = Order(
-        symbol="BTC/USDT:USDT", side=Side.SHORT, price=50_000.0, qty=0.01,
+        symbol="BTC/USDT:USDT",
+        side=Side.SHORT,
+        price=50_000.0,
+        qty=0.01,
         source=OrderSource.GRID,
     )
     asyncio.run(trader._reconcile_orders([long_close, short_entry]))
@@ -139,7 +168,10 @@ def test_dedup_does_not_cross_block_long_close_and_short_entry():
 def test_dedup_still_blocks_truly_identical_repeats():
     trader = _trader()
     o = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
         source=OrderSource.GRID,
     )
     asyncio.run(trader._reconcile_orders([o]))
@@ -158,7 +190,10 @@ def test_cid_cache_survives_save_load_cycle():
         trader_a = _trader()
         trader_a.config.state_file = str(state_path)
         o = Order(
-            symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
+            symbol="BTC/USDT:USDT",
+            side=Side.LONG,
+            price=50_000.0,
+            qty=0.01,
             source=OrderSource.GRID,
         )
         asyncio.run(trader_a._reconcile_orders([o]))
@@ -194,9 +229,15 @@ def test_enrich_fill_pnl_computes_long_close_from_entry_price():
     # A reduce_only LONG close at 51000 with realized_pnl=0 (missing
     # field). Local fallback: (51000 - 50000) * 0.01 = +10.0.
     fill = Fill(
-        timestamp=1_000, symbol="BTC/USDT:USDT", side=Side.LONG,
-        price=51_000.0, qty=0.01, fee=0.5, realized_pnl=0.0,
-        source=OrderSource.GRID, reduce_only=True,
+        timestamp=1_000,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=51_000.0,
+        qty=0.01,
+        fee=0.5,
+        realized_pnl=0.0,
+        source=OrderSource.GRID,
+        reduce_only=True,
     )
     enriched = trader._enrich_fill_pnl(fill)
     assert enriched.realized_pnl == pytest.approx(10.0)
@@ -207,9 +248,15 @@ def test_enrich_fill_pnl_computes_short_close_correctly():
     ss = trader.account.symbols["BTC/USDT:USDT"]
     ss.position_short = Position(size=0.01, entry_price=50_000.0)
     fill = Fill(
-        timestamp=1_000, symbol="BTC/USDT:USDT", side=Side.SHORT,
-        price=49_000.0, qty=0.01, fee=0.5, realized_pnl=0.0,
-        source=OrderSource.GRID, reduce_only=True,
+        timestamp=1_000,
+        symbol="BTC/USDT:USDT",
+        side=Side.SHORT,
+        price=49_000.0,
+        qty=0.01,
+        fee=0.5,
+        realized_pnl=0.0,
+        source=OrderSource.GRID,
+        reduce_only=True,
     )
     enriched = trader._enrich_fill_pnl(fill)
     # SHORT close at 49k from entry 50k → +10 PnL.
@@ -223,9 +270,15 @@ def test_enrich_fill_pnl_preserves_exchange_provided_value():
     ss = trader.account.symbols["BTC/USDT:USDT"]
     ss.position_long = Position(size=0.01, entry_price=50_000.0)
     fill = Fill(
-        timestamp=1_000, symbol="BTC/USDT:USDT", side=Side.LONG,
-        price=51_000.0, qty=0.01, fee=0.5, realized_pnl=42.0,  # given
-        source=OrderSource.GRID, reduce_only=True,
+        timestamp=1_000,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=51_000.0,
+        qty=0.01,
+        fee=0.5,
+        realized_pnl=42.0,  # given
+        source=OrderSource.GRID,
+        reduce_only=True,
     )
     enriched = trader._enrich_fill_pnl(fill)
     assert enriched.realized_pnl == pytest.approx(42.0)
@@ -238,9 +291,15 @@ def test_enrich_fill_pnl_skips_non_reduce_fills():
     ss = trader.account.symbols["BTC/USDT:USDT"]
     ss.position_long = Position(size=0.01, entry_price=50_000.0)
     fill = Fill(
-        timestamp=1_000, symbol="BTC/USDT:USDT", side=Side.LONG,
-        price=51_000.0, qty=0.01, fee=0.5, realized_pnl=0.0,
-        source=OrderSource.GRID, reduce_only=False,
+        timestamp=1_000,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=51_000.0,
+        qty=0.01,
+        fee=0.5,
+        realized_pnl=0.0,
+        source=OrderSource.GRID,
+        reduce_only=False,
     )
     enriched = trader._enrich_fill_pnl(fill)
     assert enriched.realized_pnl == 0.0
@@ -252,10 +311,14 @@ def test_enrich_fill_pnl_skips_non_reduce_fills():
 
 
 def test_realized_loss_gate_drops_close_when_budget_exhausted():
-    risk = RiskManager(RiskConfig(
-        max_realized_loss_pct=0.01,  # $100 on $10k
-        yellow_threshold=0.99, orange_threshold=0.99, red_threshold=0.99,
-    ))
+    risk = RiskManager(
+        RiskConfig(
+            max_realized_loss_pct=0.01,  # $100 on $10k
+            yellow_threshold=0.99,
+            orange_threshold=0.99,
+            red_threshold=0.99,
+        )
+    )
     acc = AccountState(balance=10_000, equity=10_000, equity_peak=10_000)
     acc.symbols["BTC"] = SymbolState(symbol="BTC")
     acc.symbols["BTC"].position_long = Position(size=1.0, entry_price=50_000.0)
@@ -264,8 +327,12 @@ def test_realized_loss_gate_drops_close_when_budget_exhausted():
 
     # Close at $45000 would realize $5000 loss — way over remaining $10.
     huge_loss_close = Order(
-        symbol="BTC", side=Side.LONG, price=45_000.0, qty=1.0,
-        source=OrderSource.GRID, reduce_only=True,
+        symbol="BTC",
+        side=Side.LONG,
+        price=45_000.0,
+        qty=1.0,
+        source=OrderSource.GRID,
+        reduce_only=True,
     )
     out = risk.filter_orders([huge_loss_close], acc, timestamp=10_000)
     # Either trimmed to fit ~$10 budget or dropped entirely.
@@ -273,18 +340,26 @@ def test_realized_loss_gate_drops_close_when_budget_exhausted():
 
 
 def test_realized_loss_gate_passes_profitable_closes():
-    risk = RiskManager(RiskConfig(
-        max_realized_loss_pct=0.01,
-        yellow_threshold=0.99, orange_threshold=0.99, red_threshold=0.99,
-    ))
+    risk = RiskManager(
+        RiskConfig(
+            max_realized_loss_pct=0.01,
+            yellow_threshold=0.99,
+            orange_threshold=0.99,
+            red_threshold=0.99,
+        )
+    )
     acc = AccountState(balance=10_000, equity=10_000, equity_peak=10_000)
     acc.symbols["BTC"] = SymbolState(symbol="BTC")
     acc.symbols["BTC"].position_long = Position(size=1.0, entry_price=50_000.0)
     acc.grid_loss_log = deque([(1_000, -99.0)])  # near-budget loss
 
     profit_close = Order(
-        symbol="BTC", side=Side.LONG, price=51_000.0, qty=1.0,
-        source=OrderSource.GRID, reduce_only=True,
+        symbol="BTC",
+        side=Side.LONG,
+        price=51_000.0,
+        qty=1.0,
+        source=OrderSource.GRID,
+        reduce_only=True,
     )
     out = risk.filter_orders([profit_close], acc, timestamp=10_000)
     # Profit close must pass — gate is about realising LOSS, not P&L direction.
@@ -293,18 +368,27 @@ def test_realized_loss_gate_passes_profitable_closes():
 
 def test_realized_loss_gate_lets_market_orders_through():
     """is_market = panic / SL / forced exit — must not be gated."""
-    risk = RiskManager(RiskConfig(
-        max_realized_loss_pct=0.001,  # $10 on $10k
-        yellow_threshold=0.99, orange_threshold=0.99, red_threshold=0.99,
-    ))
+    risk = RiskManager(
+        RiskConfig(
+            max_realized_loss_pct=0.001,  # $10 on $10k
+            yellow_threshold=0.99,
+            orange_threshold=0.99,
+            red_threshold=0.99,
+        )
+    )
     acc = AccountState(balance=10_000, equity=10_000, equity_peak=10_000)
     acc.symbols["BTC"] = SymbolState(symbol="BTC")
     acc.symbols["BTC"].position_long = Position(size=1.0, entry_price=50_000.0)
     acc.grid_loss_log = deque([(1_000, -100.0)])  # over budget
 
     panic = Order(
-        symbol="BTC", side=Side.LONG, price=45_000.0, qty=1.0,
-        source=OrderSource.RISK, reduce_only=True, is_market=True,
+        symbol="BTC",
+        side=Side.LONG,
+        price=45_000.0,
+        qty=1.0,
+        source=OrderSource.RISK,
+        reduce_only=True,
+        is_market=True,
     )
     out = risk.filter_orders([panic], acc, timestamp=10_000)
     assert len(out) == 1
@@ -326,10 +410,15 @@ def test_grid_entry_inverted_from_mixed_trend_aggregate_chatgpt_p0():
     ss.trend_long = Position(size=0.1, entry_price=60_000.0)
     # Exchange echoes the AGGREGATE: 0.2 @ 55k (the volume-weighted
     # average of the local grid 0.1 @ 50k and trend 0.1 @ 60k).
-    trader.exchange.positions = [{
-        "symbol": "BTC/USDT:USDT", "side": "long",
-        "contracts": 0.2, "entryPrice": 55_000.0, "markPrice": 55_500.0,
-    }]
+    trader.exchange.positions = [
+        {
+            "symbol": "BTC/USDT:USDT",
+            "side": "long",
+            "contracts": 0.2,
+            "entryPrice": 55_000.0,
+            "markPrice": 55_500.0,
+        }
+    ]
     asyncio.run(trader._refresh_account())
 
     # If the bug were live, the grid bucket would carry entry_price
@@ -344,16 +433,24 @@ def test_grid_entry_inverted_from_mixed_trend_aggregate_chatgpt_p0():
 
 
 def test_realized_loss_gate_zero_pct_disables():
-    risk = RiskManager(RiskConfig(
-        max_realized_loss_pct=0.0,
-        yellow_threshold=0.99, orange_threshold=0.99, red_threshold=0.99,
-    ))
+    risk = RiskManager(
+        RiskConfig(
+            max_realized_loss_pct=0.0,
+            yellow_threshold=0.99,
+            orange_threshold=0.99,
+            red_threshold=0.99,
+        )
+    )
     acc = AccountState(balance=10_000, equity=10_000, equity_peak=10_000)
     acc.symbols["BTC"] = SymbolState(symbol="BTC")
     acc.symbols["BTC"].position_long = Position(size=1.0, entry_price=50_000.0)
     huge_loss = Order(
-        symbol="BTC", side=Side.LONG, price=45_000.0, qty=1.0,
-        source=OrderSource.GRID, reduce_only=True,
+        symbol="BTC",
+        side=Side.LONG,
+        price=45_000.0,
+        qty=1.0,
+        source=OrderSource.GRID,
+        reduce_only=True,
     )
     out = risk.filter_orders([huge_loss], acc, timestamp=0)
     # Gate disabled → order survives.
@@ -384,23 +481,30 @@ def test_flat_account_first_entry_actually_reaches_exchange():
 
     # Now drive a normal entry through reconcile. It must reach the exchange.
     o = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
         source=OrderSource.GRID,
     )
     asyncio.run(trader._reconcile_orders([o]))
-    assert len(trader.exchange.created) == 1, (
-        "first live entry on a flat account must actually create_order"
-    )
+    assert (
+        len(trader.exchange.created) == 1
+    ), "first live entry on a flat account must actually create_order"
 
 
 def test_realized_loss_gate_honors_c_mult():
     """Round-10 P1.b: a c_mult != 1 symbol must NOT compute projected
     loss as qty * (fill - entry); it must multiply by c_mult so the
     budget gate actually reflects USD loss."""
-    risk = RiskManager(RiskConfig(
-        max_realized_loss_pct=0.01,  # $100 budget
-        yellow_threshold=0.99, orange_threshold=0.99, red_threshold=0.99,
-    ))
+    risk = RiskManager(
+        RiskConfig(
+            max_realized_loss_pct=0.01,  # $100 budget
+            yellow_threshold=0.99,
+            orange_threshold=0.99,
+            red_threshold=0.99,
+        )
+    )
     acc = AccountState(balance=10_000, equity=10_000, equity_peak=10_000)
     acc.symbols["BTC"] = SymbolState(symbol="BTC")
     acc.symbols["BTC"].position_long = Position(size=1.0, entry_price=50_000.0)
@@ -410,11 +514,18 @@ def test_realized_loss_gate_honors_c_mult():
     ep = ExchangeParams(c_mult=10.0)
     # 11 unit gap → projected loss = 1.0 * 11 * 10 = $110 > $100 budget.
     big_loss = Order(
-        symbol="BTC", side=Side.LONG, price=49_989.0, qty=1.0,
-        source=OrderSource.GRID, reduce_only=True,
+        symbol="BTC",
+        side=Side.LONG,
+        price=49_989.0,
+        qty=1.0,
+        source=OrderSource.GRID,
+        reduce_only=True,
     )
     out = risk.filter_orders(
-        [big_loss], acc, timestamp=0, exchange_params={"BTC": ep},
+        [big_loss],
+        acc,
+        timestamp=0,
+        exchange_params={"BTC": ep},
     )
     # Must be trimmed below qty=1 because the c_mult-aware projection
     # sees the loss exceeds the budget.
@@ -434,27 +545,43 @@ def test_fill_pnl_correct_when_entry_and_close_in_same_batch():
 
     # Stub two trades: a TREND LONG entry at ts=1000, then a TREND
     # LONG close at ts=2000. fetch_my_trades returns them together.
-    trader.exchange.trades_by_call = [[
-        {
-            "id": "t-entry", "timestamp": 1_000, "side": "buy",
-            "price": 50_000.0, "amount": 0.01,
-            "fee": {"cost": 0.1}, "order": "ord-entry",
-            "info": {"realizedPnl": "0"},
-        },
-        {
-            "id": "t-close", "timestamp": 2_000, "side": "sell",
-            "price": 51_000.0, "amount": 0.01,
-            "fee": {"cost": 0.1}, "order": "ord-close",
-            "info": {"realizedPnl": "0"},  # missing PnL → fallback path
-        },
-    ]]
+    trader.exchange.trades_by_call = [
+        [
+            {
+                "id": "t-entry",
+                "timestamp": 1_000,
+                "side": "buy",
+                "price": 50_000.0,
+                "amount": 0.01,
+                "fee": {"cost": 0.1},
+                "order": "ord-entry",
+                "info": {"realizedPnl": "0"},
+            },
+            {
+                "id": "t-close",
+                "timestamp": 2_000,
+                "side": "sell",
+                "price": 51_000.0,
+                "amount": 0.01,
+                "fee": {"cost": 0.1},
+                "order": "ord-close",
+                "info": {"realizedPnl": "0"},  # missing PnL → fallback path
+            },
+        ]
+    ]
     # Register source/meta for both orders so attribution finds TREND
     # and the close's reduce_only flag.
     trader.fill_events.register_outgoing(
-        "ord-entry", OrderSource.TREND, Side.LONG, reduce_only=False,
+        "ord-entry",
+        OrderSource.TREND,
+        Side.LONG,
+        reduce_only=False,
     )
     trader.fill_events.register_outgoing(
-        "ord-close", OrderSource.TREND, Side.LONG, reduce_only=True,
+        "ord-close",
+        OrderSource.TREND,
+        Side.LONG,
+        reduce_only=True,
     )
     asyncio.run(trader._refresh_fills())
 
@@ -481,12 +608,26 @@ def test_first_poll_skips_pre_bot_start_history():
         async def fetch_my_trades(self, *_a, **_k):
             self.calls += 1
             return [
-                {"id": "old", "timestamp": 500, "side": "buy",
-                 "price": 50_000.0, "amount": 0.01, "fee": {"cost": 0.05},
-                 "order": "ord-old", "info": {}},
-                {"id": "new", "timestamp": 2_000, "side": "sell",
-                 "price": 51_000.0, "amount": 0.01, "fee": {"cost": 0.05},
-                 "order": "ord-new", "info": {"realizedPnl": "10"}},
+                {
+                    "id": "old",
+                    "timestamp": 500,
+                    "side": "buy",
+                    "price": 50_000.0,
+                    "amount": 0.01,
+                    "fee": {"cost": 0.05},
+                    "order": "ord-old",
+                    "info": {},
+                },
+                {
+                    "id": "new",
+                    "timestamp": 2_000,
+                    "side": "sell",
+                    "price": 51_000.0,
+                    "amount": 0.01,
+                    "fee": {"cost": 0.05},
+                    "order": "ord-new",
+                    "info": {"realizedPnl": "10"},
+                },
             ]
 
     mgr = FillEventManager(_Ex(), FillEventManagerConfig(poll_interval_ms=0))
@@ -517,9 +658,12 @@ def test_pending_overlay_blocks_double_market_entry_until_fill():
         conviction=0.9,
         long_mode=TradingMode.AGGRESSIVE,
         short_mode=TradingMode.PANIC,
-        allow_grid_long=True, allow_grid_short=False,
-        trend_overlay=Side.LONG, trend_qty_scale=0.5,
-        close_aggressiveness=0.7, veto_reasons=(),
+        allow_grid_long=True,
+        allow_grid_short=False,
+        trend_overlay=Side.LONG,
+        trend_qty_scale=0.5,
+        close_aggressiveness=0.7,
+        veto_reasons=(),
     )
     ep = ExchangeParams(qty_step=0.001, price_step=0.01, min_qty=0.001, min_cost=5.0)
 
@@ -534,7 +678,9 @@ def test_pending_overlay_blocks_double_market_entry_until_fill():
 
     # Second call: bucket still empty (fill hasn't arrived), pending
     # set must block.
-    second = trader._emit_trend_overlay("BTC/USDT:USDT", rv, price=50_000.0, exchange=ep)
+    second = trader._emit_trend_overlay(
+        "BTC/USDT:USDT", rv, price=50_000.0, exchange=ep
+    )
     assert second == [], (
         "pending-overlay claim must block a second market entry until "
         "the fill arrives or the entry expires"
@@ -564,11 +710,16 @@ def test_pending_overlay_ttl_graduates_to_unknown_not_freed():
     trader._pending_overlay[("BTC/USDT:USDT", Side.LONG)] = 0.0
 
     rv = RegimeView(
-        primary=TrendRegime.STRONG_BULL, conviction=0.9,
-        long_mode=TradingMode.AGGRESSIVE, short_mode=TradingMode.PANIC,
-        allow_grid_long=True, allow_grid_short=False,
-        trend_overlay=Side.LONG, trend_qty_scale=0.5,
-        close_aggressiveness=0.7, veto_reasons=(),
+        primary=TrendRegime.STRONG_BULL,
+        conviction=0.9,
+        long_mode=TradingMode.AGGRESSIVE,
+        short_mode=TradingMode.PANIC,
+        allow_grid_long=True,
+        allow_grid_short=False,
+        trend_overlay=Side.LONG,
+        trend_qty_scale=0.5,
+        close_aggressiveness=0.7,
+        veto_reasons=(),
     )
     ep = ExchangeParams(qty_step=0.001, price_step=0.01, min_qty=0.001, min_cost=5.0)
     out = trader._emit_trend_overlay("BTC/USDT:USDT", rv, price=50_000.0, exchange=ep)
@@ -586,12 +737,20 @@ def test_desired_identity_distinguishes_market_from_limit():
     DIFFERENT cOIDs — they're different orders on the exchange."""
     trader = _trader()
     limit_o = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
-        source=OrderSource.GRID, is_market=False,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
+        source=OrderSource.GRID,
+        is_market=False,
     )
     market_o = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
-        source=OrderSource.GRID, is_market=True,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
+        source=OrderSource.GRID,
+        is_market=True,
     )
     assert trader._desired_identity(limit_o) != trader._desired_identity(market_o)
 
@@ -603,14 +762,23 @@ def test_prune_runs_before_stamp_so_stale_cache_doesnt_revive():
     trader = _trader()
     # Plant a stale cache entry (well past the dedup window).
     old_identity = (
-        "BTC/USDT:USDT", "long", "grid", False, False, 50_000.0, 0.01,
+        "BTC/USDT:USDT",
+        "long",
+        "grid",
+        False,
+        False,
+        50_000.0,
+        0.01,
     )
     very_old_ts = 1.0
     trader._cid_by_desired[old_identity] = ("cb-stale-old-cid", very_old_ts)
     # Now reconcile a desired with the same identity. Prune must have
     # cleared the stale entry; a fresh cOID must be minted.
     o = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
         source=OrderSource.GRID,
     )
     asyncio.run(trader._reconcile_orders([o]))
@@ -629,14 +797,19 @@ def test_fill_attribution_via_client_order_id_when_exchange_id_missing():
 
     class _Ex:
         async def fetch_my_trades(self, *_a, **_k):
-            return [{
-                "id": "t-1", "timestamp": 1_000, "side": "buy",
-                "price": 50_000.0, "amount": 0.01,
-                "fee": {"cost": 0.1},
-                # No "order" / "orderId" field — only clientOrderId.
-                "clientOrderId": "cb-trend-1",
-                "info": {"realizedPnl": "0"},
-            }]
+            return [
+                {
+                    "id": "t-1",
+                    "timestamp": 1_000,
+                    "side": "buy",
+                    "price": 50_000.0,
+                    "amount": 0.01,
+                    "fee": {"cost": 0.1},
+                    # No "order" / "orderId" field — only clientOrderId.
+                    "clientOrderId": "cb-trend-1",
+                    "info": {"realizedPnl": "0"},
+                }
+            ]
 
     mgr = FillEventManager(_Ex(), FillEventManagerConfig(poll_interval_ms=0))
     mgr.register_outgoing(
@@ -649,9 +822,9 @@ def test_fill_attribution_via_client_order_id_when_exchange_id_missing():
     captured = []
     asyncio.run(mgr.poll("BTC/USDT:USDT", now_ms=2_000, sink=captured.extend))
     assert len(captured) == 1
-    assert captured[0].source == OrderSource.TREND, (
-        "fill must be attributed via clientOrderId when exchange id is missing"
-    )
+    assert (
+        captured[0].source == OrderSource.TREND
+    ), "fill must be attributed via clientOrderId when exchange id is missing"
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -668,11 +841,18 @@ def test_bot_start_skip_respects_warmstart_watermark():
 
     class _Ex:
         async def fetch_my_trades(self, *_a, **_k):
-            return [{
-                "id": "real-fill", "timestamp": 500, "side": "buy",
-                "price": 50_000.0, "amount": 0.01, "fee": {"cost": 0.05},
-                "order": "ord-1", "info": {},
-            }]
+            return [
+                {
+                    "id": "real-fill",
+                    "timestamp": 500,
+                    "side": "buy",
+                    "price": 50_000.0,
+                    "amount": 0.01,
+                    "fee": {"cost": 0.05},
+                    "order": "ord-1",
+                    "info": {},
+                }
+            ]
 
     mgr = FillEventManager(_Ex(), FillEventManagerConfig(poll_interval_ms=0))
     # Simulate state restored from disk: we already had a watermark.
@@ -696,17 +876,27 @@ def test_bot_start_skip_respects_known_outgoing_order():
 
     class _Ex:
         async def fetch_my_trades(self, *_a, **_k):
-            return [{
-                "id": "ours", "timestamp": 500, "side": "buy",
-                "price": 50_000.0, "amount": 0.01, "fee": {"cost": 0.05},
-                "order": "ord-mine", "info": {},
-            }]
+            return [
+                {
+                    "id": "ours",
+                    "timestamp": 500,
+                    "side": "buy",
+                    "price": 50_000.0,
+                    "amount": 0.01,
+                    "fee": {"cost": 0.05},
+                    "order": "ord-mine",
+                    "info": {},
+                }
+            ]
 
     mgr = FillEventManager(_Ex(), FillEventManagerConfig(poll_interval_ms=0))
     mgr.set_bot_start(1_000)
     # We sent this order before the restart.
     mgr.register_outgoing(
-        "ord-mine", OrderSource.TREND, Side.LONG, reduce_only=False,
+        "ord-mine",
+        OrderSource.TREND,
+        Side.LONG,
+        reduce_only=False,
     )
     captured = []
     asyncio.run(mgr.poll("BTC/USDT:USDT", now_ms=2_000, sink=captured.extend))
@@ -738,6 +928,7 @@ def test_create_order_exception_keeps_pending_and_cid_registration():
     order may have been accepted server-side. We must keep the cOID
     attribution registered and the pending overlay marker in place so
     a delayed fill is routable AND no race tick can double-emit."""
+
     class _ErrorExchange(_Stub):
         async def create_order(self, *_a, **_k):
             raise RuntimeError("network hiccup")
@@ -746,12 +937,19 @@ def test_create_order_exception_keeps_pending_and_cid_registration():
     cfg = LiveConfig(symbols=["BTC/USDT:USDT"], dry_run=False)
     trader = LiveTrader(cfg, ex)
     trader.exchange_params["BTC/USDT:USDT"] = ExchangeParams(
-        qty_step=0.001, price_step=0.01, min_qty=0.001, min_cost=5.0,
+        qty_step=0.001,
+        price_step=0.01,
+        min_qty=0.001,
+        min_cost=5.0,
     )
     trader.account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
     o = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
-        source=OrderSource.TREND, is_market=True,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
+        source=OrderSource.TREND,
+        is_market=True,
         client_order_id="cb-trend-net-fail",
     )
     asyncio.run(trader._create_order(o))
@@ -768,7 +966,10 @@ def test_cid_cache_outlives_recent_creates_window():
     to cOID-match the exchange's still-open order."""
     trader = _trader()
     o = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
         source=OrderSource.GRID,
     )
     asyncio.run(trader._reconcile_orders([o]))
@@ -813,12 +1014,18 @@ def test_fuzzy_match_refuses_when_reduce_only_disagrees():
     ccxt 'sell' side, price, and qty."""
     trader = _trader()
     long_close = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
-        source=OrderSource.GRID, reduce_only=True,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
+        source=OrderSource.GRID,
+        reduce_only=True,
         client_order_id="cb-long-close",
     )
     short_entry_open_order = {
-        "side": "sell", "price": 50_000.0, "amount": 0.01,
+        "side": "sell",
+        "price": 50_000.0,
+        "amount": 0.01,
         "reduceOnly": False,
         # No clientOrderId echo — exercise the fuzzy path.
     }

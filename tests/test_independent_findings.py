@@ -19,22 +19,38 @@ Bugs covered:
      to 1-minute bars. Backtests on 1h candles got funding ~60× too
      rarely and a volatility EMA ~60× too slow.
 """
+
 from __future__ import annotations
 
 import pytest
 
 from combo_bot.backtest import BacktestConfig, Backtester
-from combo_bot.correlation import CorrelationGate, CorrelationGateConfig, CorrelationTracker
+from combo_bot.correlation import (
+    CorrelationGate,
+    CorrelationGateConfig,
+    CorrelationTracker,
+)
 from combo_bot.grid_engine import GridConfig, GridEngine
 from combo_bot.protections import (
-    CooldownPeriod, CooldownPeriodConfig, ProtectionManager,
-    StoplossGuard, StoplossGuardConfig,
+    CooldownPeriod,
+    CooldownPeriodConfig,
+    StoplossGuard,
+    StoplossGuardConfig,
 )
 from combo_bot.types import (
-    AccountState, Candle, EMAState, ExchangeParams, Fill, Order,
-    OrderSource, Position, Side, SymbolState, TradingMode, VolatilityState,
+    AccountState,
+    Candle,
+    EMAState,
+    ExchangeParams,
+    Fill,
+    Order,
+    OrderSource,
+    Position,
+    Side,
+    SymbolState,
+    TradingMode,
+    VolatilityState,
 )
-
 
 # ────────────────────────────────────────────────────────────────────
 # Bug 1: correlation tracker temporal misalignment via zero closes
@@ -83,6 +99,7 @@ def test_correlation_returns_zero_when_too_few_paired_samples():
     tracker = CorrelationTracker(window=10)
     # Only one valid paired return possible.
     import collections
+
     tracker._closes["A"] = collections.deque([100.0, 0.0, 105.0], maxlen=10)
     tracker._closes["B"] = collections.deque([200.0, 0.0, 210.0], maxlen=10)
     assert tracker.correlation("A", "B") == 0.0
@@ -95,15 +112,24 @@ def test_correlation_returns_zero_when_too_few_paired_samples():
 
 def test_stoploss_guard_counts_gross_positive_but_net_negative_as_loss():
     """A fill with gross +$0.10 PnL and $0.50 in fees is a real loss."""
-    guard = StoplossGuard(StoplossGuardConfig(
-        lookback_period_ms=60_000,
-        trade_limit=1,
-        stop_duration_ms=30_000,
-    ))
+    guard = StoplossGuard(
+        StoplossGuardConfig(
+            lookback_period_ms=60_000,
+            trade_limit=1,
+            stop_duration_ms=30_000,
+        )
+    )
     fee_eating = [
-        Fill(timestamp=1000, symbol="BTC/USDT:USDT", side=Side.LONG,
-             price=50000.0, qty=0.001, fee=0.5, realized_pnl=0.1,
-             source=OrderSource.GRID),
+        Fill(
+            timestamp=1000,
+            symbol="BTC/USDT:USDT",
+            side=Side.LONG,
+            price=50000.0,
+            qty=0.001,
+            fee=0.5,
+            realized_pnl=0.1,
+            source=OrderSource.GRID,
+        ),
     ]
     locks = guard.evaluate(fee_eating, AccountState(balance=10000), now_ms=2000)
     assert len(locks) == 1, "fee-eating close should trigger StoplossGuard"
@@ -112,9 +138,16 @@ def test_stoploss_guard_counts_gross_positive_but_net_negative_as_loss():
 def test_cooldown_period_counts_gross_positive_but_net_negative_as_loss():
     cd = CooldownPeriod(CooldownPeriodConfig())
     fee_eating = [
-        Fill(timestamp=1000, symbol="BTC/USDT:USDT", side=Side.LONG,
-             price=50000.0, qty=0.001, fee=0.5, realized_pnl=0.1,
-             source=OrderSource.GRID),
+        Fill(
+            timestamp=1000,
+            symbol="BTC/USDT:USDT",
+            side=Side.LONG,
+            price=50000.0,
+            qty=0.001,
+            fee=0.5,
+            realized_pnl=0.1,
+            source=OrderSource.GRID,
+        ),
     ]
     locks = cd.evaluate(fee_eating, AccountState(balance=10000), now_ms=2000)
     assert len(locks) == 1, "fee-eating close should trigger CooldownPeriod"
@@ -124,9 +157,16 @@ def test_cooldown_period_still_skips_clear_wins():
     """A solidly profitable close should NOT lock anything."""
     cd = CooldownPeriod(CooldownPeriodConfig())
     win = [
-        Fill(timestamp=1000, symbol="BTC/USDT:USDT", side=Side.LONG,
-             price=50000.0, qty=0.001, fee=0.05, realized_pnl=10.0,
-             source=OrderSource.GRID),
+        Fill(
+            timestamp=1000,
+            symbol="BTC/USDT:USDT",
+            side=Side.LONG,
+            price=50000.0,
+            qty=0.001,
+            fee=0.05,
+            realized_pnl=10.0,
+            source=OrderSource.GRID,
+        ),
     ]
     locks = cd.evaluate(win, AccountState(balance=10000), now_ms=2000)
     assert locks == []
@@ -141,9 +181,9 @@ def test_grid_spacing_widens_as_cumulative_position_grows():
     """Subsequent levels must be further apart (in %) than the first
     couple, because cumulative wallet exposure has grown into them."""
     cfg = GridConfig(
-        entry_initial_qty_pct=0.05,            # bigger initial → faster WE growth
+        entry_initial_qty_pct=0.05,  # bigger initial → faster WE growth
         entry_grid_spacing_pct=0.02,
-        entry_grid_spacing_we_weight=2.0,      # WE multiplier dominates
+        entry_grid_spacing_we_weight=2.0,  # WE multiplier dominates
         entry_grid_spacing_volatility_weight=0.0,
         entry_grid_double_down_factor=1.3,
         wallet_exposure_limit=2.0,
@@ -153,12 +193,18 @@ def test_grid_spacing_widens_as_cumulative_position_grows():
     ema = EMAState()
     ema.init([385.0, 620.0], 50000.0)
     vol = VolatilityState()
-    vol.init(1000.0, 0.0)                      # vol component disabled
+    vol.init(1000.0, 0.0)  # vol component disabled
     ep = ExchangeParams(qty_step=0.0001, price_step=0.01, min_qty=0.0001, min_cost=5.0)
     orders = engine._compute_entry_orders(
-        symbol="BTC/USDT:USDT", side=Side.LONG, position=Position(),
-        ema_state=ema, volatility=vol, balance=100_000.0,
-        wallet_exposure=0.0, exchange_params=ep, mode=TradingMode.NORMAL,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        position=Position(),
+        ema_state=ema,
+        volatility=vol,
+        balance=100_000.0,
+        wallet_exposure=0.0,
+        exchange_params=ep,
+        mode=TradingMode.NORMAL,
     )
     # Need at least 4 levels to compare early vs late spacing.
     assert len(orders) >= 4
@@ -186,11 +232,11 @@ def test_backtest_funding_respects_bar_interval():
     cfg = BacktestConfig(
         starting_balance=10000.0,
         funding_interval_hours=8,
-        funding_rate_default=0.0,    # zero rate → no balance perturbation, only counter trips
+        funding_rate_default=0.0,  # zero rate → no balance perturbation, only counter trips
         bar_interval_minutes=60.0,
         symbols=[],
     )
-    bt = Backtester(cfg)
+    Backtester(cfg)
     # Hand-simulate the loop's funding-trip arithmetic.
     fired = []
     funding_hour_counter = 0
@@ -199,9 +245,10 @@ def test_backtest_funding_respects_bar_interval():
         if int(hours_elapsed / cfg.funding_interval_hours) > funding_hour_counter:
             funding_hour_counter = int(hours_elapsed / cfg.funding_interval_hours)
             fired.append(step + 1)  # bar index when funding fires
-    assert fired == [8, 16], (
-        f"with 60m bars + 8h funding, expected funding at bars 8 and 16; got {fired}"
-    )
+    assert fired == [
+        8,
+        16,
+    ], f"with 60m bars + 8h funding, expected funding at bars 8 and 16; got {fired}"
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -234,9 +281,13 @@ def test_adjust_trade_position_emits_grid_source():
     account = AccountState(balance=10_000)
     account.symbols["BTC/USDT:USDT"] = ss
     ctx = TradeContext(
-        symbol="BTC/USDT:USDT", side=Side.LONG, position=pos,
-        account=account, candle=Candle(0, 51_000, 51_000, 51_000, 51_000, 0),
-        signal=None, current_time_ms=0,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        position=pos,
+        account=account,
+        candle=Candle(0, 51_000, 51_000, 51_000, 51_000, 0),
+        signal=None,
+        current_time_ms=0,
         exchange_params=ExchangeParams(),
     )
     order = runner.check_position_adjustment(ctx)
@@ -289,20 +340,15 @@ def test_backtest_invokes_strategy_populate_methods():
     ]
     bt.run({"BTC/USDT:USDT": candles})
     # The probe must have been invoked at least once per tick × hook.
-    assert "indicators" in _ProbeStrategy.invocations, (
-        "populate_indicators must be called from Backtester tick loop"
-    )
-    assert "entry" in _ProbeStrategy.invocations, (
-        "populate_entry_trend must be called"
-    )
-    assert "exit" in _ProbeStrategy.invocations, (
-        "populate_exit_trend must be called"
-    )
+    assert (
+        "indicators" in _ProbeStrategy.invocations
+    ), "populate_indicators must be called from Backtester tick loop"
+    assert "entry" in _ProbeStrategy.invocations, "populate_entry_trend must be called"
+    assert "exit" in _ProbeStrategy.invocations, "populate_exit_trend must be called"
 
 
 def test_strategy_entry_signal_actually_reaches_read_strategy_signals():
     """After populate_* runs, read_strategy_signals must see the columns."""
-    from combo_bot.data_provider import DataProvider
     from combo_bot.regime import read_strategy_signals
     from combo_bot.strategy import IStrategy
 
@@ -342,6 +388,7 @@ def test_strategy_entry_signal_actually_reaches_read_strategy_signals():
 def test_rust_adapter_emits_entries_in_aggressive_mode():
     pytest.importorskip("combo_futures_core")
     from combo_bot.rust_adapter import RUST_AVAILABLE, compute_grid_orders_rust
+
     if not RUST_AVAILABLE:
         pytest.skip("rust core not built")
 
@@ -356,12 +403,32 @@ def test_rust_adapter_emits_entries_in_aggressive_mode():
     pos = Position()
 
     normal = compute_grid_orders_rust(
-        "BTC", Side.LONG, pos, ema, vol, 10_000.0, 49_900.0, 50_000.0,
-        ep, cfg, TradingMode.NORMAL, max_levels=5,
+        "BTC",
+        Side.LONG,
+        pos,
+        ema,
+        vol,
+        10_000.0,
+        49_900.0,
+        50_000.0,
+        ep,
+        cfg,
+        TradingMode.NORMAL,
+        max_levels=5,
     )
     aggressive = compute_grid_orders_rust(
-        "BTC", Side.LONG, pos, ema, vol, 10_000.0, 49_900.0, 50_000.0,
-        ep, cfg, TradingMode.AGGRESSIVE, max_levels=5,
+        "BTC",
+        Side.LONG,
+        pos,
+        ema,
+        vol,
+        10_000.0,
+        49_900.0,
+        50_000.0,
+        ep,
+        cfg,
+        TradingMode.AGGRESSIVE,
+        max_levels=5,
     )
     assert len(normal) > 0
     assert len(aggressive) > 0, (
@@ -397,8 +464,7 @@ def test_unrealized_pnl_requires_side():
 
 
 def test_trend_overlay_entry_is_market():
-    from combo_bot.regime import RegimeArbiter, RegimeArbiterConfig
-    from combo_bot.types import RegimeView, TrendSignal
+    from combo_bot.types import RegimeView
 
     cfg = BacktestConfig(starting_balance=10_000.0)
     bt = Backtester(cfg)
@@ -407,16 +473,29 @@ def test_trend_overlay_entry_is_market():
     ep = ExchangeParams(min_qty=0.0001, min_cost=5.0)
     # Synthesize a strong-bull regime view that activates a long overlay.
     rv = RegimeView(
-        primary=__import__("combo_bot").combo_bot.types.TrendRegime.STRONG_BULL
-        if hasattr(__import__("combo_bot"), "combo_bot") else
-        __import__("combo_bot.types", fromlist=["TrendRegime"]).TrendRegime.STRONG_BULL,
-        conviction=0.8, long_mode=TradingMode.AGGRESSIVE,
-        short_mode=TradingMode.PANIC, allow_grid_long=True, allow_grid_short=False,
-        trend_overlay=Side.LONG, trend_qty_scale=0.5,
-        close_aggressiveness=1.0, veto_reasons=(),
+        primary=(
+            __import__("combo_bot").combo_bot.types.TrendRegime.STRONG_BULL
+            if hasattr(__import__("combo_bot"), "combo_bot")
+            else __import__(
+                "combo_bot.types", fromlist=["TrendRegime"]
+            ).TrendRegime.STRONG_BULL
+        ),
+        conviction=0.8,
+        long_mode=TradingMode.AGGRESSIVE,
+        short_mode=TradingMode.PANIC,
+        allow_grid_long=True,
+        allow_grid_short=False,
+        trend_overlay=Side.LONG,
+        trend_qty_scale=0.5,
+        close_aggressiveness=1.0,
+        veto_reasons=(),
     )
     orders = bt._emit_trend_overlay(
-        "BTC/USDT:USDT", rv, price=50_000.0, account=bt.account, exchange=ep,
+        "BTC/USDT:USDT",
+        rv,
+        price=50_000.0,
+        account=bt.account,
+        exchange=ep,
     )
     assert len(orders) == 1
     assert orders[0].is_market is True, (
@@ -458,11 +537,19 @@ def test_live_create_order_quantizes_qty_to_step():
     cfg = LiveConfig(symbols=["BTC/USDT:USDT"], dry_run=False)
     trader = LiveTrader(cfg, ex)
     trader.exchange_params["BTC/USDT:USDT"] = ExchangeParams(
-        qty_step=0.001, price_step=0.01, min_qty=0.001, min_cost=5.0,
+        qty_step=0.001,
+        price_step=0.01,
+        min_qty=0.001,
+        min_cost=5.0,
     )
     # qty=0.0123 is NOT aligned with qty_step=0.001 — quantize floor → 0.012.
-    o = Order(symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0,
-              qty=0.0123, source=OrderSource.GRID)
+    o = Order(
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.0123,
+        source=OrderSource.GRID,
+    )
     asyncio.run(trader._create_order(o))
     assert ex.last == pytest.approx(0.012), (
         f"expected quantized qty 0.012, got {ex.last} — _create_order must "
@@ -503,8 +590,9 @@ def test_strategy_enter_does_not_punch_through_panic_or_graceful_stop():
     arbiter = RegimeArbiter(RegimeArbiterConfig())
     # STRONG_BEAR forces long_mode=PANIC (panic_close_opposite). A
     # strategy enter_long must NOT override the risk-driven PANIC.
-    strong_bear = TrendSignal(direction=-0.9, strength=0.9,
-                              regime=TrendRegime.STRONG_BEAR)
+    strong_bear = TrendSignal(
+        direction=-0.9, strength=0.9, regime=TrendRegime.STRONG_BEAR
+    )
     rv = arbiter.compute(strong_bear, strategy_enter_long=True)
     assert rv.long_mode == TradingMode.PANIC, (
         "strategy enter must not override a risk-driven PANIC mode; "
@@ -519,7 +607,9 @@ def test_strategy_exit_wins_over_strategy_enter_on_same_side():
     arbiter = RegimeArbiter(RegimeArbiterConfig())
     neutral = TrendSignal(direction=0.0, strength=0.0, regime=TrendRegime.NEUTRAL)
     rv = arbiter.compute(
-        neutral, strategy_enter_long=True, strategy_exit_long=True,
+        neutral,
+        strategy_enter_long=True,
+        strategy_exit_long=True,
     )
     # Exit-on-same-side should leave us at TP_ONLY, not AGGRESSIVE.
     assert rv.long_mode == TradingMode.TP_ONLY, (
@@ -538,12 +628,17 @@ def test_strategy_exit_wins_over_strategy_enter_on_same_side():
 
 def test_risk_filter_accumulates_projected_exposure():
     from combo_bot.risk import RiskConfig, RiskManager
-    risk = RiskManager(RiskConfig(
-        max_total_wallet_exposure=1.0,
-        max_single_exposure=0.5,
-    ))
+
+    risk = RiskManager(
+        RiskConfig(
+            max_total_wallet_exposure=1.0,
+            max_single_exposure=0.5,
+        )
+    )
     account = AccountState(
-        balance=10_000.0, equity=10_000.0, equity_peak=10_000.0,
+        balance=10_000.0,
+        equity=10_000.0,
+        equity_peak=10_000.0,
     )
     account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
     # Three identical entries each costing 40% of single_exposure.
@@ -551,16 +646,24 @@ def test_risk_filter_accumulates_projected_exposure():
     # (zero existing exposure → 40% < 50%). Post-fix: first passes,
     # second pushes us past 50%, gets dropped, third also dropped.
     orders = [
-        Order(symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0,
-              qty=0.1,  # cost = 5000, we = 5000/10000 = 0.5 == max_single
-              source=OrderSource.GRID)
+        Order(
+            symbol="BTC/USDT:USDT",
+            side=Side.LONG,
+            price=50_000.0,
+            qty=0.1,  # cost = 5000, we = 5000/10000 = 0.5 == max_single
+            source=OrderSource.GRID,
+        )
         for _ in range(3)
     ]
     # Tweak qty so each is 40% (just under max single)
     orders = [
-        Order(symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0,
-              qty=0.08,  # cost=4000, we=0.4 per order
-              source=OrderSource.GRID)
+        Order(
+            symbol="BTC/USDT:USDT",
+            side=Side.LONG,
+            price=50_000.0,
+            qty=0.08,  # cost=4000, we=0.4 per order
+            source=OrderSource.GRID,
+        )
         for _ in range(3)
     ]
     out = risk._enforce_exposure_limits(orders, account)
@@ -577,29 +680,46 @@ def test_correlation_gate_accumulates_same_tick_entries():
     must see the FIRST same-tick entry as already-existing exposure."""
     import collections
 
-    from combo_bot.correlation import CorrelationGate, CorrelationGateConfig
-
-    gate = CorrelationGate(CorrelationGateConfig(
-        window=10, min_samples=3, soft_threshold=0.6, hard_threshold=0.9,
-    ))
+    gate = CorrelationGate(
+        CorrelationGateConfig(
+            window=10,
+            min_samples=3,
+            soft_threshold=0.6,
+            hard_threshold=0.9,
+        )
+    )
     # Two highly correlated symbols.
     gate.tracker._closes["BTC/USDT:USDT"] = collections.deque(
-        [100, 101, 102, 103, 104, 105], maxlen=10,
+        [100, 101, 102, 103, 104, 105],
+        maxlen=10,
     )
     gate.tracker._closes["ETH/USDT:USDT"] = collections.deque(
-        [200, 202, 204, 206, 208, 210], maxlen=10,
+        [200, 202, 204, 206, 208, 210],
+        maxlen=10,
     )
     account = AccountState(
-        balance=10_000.0, equity=10_000.0, equity_peak=10_000.0,
+        balance=10_000.0,
+        equity=10_000.0,
+        equity_peak=10_000.0,
     )
     account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
     account.symbols["ETH/USDT:USDT"] = SymbolState(symbol="ETH/USDT:USDT")
     # First long entry on BTC, then long entry on ETH (correlated).
     orders = [
-        Order(symbol="BTC/USDT:USDT", side=Side.LONG, price=105.0, qty=10,
-              source=OrderSource.GRID),
-        Order(symbol="ETH/USDT:USDT", side=Side.LONG, price=210.0, qty=10,
-              source=OrderSource.GRID),
+        Order(
+            symbol="BTC/USDT:USDT",
+            side=Side.LONG,
+            price=105.0,
+            qty=10,
+            source=OrderSource.GRID,
+        ),
+        Order(
+            symbol="ETH/USDT:USDT",
+            side=Side.LONG,
+            price=210.0,
+            qty=10,
+            source=OrderSource.GRID,
+        ),
     ]
     out = gate.filter_orders(orders, account)
     # Without accumulation, BTC entry passes (no other open positions)
@@ -640,9 +760,7 @@ def test_trend_overlay_passes_through_strategy_veto():
             return df
 
         def confirm_trade_entry(self, ctx, proposed_qty, proposed_price):
-            _VetoAllStrategy.veto_calls.append(
-                (ctx.symbol, ctx.side, proposed_qty)
-            )
+            _VetoAllStrategy.veto_calls.append((ctx.symbol, ctx.side, proposed_qty))
             return False  # veto everything
 
     _VetoAllStrategy.veto_calls = []
@@ -656,8 +774,14 @@ def test_trend_overlay_passes_through_strategy_veto():
     bt = Backtester(cfg, strategy=_VetoAllStrategy())
     # Synthesize 100 ascending candles to drive STRONG_BULL.
     candles = [
-        Candle(timestamp=i * 60_000, open=100 + i, high=101 + i,
-               low=99 + i, close=100 + i, volume=1)
+        Candle(
+            timestamp=i * 60_000,
+            open=100 + i,
+            high=101 + i,
+            low=99 + i,
+            close=100 + i,
+            volume=1,
+        )
         for i in range(120)
     ]
     bt.run({"BTC/USDT:USDT": candles})
@@ -667,14 +791,10 @@ def test_trend_overlay_passes_through_strategy_veto():
     if _VetoAllStrategy.veto_calls:
         # The veto must actually drop trend entries — confirm by
         # checking that no fills were tagged as TREND source.
-        trend_fills = [f for f in bt._latest_fills if f.source.value == "trend"] \
-            if hasattr(bt, "_latest_fills") else []
-        # The above guard exists because we don't expose fills on the
-        # bt object; the real check is the veto_calls list being
-        # populated, which itself proves the wiring.
-        assert any(
-            c[1] in (Side.LONG, Side.SHORT) for c in _VetoAllStrategy.veto_calls
-        )
+        # The real check is the veto_calls list being populated, which
+        # itself proves the wiring — we don't currently expose fills on
+        # the backtester so we can't directly assert "no TREND fills".
+        assert any(c[1] in (Side.LONG, Side.SHORT) for c in _VetoAllStrategy.veto_calls)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -688,15 +808,23 @@ def test_trend_overlay_passes_through_strategy_veto():
 def test_yellow_risk_scaling_preserves_is_market():
     from combo_bot.risk import RiskConfig, RiskManager
 
-    risk = RiskManager(RiskConfig(
-        yellow_threshold=0.05, orange_threshold=0.5, red_threshold=0.99,
-    ))
+    risk = RiskManager(
+        RiskConfig(
+            yellow_threshold=0.05,
+            orange_threshold=0.5,
+            red_threshold=0.99,
+        )
+    )
     account = AccountState(balance=10_000.0, equity=9_400.0, equity_peak=10_000.0)
     account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
     # Construct a trend overlay-style market order.
     market_order = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
-        source=OrderSource.TREND, is_market=True,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
+        source=OrderSource.TREND,
+        is_market=True,
     )
     filtered = risk.filter_orders([market_order], account, timestamp=0)
     assert len(filtered) == 1, "YELLOW should scale, not drop"
@@ -742,21 +870,34 @@ def test_reconcile_quantizes_and_dedup_uses_post_quantize_qty():
     cfg = LiveConfig(symbols=["BTC/USDT:USDT"], dry_run=False)
     trader = LiveTrader(cfg, ex)
     trader.exchange_params["BTC/USDT:USDT"] = ExchangeParams(
-        qty_step=0.001, price_step=0.01, min_qty=0.001, min_cost=5.0,
+        qty_step=0.001,
+        price_step=0.01,
+        min_qty=0.001,
+        min_cost=5.0,
     )
     trader.account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
 
     # First tick: sizer outputs 0.00723 → quantize to 0.007.
-    o1 = Order(symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0,
-               qty=0.00723, source=OrderSource.GRID)
+    o1 = Order(
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.00723,
+        source=OrderSource.GRID,
+    )
     asyncio.run(trader._reconcile_orders([o1]))
     assert len(ex.created) == 1
     assert ex.created[0] == pytest.approx(0.007)
 
     # Second tick: sizer outputs a slightly different 0.00729 → still
     # quantizes to 0.007. Dedup MUST recognise this as a duplicate.
-    o2 = Order(symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0,
-               qty=0.00729, source=OrderSource.GRID)
+    o2 = Order(
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.00729,
+        source=OrderSource.GRID,
+    )
     asyncio.run(trader._reconcile_orders([o2]))
     assert len(ex.created) == 1, (
         f"second order with different raw qty but same quantized qty must "
@@ -789,12 +930,20 @@ def test_reconcile_drops_orders_below_min_cost_after_quantize():
     # qty_step=0.001 OK, but min_cost=100 means at qty 0.001 × price 50
     # = 0.05 (way below min_cost).
     trader.exchange_params["BTC/USDT:USDT"] = ExchangeParams(
-        qty_step=0.001, price_step=0.01, min_qty=0.001, min_cost=100.0,
+        qty_step=0.001,
+        price_step=0.01,
+        min_qty=0.001,
+        min_cost=100.0,
     )
     trader.account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
 
-    o = Order(symbol="BTC/USDT:USDT", side=Side.LONG, price=50.0,
-              qty=0.001, source=OrderSource.GRID)
+    o = Order(
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50.0,
+        qty=0.001,
+        source=OrderSource.GRID,
+    )
     asyncio.run(trader._reconcile_orders([o]))
     assert ex.created == [], (
         "order whose POST-QUANTIZE cost is below min_cost must be dropped "
@@ -835,7 +984,8 @@ def test_trend_bucket_round_trips_through_state_file():
         trader_a = LiveTrader(cfg_a, ex_a)
         trader_a.account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
         trader_a.account.symbols["BTC/USDT:USDT"].trend_long = Position(
-            size=0.05, entry_price=50_000.0,
+            size=0.05,
+            entry_price=50_000.0,
         )
         asyncio.run(trader_a._save_state())
 
@@ -884,23 +1034,23 @@ def test_refresh_candles_deduplicates_by_timestamp():
         async def fetch_positions(self, *_a, **_k):
             return []
 
-    bars = [
-        [i * 60_000, 100.0, 101.0, 99.0, 100.0 + (i % 3), 1.0]
-        for i in range(5)
-    ]
+    bars = [[i * 60_000, 100.0, 101.0, 99.0, 100.0 + (i % 3), 1.0] for i in range(5)]
     ex = _CandleStub(bars)
     cfg = LiveConfig(symbols=["BTC/USDT:USDT"], dry_run=True)
     trader = LiveTrader(cfg, ex)
     trader.exchange_params["BTC/USDT:USDT"] = ExchangeParams(
-        qty_step=0.001, price_step=0.01, min_qty=0.001, min_cost=5.0,
+        qty_step=0.001,
+        price_step=0.01,
+        min_qty=0.001,
+        min_cost=5.0,
     )
     trader.account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
 
     asyncio.run(trader._refresh_candles())
     history_len_after_first = len(trader.trend._history["BTC/USDT:USDT"])
-    assert history_len_after_first == 5, (
-        f"first refresh should ingest 5 bars; got {history_len_after_first}"
-    )
+    assert (
+        history_len_after_first == 5
+    ), f"first refresh should ingest 5 bars; got {history_len_after_first}"
 
     # Second refresh with the SAME bars: must be a no-op for trend
     # history (every bar's ts <= last_ts).
@@ -927,11 +1077,15 @@ def test_refresh_candles_deduplicates_by_timestamp():
 def test_yellow_risk_still_enforces_hard_cap():
     from combo_bot.risk import RiskConfig, RiskManager
 
-    risk = RiskManager(RiskConfig(
-        yellow_threshold=0.05, orange_threshold=0.5, red_threshold=0.99,
-        max_total_wallet_exposure=0.5,    # tight cap
-        max_single_exposure=0.5,
-    ))
+    risk = RiskManager(
+        RiskConfig(
+            yellow_threshold=0.05,
+            orange_threshold=0.5,
+            red_threshold=0.99,
+            max_total_wallet_exposure=0.5,  # tight cap
+            max_single_exposure=0.5,
+        )
+    )
     account = AccountState(balance=10_000.0, equity=9_400.0, equity_peak=10_000.0)
     account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
     # Three orders, each costing 30% WE pre-scale. After 50% YELLOW
@@ -941,20 +1095,28 @@ def test_yellow_risk_still_enforces_hard_cap():
     # push past 50% and is dropped (NOT due to YELLOW, but due to the
     # cumulative projection in _enforce_exposure_limits).
     orders = [
-        Order(symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0,
-              qty=0.06,  # raw cost 3000 → we 0.3; after YELLOW *0.5 → 0.15
-              source=OrderSource.GRID)
+        Order(
+            symbol="BTC/USDT:USDT",
+            side=Side.LONG,
+            price=50_000.0,
+            qty=0.06,  # raw cost 3000 → we 0.3; after YELLOW *0.5 → 0.15
+            source=OrderSource.GRID,
+        )
         for _ in range(3)
     ]
-    out = risk.filter_orders(orders, account, timestamp=0)
+    risk.filter_orders(orders, account, timestamp=0)
     # All three reduced to qty 0.03 (we 0.15 each). First two cumulate
     # to 0.3, third would push to 0.45 (still under 0.5), so all 3
     # should pass with a TIGHT cap=0.5. Drop cap to verify:
-    risk2 = RiskManager(RiskConfig(
-        yellow_threshold=0.05, orange_threshold=0.5, red_threshold=0.99,
-        max_total_wallet_exposure=0.30,   # < 3 × 0.15
-        max_single_exposure=0.30,
-    ))
+    risk2 = RiskManager(
+        RiskConfig(
+            yellow_threshold=0.05,
+            orange_threshold=0.5,
+            red_threshold=0.99,
+            max_total_wallet_exposure=0.30,  # < 3 × 0.15
+            max_single_exposure=0.30,
+        )
+    )
     out2 = risk2.filter_orders(orders, account, timestamp=0)
     assert len(out2) == 2, (
         f"with cap 0.30 and 3 orders each contributing 0.15 post-YELLOW, "
@@ -973,13 +1135,15 @@ def test_unstuck_qty_scales_to_remaining_allowance():
     from combo_bot.risk import RiskConfig, RiskManager
 
     # Tiny allowance (0.001% of balance), large position deep underwater.
-    risk = RiskManager(RiskConfig(
-        unstuck_threshold=0.5,
-        unstuck_close_pct=1.0,     # would normally try to close the full position
-        unstuck_ema_dist=0.0,
-        daily_loss_allowance_pct=0.00001,  # $0.10 on $10k
-        trend_wallet_exposure_limit=1.0,
-    ))
+    risk = RiskManager(
+        RiskConfig(
+            unstuck_threshold=0.5,
+            unstuck_close_pct=1.0,  # would normally try to close the full position
+            unstuck_ema_dist=0.0,
+            daily_loss_allowance_pct=0.00001,  # $0.10 on $10k
+            trend_wallet_exposure_limit=1.0,
+        )
+    )
     account = AccountState(balance=10_000.0, equity=10_000.0, equity_peak=10_000.0)
     ss = SymbolState(symbol="BTC/USDT:USDT")
     ss.position_long = Position(size=10.0, entry_price=2_000.0)  # notional 20k
@@ -989,7 +1153,9 @@ def test_unstuck_qty_scales_to_remaining_allowance():
     ss.ema.values = [950.0, 940.0]
     account.symbols["BTC/USDT:USDT"] = ss
     orders = risk.compute_unstuck_orders(
-        account, grid_wallet_exposure_limit=2.0, now_ms=0,
+        account,
+        grid_wallet_exposure_limit=2.0,
+        now_ms=0,
     )
     if orders:
         # The projected loss = qty * (entry - order_price) = qty * (2000 - ~950).
@@ -997,8 +1163,8 @@ def test_unstuck_qty_scales_to_remaining_allowance():
         for o in orders:
             projected_loss_per_unit = (
                 ss.position_long.entry_price - o.price
-                if o.side == Side.LONG else
-                o.price - ss.position_short.entry_price
+                if o.side == Side.LONG
+                else o.price - ss.position_short.entry_price
             )
             if projected_loss_per_unit > 0:
                 loss = o.qty * projected_loss_per_unit
@@ -1024,11 +1190,15 @@ def test_refresh_account_preserves_best_price():
             return {"USDT": {"free": 10_000.0}}
 
         async def fetch_positions(self, _syms):
-            return [{
-                "symbol": "BTC/USDT:USDT", "side": "long",
-                "contracts": 0.05, "entryPrice": 50_000.0,
-                "markPrice": 52_000.0,
-            }]
+            return [
+                {
+                    "symbol": "BTC/USDT:USDT",
+                    "side": "long",
+                    "contracts": 0.05,
+                    "entryPrice": 50_000.0,
+                    "markPrice": 52_000.0,
+                }
+            ]
 
         async def fetch_funding_rate(self, *_a, **_k):
             return {"fundingRate": 0.0}
@@ -1040,7 +1210,9 @@ def test_refresh_account_preserves_best_price():
     trader.account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
     # Pre-seed best_price as if a previous tick had ratcheted to 51k.
     trader.account.symbols["BTC/USDT:USDT"].position_long = Position(
-        size=0.05, entry_price=50_000.0, best_price=51_000.0,
+        size=0.05,
+        entry_price=50_000.0,
+        best_price=51_000.0,
     )
     asyncio.run(trader._refresh_account())
     pos = trader.account.symbols["BTC/USDT:USDT"].position_long
@@ -1084,9 +1256,9 @@ def test_dd_ema_restore_survives_first_assess():
         cfg_b = LiveConfig(symbols=["BTC/USDT:USDT"], state_file=str(state_path))
         trader_b = LiveTrader(cfg_b, ex_b)
         asyncio.run(trader_b._load_state())
-        assert trader_b.risk._dd_initialized is True, (
-            "_dd_initialized must be restored from state file"
-        )
+        assert (
+            trader_b.risk._dd_initialized is True
+        ), "_dd_initialized must be restored from state file"
         # First assess after load must NOT overwrite dd_ema with raw=0
         # via the seeding branch.
         acc = AccountState(balance=10_000.0, equity=10_000.0, equity_peak=10_000.0)
@@ -1108,13 +1280,15 @@ def test_dd_ema_restore_survives_first_assess():
 def test_unstuck_respects_exchange_min_qty_after_allowance_scaling():
     from combo_bot.risk import RiskConfig, RiskManager
 
-    risk = RiskManager(RiskConfig(
-        unstuck_threshold=0.5,
-        unstuck_close_pct=1.0,
-        unstuck_ema_dist=0.0,
-        daily_loss_allowance_pct=0.00001,  # very tight
-        trend_wallet_exposure_limit=1.0,
-    ))
+    risk = RiskManager(
+        RiskConfig(
+            unstuck_threshold=0.5,
+            unstuck_close_pct=1.0,
+            unstuck_ema_dist=0.0,
+            daily_loss_allowance_pct=0.00001,  # very tight
+            trend_wallet_exposure_limit=1.0,
+        )
+    )
     account = AccountState(balance=10_000.0, equity=10_000.0, equity_peak=10_000.0)
     ss = SymbolState(symbol="BTC/USDT:USDT")
     ss.position_long = Position(size=10.0, entry_price=2_000.0)
@@ -1141,13 +1315,15 @@ def test_unstuck_emits_when_allowance_supports_min_qty():
     """Counter-check: with generous allowance and ep, unstuck still emits."""
     from combo_bot.risk import RiskConfig, RiskManager
 
-    risk = RiskManager(RiskConfig(
-        unstuck_threshold=0.5,
-        unstuck_close_pct=0.01,        # 1% of position
-        unstuck_ema_dist=0.0,
-        daily_loss_allowance_pct=0.5,  # half the balance
-        trend_wallet_exposure_limit=1.0,
-    ))
+    risk = RiskManager(
+        RiskConfig(
+            unstuck_threshold=0.5,
+            unstuck_close_pct=0.01,  # 1% of position
+            unstuck_ema_dist=0.0,
+            daily_loss_allowance_pct=0.5,  # half the balance
+            trend_wallet_exposure_limit=1.0,
+        )
+    )
     account = AccountState(balance=10_000.0, equity=10_000.0, equity_peak=10_000.0)
     ss = SymbolState(symbol="BTC/USDT:USDT")
     ss.position_long = Position(size=10.0, entry_price=2_000.0)
@@ -1186,18 +1362,30 @@ def test_simulate_fills_rejects_orders_below_min_qty():
     account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
     ep_map = {
         "BTC/USDT:USDT": ExchangeParams(
-            qty_step=0.001, price_step=0.01, min_qty=0.01, min_cost=5.0,
+            qty_step=0.001,
+            price_step=0.01,
+            min_qty=0.01,
+            min_cost=5.0,
         ),
     }
     # qty 0.0001 is below min_qty 0.01 — even though the limit price is
     # inside the candle range, the simulator must NOT produce a fill.
     too_small = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.0001,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.0001,
         source=OrderSource.GRID,
     )
-    candle = Candle(timestamp=0, open=50_500, high=50_500, low=49_000, close=50_000, volume=1)
+    candle = Candle(
+        timestamp=0, open=50_500, high=50_500, low=49_000, close=50_000, volume=1
+    )
     fills = bt._simulate_fills(
-        [too_small], {"BTC/USDT:USDT": candle}, account, ep_map, timestamp=0,
+        [too_small],
+        {"BTC/USDT:USDT": candle},
+        account,
+        ep_map,
+        timestamp=0,
     )
     assert fills == [], (
         "_simulate_fills must reject sub-min_qty orders so backtest "
@@ -1214,16 +1402,26 @@ def test_simulate_fills_rejects_orders_below_min_cost():
     # qty 0.5: cost = 25 < 100 → must be rejected.
     ep_map = {
         "BTC/USDT:USDT": ExchangeParams(
-            qty_step=0.001, price_step=0.01, min_qty=0.001, min_cost=100.0,
+            qty_step=0.001,
+            price_step=0.01,
+            min_qty=0.001,
+            min_cost=100.0,
         ),
     }
     cheap = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50.0, qty=0.5,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50.0,
+        qty=0.5,
         source=OrderSource.GRID,
     )
     candle = Candle(timestamp=0, open=60, high=60, low=40, close=50, volume=1)
     fills = bt._simulate_fills(
-        [cheap], {"BTC/USDT:USDT": candle}, account, ep_map, timestamp=0,
+        [cheap],
+        {"BTC/USDT:USDT": candle},
+        account,
+        ep_map,
+        timestamp=0,
     )
     assert fills == [], "below-min_cost order must not fill in backtest"
 
@@ -1245,6 +1443,7 @@ def test_simulate_fills_rejects_orders_below_min_cost():
 
 def test_trend_overlay_budget_was_bumped_for_high_risk_profile():
     from combo_bot.merger import MergerConfig
+
     cfg = MergerConfig()
     per_entry_budget = cfg.trend_position_max_pct * cfg.trend_entry_qty_pct
     assert per_entry_budget >= 0.02, (
@@ -1290,18 +1489,21 @@ def test_overlay_scale_floor_still_silences_low_conviction():
 def test_source_pause_threshold_relaxed_when_tier_green():
     """When account is GREEN, source pause needs higher bucket DD to fire."""
     from combo_bot.risk import RiskConfig, RiskManager
-    risk = RiskManager(RiskConfig(
-        pause_trend_dd_pct=0.10,
-        yellow_threshold=0.99,    # ensure tier stays GREEN
-        orange_threshold=0.99,
-        red_threshold=0.99,
-    ))
+
+    risk = RiskManager(
+        RiskConfig(
+            pause_trend_dd_pct=0.10,
+            yellow_threshold=0.99,  # ensure tier stays GREEN
+            orange_threshold=0.99,
+            red_threshold=0.99,
+        )
+    )
     account = AccountState(balance=10_000, equity=10_000, equity_peak=10_000)
     account.symbols["BTC"] = SymbolState(symbol="BTC")
     # Trend bucket DD = 12% — above 0.10 strict, below 0.15 (the 1.5×
     # GREEN relax). Pre-fix: paused. Post-fix: still trades.
     account.trend_equity_peak = 2000.0
-    account.trend_equity = 800.0   # (2000-800)/10000 = 12%
+    account.trend_equity = 800.0  # (2000-800)/10000 = 12%
     orders = [Order("BTC", Side.LONG, 50_000, 0.01, OrderSource.TREND)]
     out = risk.filter_orders(orders, account, timestamp=0)
     assert len(out) == 1, (
@@ -1313,11 +1515,13 @@ def test_source_pause_threshold_relaxed_when_tier_green():
 def test_red_latch_auto_releases_after_window():
     from combo_bot.hsl import HslConfig, HslSupervisor
 
-    hsl = HslSupervisor(HslConfig(
-        red_threshold=0.20,
-        red_latch_enabled=True,
-        red_latch_auto_release_minutes=60,
-    ))
+    hsl = HslSupervisor(
+        HslConfig(
+            red_threshold=0.20,
+            red_latch_enabled=True,
+            red_latch_auto_release_minutes=60,
+        )
+    )
     # Drive account into RED at t=0.
     deep_dd = AccountState(balance=10_000, equity=7_500, equity_peak=10_000)
     hsl.assess(deep_dd, timestamp_ms=0)
@@ -1339,17 +1543,21 @@ def test_red_latch_auto_releases_after_window():
         "drawdown has recovered"
     )
     from combo_bot.hsl import HslTier
+
     assert tier_after == HslTier.GREEN
 
 
 def test_red_latch_auto_release_disabled_with_zero_minutes():
     """Setting release_minutes=0 restores passivbot-style manual reset."""
     from combo_bot.hsl import HslConfig, HslSupervisor
-    hsl = HslSupervisor(HslConfig(
-        red_threshold=0.20,
-        red_latch_enabled=True,
-        red_latch_auto_release_minutes=0,    # disabled
-    ))
+
+    hsl = HslSupervisor(
+        HslConfig(
+            red_threshold=0.20,
+            red_latch_enabled=True,
+            red_latch_auto_release_minutes=0,  # disabled
+        )
+    )
     bad = AccountState(balance=10_000, equity=7_500, equity_peak=10_000)
     hsl.assess(bad, timestamp_ms=0)
     assert hsl.red_latched is True

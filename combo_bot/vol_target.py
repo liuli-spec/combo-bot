@@ -55,7 +55,6 @@ from typing import Iterable
 
 from combo_bot.types import Order
 
-
 # Total minutes per year for 1-minute bar annualization.
 # 365 * 24 * 60 = 525,600.
 _MINUTES_PER_YEAR = 525_600
@@ -131,8 +130,8 @@ class VolTargetSizer:
         if var <= 0:
             return 0.0
 
-        per_period_std = var ** 0.5
-        return per_period_std * (self.config.periods_per_year ** 0.5)
+        per_period_std = var**0.5
+        return per_period_std * (self.config.periods_per_year**0.5)
 
     def scale_factor(self) -> float:
         """Sizing multiplier in [scale_min, scale_max].

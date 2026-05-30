@@ -57,7 +57,6 @@ from typing import Iterable
 
 from combo_bot.types import AccountState, Order, Side
 
-
 # ---------------------------------------------------------------------------
 # CorrelationTracker
 # ---------------------------------------------------------------------------
@@ -148,15 +147,13 @@ class CorrelationTracker:
             return 0.0
         mean_a = sum(ra) / n
         mean_b = sum(rb) / n
-        cov = sum(
-            (ra[i] - mean_a) * (rb[i] - mean_b) for i in range(n)
-        ) / n
+        cov = sum((ra[i] - mean_a) * (rb[i] - mean_b) for i in range(n)) / n
         var_a = sum((r - mean_a) ** 2 for r in ra) / n
         var_b = sum((r - mean_b) ** 2 for r in rb) / n
         denom_sq = var_a * var_b
         if denom_sq <= 1e-24:
             return 0.0
-        return cov / (denom_sq ** 0.5)
+        return cov / (denom_sq**0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +197,9 @@ class CorrelationGate:
             self.tracker.update(symbol, close)
 
     def filter_orders(
-        self, orders: list[Order], account: AccountState,
+        self,
+        orders: list[Order],
+        account: AccountState,
     ) -> list[Order]:
         """Scale or drop new entries that increase same-factor exposure.
 
@@ -219,17 +218,18 @@ class CorrelationGate:
                 result.append(order)
                 continue
             max_eff = self._max_effective_correlation(
-                order, account, new_exposure,
+                order,
+                account,
+                new_exposure,
             )
             if max_eff >= self.config.hard_threshold:
                 # Drop — adding here piles onto an already-overcrowded factor.
                 continue
             if max_eff <= self.config.soft_threshold:
                 result.append(order)
-                new_exposure[(order.symbol, order.side)] = (
-                    new_exposure.get((order.symbol, order.side), 0.0)
-                    + abs(order.qty * order.price)
-                )
+                new_exposure[(order.symbol, order.side)] = new_exposure.get(
+                    (order.symbol, order.side), 0.0
+                ) + abs(order.qty * order.price)
                 continue
             # Linear ramp between soft and hard.
             span = self.config.hard_threshold - self.config.soft_threshold
@@ -238,14 +238,15 @@ class CorrelationGate:
             if new_qty <= 0:
                 continue
             result.append(replace(order, qty=new_qty))
-            new_exposure[(order.symbol, order.side)] = (
-                new_exposure.get((order.symbol, order.side), 0.0)
-                + abs(new_qty * order.price)
-            )
+            new_exposure[(order.symbol, order.side)] = new_exposure.get(
+                (order.symbol, order.side), 0.0
+            ) + abs(new_qty * order.price)
         return result
 
     def _max_effective_correlation(
-        self, order: Order, account: AccountState,
+        self,
+        order: Order,
+        account: AccountState,
         new_exposure: dict[tuple[str, Side], float] | None = None,
     ) -> float:
         """Compute the worst-case effective correlation across other

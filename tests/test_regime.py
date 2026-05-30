@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pytest
 
 from combo_bot.data_provider import DataProvider
 from combo_bot.regime import RegimeArbiter, RegimeArbiterConfig, read_strategy_signals
@@ -149,7 +148,6 @@ class TestReadStrategySignals:
         assert read_strategy_signals(dp, "BTC") == (False, False, False, False)
 
     def test_reads_enter_long_from_latest_row(self):
-        import pandas as pd
 
         dp = DataProvider()
         for ts in (1_000, 2_000, 3_000):

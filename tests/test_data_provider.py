@@ -1,20 +1,33 @@
 from __future__ import annotations
 
-import pytest
 
 from combo_bot.data_provider import DataProvider
 from combo_bot.types import Candle
 
 
 def _candle(ts: int, close: float) -> Candle:
-    return Candle(timestamp=ts, open=close, high=close + 1, low=close - 1, close=close, volume=10.0)
+    return Candle(
+        timestamp=ts,
+        open=close,
+        high=close + 1,
+        low=close - 1,
+        close=close,
+        volume=10.0,
+    )
 
 
 class TestDataProvider:
     def test_empty_dataframe_has_expected_columns(self):
         dp = DataProvider()
         df = dp.get_dataframe("BTC")
-        assert list(df.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+        assert list(df.columns) == [
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
         assert len(df) == 0
 
     def test_append_grows_buffer(self):

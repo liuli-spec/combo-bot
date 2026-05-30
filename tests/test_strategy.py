@@ -1,11 +1,23 @@
 from __future__ import annotations
 import pytest
 from combo_bot.strategy import (
-    IStrategy, StrategyRunner, DefaultStrategy, ExampleTrendStrategy, TradeContext,
+    IStrategy,
+    StrategyRunner,
+    DefaultStrategy,
+    ExampleTrendStrategy,
+    TradeContext,
 )
 from combo_bot.types import (
-    AccountState, Candle, ExchangeParams, Order, OrderSource, Position,
-    Side, SymbolState, TradingMode, TrendRegime, TrendSignal,
+    AccountState,
+    Candle,
+    ExchangeParams,
+    Order,
+    OrderSource,
+    Position,
+    Side,
+    SymbolState,
+    TrendRegime,
+    TrendSignal,
 )
 
 
@@ -18,15 +30,24 @@ def default_account():
 
 @pytest.fixture
 def default_candle():
-    return Candle(timestamp=1700000000000, open=50000, high=50100, low=49900,
-                  close=50000, volume=100)
+    return Candle(
+        timestamp=1700000000000,
+        open=50000,
+        high=50100,
+        low=49900,
+        close=50000,
+        volume=100,
+    )
 
 
 @pytest.fixture
 def default_ctx(default_account, default_candle):
     return TradeContext(
-        symbol="BTC", side=Side.LONG, position=Position(),
-        account=default_account, candle=default_candle,
+        symbol="BTC",
+        side=Side.LONG,
+        position=Position(),
+        account=default_account,
+        candle=default_candle,
         signal=TrendSignal(direction=0.5, strength=0.5, regime=TrendRegime.BULL),
         current_time_ms=1700000000000,
         exchange_params=ExchangeParams(),
@@ -54,8 +75,11 @@ class TestExampleStrategy:
     def test_example_vetoes_weak_signal(self, default_account, default_candle):
         s = ExampleTrendStrategy()
         ctx = TradeContext(
-            symbol="BTC", side=Side.LONG, position=Position(),
-            account=default_account, candle=default_candle,
+            symbol="BTC",
+            side=Side.LONG,
+            position=Position(),
+            account=default_account,
+            candle=default_candle,
             signal=TrendSignal(direction=0.2, strength=0.2, regime=TrendRegime.NEUTRAL),
             current_time_ms=1700000000000,
             exchange_params=ExchangeParams(),
@@ -130,13 +154,21 @@ class TestCustomExit:
         pos = Position(size=0.01, entry_price=51000)
         default_account.symbols["BTC"].position_long = pos
         bad_candle = Candle(
-            timestamp=1700000000000, open=49500, high=49600,
-            low=49400, close=49000, volume=100,
+            timestamp=1700000000000,
+            open=49500,
+            high=49600,
+            low=49400,
+            close=49000,
+            volume=100,
         )
         ctx = TradeContext(
-            symbol="BTC", side=Side.LONG, position=pos,
-            account=default_account, candle=bad_candle,
-            signal=None, current_time_ms=1700000000000,
+            symbol="BTC",
+            side=Side.LONG,
+            position=pos,
+            account=default_account,
+            candle=bad_candle,
+            signal=None,
+            current_time_ms=1700000000000,
             exchange_params=ExchangeParams(),
         )
 
@@ -154,13 +186,21 @@ class TestCustomExit:
         ss = default_account.symbols["BTC"]
         ss.trend_long = pos
         candle = Candle(
-            timestamp=1700000000000, open=49500, high=49600,
-            low=49400, close=49000, volume=100,
+            timestamp=1700000000000,
+            open=49500,
+            high=49600,
+            low=49400,
+            close=49000,
+            volume=100,
         )
         ctx = TradeContext(
-            symbol="BTC", side=Side.LONG, position=pos,
-            account=default_account, candle=candle,
-            signal=None, current_time_ms=1700000000000,
+            symbol="BTC",
+            side=Side.LONG,
+            position=pos,
+            account=default_account,
+            candle=candle,
+            signal=None,
+            current_time_ms=1700000000000,
             exchange_params=ExchangeParams(),
             source=OrderSource.TREND,
         )
@@ -183,13 +223,21 @@ class TestPositionAdjustment:
         ss = default_account.symbols["BTC"]
         ss.trend_long = pos
         candle = Candle(
-            timestamp=1700000000000, open=49500, high=49600,
-            low=49400, close=49000, volume=100,
+            timestamp=1700000000000,
+            open=49500,
+            high=49600,
+            low=49400,
+            close=49000,
+            volume=100,
         )
         ctx = TradeContext(
-            symbol="BTC", side=Side.LONG, position=pos,
-            account=default_account, candle=candle,
-            signal=None, current_time_ms=1700000000000,
+            symbol="BTC",
+            side=Side.LONG,
+            position=pos,
+            account=default_account,
+            candle=candle,
+            signal=None,
+            current_time_ms=1700000000000,
             exchange_params=ExchangeParams(),
             source=OrderSource.TREND,
         )

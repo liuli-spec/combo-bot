@@ -1,12 +1,20 @@
 from __future__ import annotations
 import numpy as np
-import pytest
 from tests.conftest import make_candles, make_oscillating_candles
 from combo_bot.backtest import BacktestConfig, Backtester
 from combo_bot.grid_engine import GridConfig
 from combo_bot.merger import MergerConfig
 from combo_bot.risk import RiskConfig
-from combo_bot.types import AccountState, Candle, ExchangeParams, Order, OrderSource, Position, Side, SymbolState
+from combo_bot.types import (
+    AccountState,
+    Candle,
+    ExchangeParams,
+    Order,
+    OrderSource,
+    Position,
+    Side,
+    SymbolState,
+)
 
 
 class TestBacktestSmoke:
@@ -37,7 +45,11 @@ class TestBacktestGridOnly:
         candle = Candle(1700000000000, 50000, 51500, 50500, 51000, 100)
 
         fills = Backtester(BacktestConfig())._simulate_fills(
-            [order], {"BTC": candle}, account, {"BTC": ExchangeParams()}, candle.timestamp,
+            [order],
+            {"BTC": candle},
+            account,
+            {"BTC": ExchangeParams()},
+            candle.timestamp,
         )
 
         assert len(fills) == 1
@@ -52,7 +64,11 @@ class TestBacktestGridOnly:
         candle = Candle(1700000000000, 50000, 49500, 48500, 49000, 100)
 
         fills = Backtester(BacktestConfig())._simulate_fills(
-            [order], {"BTC": candle}, account, {"BTC": ExchangeParams()}, candle.timestamp,
+            [order],
+            {"BTC": candle},
+            account,
+            {"BTC": ExchangeParams()},
+            candle.timestamp,
         )
 
         assert len(fills) == 1
@@ -76,8 +92,9 @@ class TestBacktestGridOnly:
             merger=MergerConfig(mode_switch_strong_threshold=0.99),
         )
         result = Backtester(config).run({"BTC": candles})
-        assert result.final_balance > config.starting_balance, \
-            f"Grid should profit in oscillating market: {result.final_balance}"
+        assert (
+            result.final_balance > config.starting_balance
+        ), f"Grid should profit in oscillating market: {result.final_balance}"
         assert result.n_trades > 10
         assert result.grid_pnl > 0
 
@@ -96,8 +113,20 @@ class TestBacktestGridOnly:
 class TestBacktestMultiSymbol:
     def test_multi_symbol_backtest(self):
         rng = np.random.default_rng(42)
-        btc = make_candles((50000 + 500 * np.sin(np.arange(2000) / 80 * 2 * np.pi) + rng.normal(0, 50, 2000)).tolist())
-        eth = make_candles((3000 + 100 * np.sin(np.arange(2000) / 80 * 2 * np.pi) + rng.normal(0, 5, 2000)).tolist())
+        btc = make_candles(
+            (
+                50000
+                + 500 * np.sin(np.arange(2000) / 80 * 2 * np.pi)
+                + rng.normal(0, 50, 2000)
+            ).tolist()
+        )
+        eth = make_candles(
+            (
+                3000
+                + 100 * np.sin(np.arange(2000) / 80 * 2 * np.pi)
+                + rng.normal(0, 5, 2000)
+            ).tolist()
+        )
 
         config = BacktestConfig(
             starting_balance=10000,

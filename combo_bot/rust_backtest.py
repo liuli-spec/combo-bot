@@ -1,6 +1,6 @@
 from __future__ import annotations
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any
 import numpy as np
 
@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 try:
     import combo_futures_core as _rust
+
     RUST_AVAILABLE = True
 except ImportError:
     _rust = None
@@ -201,9 +202,13 @@ def parallel_backtest_grid(
         arr = candles
 
     if n_workers is None or n_workers <= 1:
-        return [run_rust_backtest(arr, cfg, exchange_params, bt_config) for cfg in grid_configs]
+        return [
+            run_rust_backtest(arr, cfg, exchange_params, bt_config)
+            for cfg in grid_configs
+        ]
 
     from concurrent.futures import ProcessPoolExecutor
+
     ep = exchange_params or ExchangeParams()
     cfg = bt_config or RustBacktestConfig()
     args = [(arr, gcfg, ep, cfg) for gcfg in grid_configs]

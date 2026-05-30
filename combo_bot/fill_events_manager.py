@@ -497,7 +497,7 @@ class FillEventManager:
         # jumped past them — those fills are lost.
         existing_seen = self._seen_ids.setdefault(symbol, [])
         seen_set = set(existing_seen)
-        staged_seen: list[str] = []          # new ids accepted this poll
+        staged_seen: list[str] = []  # new ids accepted this poll
         fresh: list[Fill] = []
         max_ts = since_ms or 0
         # The bot_start filter is ONLY safe for a true cold start:

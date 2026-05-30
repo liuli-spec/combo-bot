@@ -27,7 +27,6 @@ from combo_bot.types import (
     SymbolState,
 )
 
-
 # ---------------------------------------------------------------------------
 # 24h rolling loss log on AccountState
 # ---------------------------------------------------------------------------
@@ -83,7 +82,7 @@ def _ema_state(lower=49_000.0, upper=49_500.0) -> EMAState:
 def _risk(**overrides) -> RiskManager:
     defaults = dict(
         unstuck_threshold=0.90,
-        unstuck_close_pct=0.05,   # 5% per fire — easier to inspect in tests
+        unstuck_close_pct=0.05,  # 5% per fire — easier to inspect in tests
         unstuck_ema_dist=0.01,
         daily_loss_allowance_pct=0.05,
         trend_wallet_exposure_limit=0.15,
@@ -107,13 +106,17 @@ class TestUnstuckTrigger:
         # Grid bucket: 5.5 BTC @ 50k = 275_000 notional / 1_000 balance = WE 275.
         # WEL 300 → ratio 0.916 > 0.90 → stuck.
         acc = _account_with_grid_long(
-            balance=1_000.0, qty=5.5, entry=50_000.0,
+            balance=1_000.0,
+            qty=5.5,
+            entry=50_000.0,
             last_price=50_300.0,  # > upper(49_500) * 1.01 = 49_995
             ema=_ema_state(lower=49_000, upper=49_500),
         )
 
         orders = risk.compute_unstuck_orders(
-            acc, grid_wallet_exposure_limit=300.0, now_ms=0,
+            acc,
+            grid_wallet_exposure_limit=300.0,
+            now_ms=0,
         )
 
         assert len(orders) == 1
@@ -132,11 +135,16 @@ class TestUnstuckTrigger:
         risk = _risk()
         # 4 BTC @ 50k = 200_000 / 1_000 = WE 200. WEL 300 → ratio 0.66.
         acc = _account_with_grid_long(
-            balance=1_000.0, qty=4.0, entry=50_000.0, last_price=50_300.0,
+            balance=1_000.0,
+            qty=4.0,
+            entry=50_000.0,
+            last_price=50_300.0,
             ema=_ema_state(),
         )
         orders = risk.compute_unstuck_orders(
-            acc, grid_wallet_exposure_limit=300.0, now_ms=0,
+            acc,
+            grid_wallet_exposure_limit=300.0,
+            now_ms=0,
         )
         assert orders == []
 
@@ -146,12 +154,16 @@ class TestUnstuckTrigger:
         risk = _risk(unstuck_ema_dist=0.02)
         # Stuck (we/wel 0.916) but price still below upper(49_500) * 1.02 = 50_490.
         acc = _account_with_grid_long(
-            balance=1_000.0, qty=5.5, entry=50_000.0,
+            balance=1_000.0,
+            qty=5.5,
+            entry=50_000.0,
             last_price=49_500.0,  # below 49_500 * 1.02 = 50_490
             ema=_ema_state(upper=49_500),
         )
         orders = risk.compute_unstuck_orders(
-            acc, grid_wallet_exposure_limit=300.0, now_ms=0,
+            acc,
+            grid_wallet_exposure_limit=300.0,
+            now_ms=0,
         )
         assert orders == []
 
@@ -167,7 +179,9 @@ class TestUnstuckTrigger:
         acc.symbols["BTC"] = ss
 
         orders = risk.compute_unstuck_orders(
-            acc, grid_wallet_exposure_limit=300.0, now_ms=0,
+            acc,
+            grid_wallet_exposure_limit=300.0,
+            now_ms=0,
         )
         assert len(orders) == 1
         o = orders[0]
@@ -192,7 +206,9 @@ class TestBucketIndependence:
         acc.symbols["BTC"] = ss
 
         orders = risk.compute_unstuck_orders(
-            acc, grid_wallet_exposure_limit=300.0, now_ms=0,
+            acc,
+            grid_wallet_exposure_limit=300.0,
+            now_ms=0,
         )
         assert len(orders) == 1
         assert orders[0].source == OrderSource.TREND
@@ -209,7 +225,9 @@ class TestBucketIndependence:
         acc.symbols["BTC"] = ss
 
         orders = risk.compute_unstuck_orders(
-            acc, grid_wallet_exposure_limit=300.0, now_ms=0,
+            acc,
+            grid_wallet_exposure_limit=300.0,
+            now_ms=0,
         )
         sources = {o.source for o in orders}
         assert OrderSource.GRID in sources
@@ -225,7 +243,9 @@ class TestBucketIndependence:
         acc.symbols["BTC"] = ss
 
         orders = risk.compute_unstuck_orders(
-            acc, grid_wallet_exposure_limit=300.0, now_ms=0,
+            acc,
+            grid_wallet_exposure_limit=300.0,
+            now_ms=0,
         )
 
         assert len(orders) == 1
@@ -241,14 +261,19 @@ class TestAllowanceThrottle:
     def test_allowance_exhausted_blocks_unstuck(self):
         risk = _risk(daily_loss_allowance_pct=0.01)  # $10 of $1000 balance
         acc = _account_with_grid_long(
-            balance=1_000.0, qty=5.5, entry=50_000.0, last_price=49_500.0,
+            balance=1_000.0,
+            qty=5.5,
+            entry=50_000.0,
+            last_price=49_500.0,
             ema=_ema_state(lower=48_000.0, upper=49_000.0),
         )
         # Spent the entire grid loss budget already.
         acc.add_realized_pnl(OrderSource.GRID, -20.0, 0)
 
         orders = risk.compute_unstuck_orders(
-            acc, grid_wallet_exposure_limit=300.0, now_ms=1_000,
+            acc,
+            grid_wallet_exposure_limit=300.0,
+            now_ms=1_000,
         )
         assert orders == []
 
@@ -264,7 +289,9 @@ class TestAllowanceThrottle:
         acc.add_realized_pnl(OrderSource.TREND, -50.0, 0)
 
         orders = risk.compute_unstuck_orders(
-            acc, grid_wallet_exposure_limit=300.0, now_ms=1_000,
+            acc,
+            grid_wallet_exposure_limit=300.0,
+            now_ms=1_000,
         )
         # Grid unstuck still fires.
         assert any(o.source == OrderSource.GRID for o in orders)
@@ -272,14 +299,18 @@ class TestAllowanceThrottle:
     def test_allowance_window_rolls_off(self):
         risk = _risk(daily_loss_allowance_pct=0.01)
         acc = _account_with_grid_long(
-            balance=1_000.0, qty=5.5, entry=50_000.0, last_price=49_500.0,
+            balance=1_000.0,
+            qty=5.5,
+            entry=50_000.0,
+            last_price=49_500.0,
             ema=_ema_state(lower=48_000.0, upper=49_000.0),
         )
         # Loss recorded 25h ago — outside the window.
         acc.add_realized_pnl(OrderSource.GRID, -50.0, 0)
 
         orders = risk.compute_unstuck_orders(
-            acc, grid_wallet_exposure_limit=300.0,
+            acc,
+            grid_wallet_exposure_limit=300.0,
             now_ms=25 * 60 * 60 * 1000,
         )
         assert len(orders) == 1
@@ -296,39 +327,56 @@ class TestEdgeGuards:
         acc = AccountState(balance=1_000.0)
         acc.symbols["BTC"] = SymbolState("BTC", last_price=50_000.0)
         orders = risk.compute_unstuck_orders(
-            acc, grid_wallet_exposure_limit=300.0, now_ms=0,
+            acc,
+            grid_wallet_exposure_limit=300.0,
+            now_ms=0,
         )
         assert orders == []
 
     def test_uninitialized_ema_skipped(self):
         risk = _risk()
         acc = _account_with_grid_long(
-            balance=1_000.0, qty=5.5, entry=50_000.0, last_price=50_300.0,
+            balance=1_000.0,
+            qty=5.5,
+            entry=50_000.0,
+            last_price=50_300.0,
             ema=EMAState(),  # uninitialized
         )
         orders = risk.compute_unstuck_orders(
-            acc, grid_wallet_exposure_limit=300.0, now_ms=0,
+            acc,
+            grid_wallet_exposure_limit=300.0,
+            now_ms=0,
         )
         assert orders == []
 
     def test_zero_balance_returns_empty(self):
         risk = _risk()
         acc = _account_with_grid_long(
-            balance=0.0, qty=5.5, entry=50_000.0, last_price=50_300.0,
+            balance=0.0,
+            qty=5.5,
+            entry=50_000.0,
+            last_price=50_300.0,
             ema=_ema_state(),
         )
         orders = risk.compute_unstuck_orders(
-            acc, grid_wallet_exposure_limit=300.0, now_ms=0,
+            acc,
+            grid_wallet_exposure_limit=300.0,
+            now_ms=0,
         )
         assert orders == []
 
     def test_negative_threshold_disables_mechanism(self):
         risk = _risk(unstuck_threshold=-1.0)
         acc = _account_with_grid_long(
-            balance=1_000.0, qty=5.5, entry=50_000.0, last_price=50_300.0,
+            balance=1_000.0,
+            qty=5.5,
+            entry=50_000.0,
+            last_price=50_300.0,
             ema=_ema_state(),
         )
         orders = risk.compute_unstuck_orders(
-            acc, grid_wallet_exposure_limit=300.0, now_ms=0,
+            acc,
+            grid_wallet_exposure_limit=300.0,
+            now_ms=0,
         )
         assert orders == []

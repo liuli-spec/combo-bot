@@ -35,9 +35,18 @@ def cmd_backtest(args):
     # scale correctly. Explicit ``bar_interval_minutes`` in the config
     # takes priority if set.
     _TF_TO_MIN = {
-        "1m": 1.0, "3m": 3.0, "5m": 5.0, "15m": 15.0, "30m": 30.0,
-        "1h": 60.0, "2h": 120.0, "4h": 240.0, "6h": 360.0, "8h": 480.0,
-        "12h": 720.0, "1d": 1440.0,
+        "1m": 1.0,
+        "3m": 3.0,
+        "5m": 5.0,
+        "15m": 15.0,
+        "30m": 30.0,
+        "1h": 60.0,
+        "2h": 120.0,
+        "4h": 240.0,
+        "6h": 360.0,
+        "8h": 480.0,
+        "12h": 720.0,
+        "1d": 1440.0,
     }
     bar_min = cfg.get("bar_interval_minutes")
     if bar_min is None:
@@ -56,17 +65,24 @@ def cmd_backtest(args):
         regime=build_regime_config(cfg),
     )
 
-    candle_data = load_cached_data(bt_config.symbols, data_dir=cfg.get("data_dir", "data"))
+    candle_data = load_cached_data(
+        bt_config.symbols, data_dir=cfg.get("data_dir", "data")
+    )
     if not candle_data:
         logger.error("No cached data found. Run 'download' first.")
         sys.exit(1)
 
-    logger.info("Running backtest on %d symbols, %d candles each",
-                len(candle_data), min(len(v) for v in candle_data.values()))
+    logger.info(
+        "Running backtest on %d symbols, %d candles each",
+        len(candle_data),
+        min(len(v) for v in candle_data.values()),
+    )
 
     fusion = build_fusion(cfg)
-    if any(fusion[k] for k in ("kelly_sizer", "correlation_gate", "vol_target_sizer")) \
-            or fusion["protections"]:
+    if (
+        any(fusion[k] for k in ("kelly_sizer", "correlation_gate", "vol_target_sizer"))
+        or fusion["protections"]
+    ):
         logger.info(
             "Fusion layer active: kelly=%s correlation=%s vol_target=%s protections=%d",
             fusion["kelly_sizer"] is not None,
@@ -97,7 +113,6 @@ def cmd_backtest(args):
     print("=" * 60)
 
     if args.output:
-        import numpy as np
         out = {
             "final_balance": result.final_balance,
             "total_pnl": result.total_pnl,
@@ -129,13 +144,15 @@ def cmd_download(args):
         sys.exit(1)
 
     logger.info("Downloading data for %s", symbols)
-    asyncio.run(download_backtest_data(
-        symbols=symbols,
-        start_date=args.start,
-        end_date=args.end,
-        timeframe=args.timeframe,
-        data_dir=data_dir,
-    ))
+    asyncio.run(
+        download_backtest_data(
+            symbols=symbols,
+            start_date=args.start,
+            end_date=args.end,
+            timeframe=args.timeframe,
+            data_dir=data_dir,
+        )
+    )
     logger.info("Download complete")
 
 
@@ -184,9 +201,18 @@ def cmd_live(args):
     # volatility EMA, vol-target annualization, and live OHLCV fetch
     # all agree.
     _TF_TO_MIN = {
-        "1m": 1.0, "3m": 3.0, "5m": 5.0, "15m": 15.0, "30m": 30.0,
-        "1h": 60.0, "2h": 120.0, "4h": 240.0, "6h": 360.0, "8h": 480.0,
-        "12h": 720.0, "1d": 1440.0,
+        "1m": 1.0,
+        "3m": 3.0,
+        "5m": 5.0,
+        "15m": 15.0,
+        "30m": 30.0,
+        "1h": 60.0,
+        "2h": 120.0,
+        "4h": 240.0,
+        "6h": 360.0,
+        "8h": 480.0,
+        "12h": 720.0,
+        "1d": 1440.0,
     }
     timeframe = str(cfg.get("timeframe", "1m"))
     bar_min = cfg.get("bar_interval_minutes")
@@ -219,26 +245,20 @@ def cmd_live(args):
         bar_interval_minutes=float(bar_min),
         loop_interval_seconds=float(cfg.get("loop_interval_seconds", 60.0)),
         max_orders_per_batch=int(cfg.get("max_orders_per_batch", 5)),
-        order_match_tolerance_pct=float(
-            cfg.get("order_match_tolerance_pct", 0.002)
-        ),
+        order_match_tolerance_pct=float(cfg.get("order_match_tolerance_pct", 0.002)),
         state_file=state_file,
-        grid=GridConfig(**{
-            k: v for k, v in cfg.get("grid", {}).items()
-            if not k.startswith("_")
-        }),
-        trend=TrendConfig(**{
-            k: v for k, v in cfg.get("trend", {}).items()
-            if not k.startswith("_")
-        }),
-        merger=MergerConfig(**{
-            k: v for k, v in cfg.get("merger", {}).items()
-            if not k.startswith("_")
-        }),
-        risk=RiskConfig(**{
-            k: v for k, v in cfg.get("risk", {}).items()
-            if not k.startswith("_")
-        }),
+        grid=GridConfig(
+            **{k: v for k, v in cfg.get("grid", {}).items() if not k.startswith("_")}
+        ),
+        trend=TrendConfig(
+            **{k: v for k, v in cfg.get("trend", {}).items() if not k.startswith("_")}
+        ),
+        merger=MergerConfig(
+            **{k: v for k, v in cfg.get("merger", {}).items() if not k.startswith("_")}
+        ),
+        risk=RiskConfig(
+            **{k: v for k, v in cfg.get("risk", {}).items() if not k.startswith("_")}
+        ),
         regime=build_regime_config(cfg),
     )
 
@@ -254,8 +274,10 @@ def cmd_live(args):
     exchange = create_exchange(testnet=args.testnet)
 
     fusion = build_fusion(cfg)
-    if any(fusion[k] for k in ("kelly_sizer", "correlation_gate", "vol_target_sizer")) \
-            or fusion["protections"]:
+    if (
+        any(fusion[k] for k in ("kelly_sizer", "correlation_gate", "vol_target_sizer"))
+        or fusion["protections"]
+    ):
         logger.info(
             "Fusion layer active: kelly=%s correlation=%s vol_target=%s protections=%d",
             fusion["kelly_sizer"] is not None,
@@ -277,7 +299,9 @@ def cmd_live(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Combo Bot: Grid + Trend Futures Trading")
+    parser = argparse.ArgumentParser(
+        description="Combo Bot: Grid + Trend Futures Trading"
+    )
     sub = parser.add_subparsers(dest="command")
 
     p_bt = sub.add_parser("backtest", help="Run backtest")
@@ -298,7 +322,9 @@ def main():
 
     p_live = sub.add_parser("live", help="Live trading")
     p_live.add_argument("-c", "--config", default="config.json")
-    p_live.add_argument("--real", action="store_true", help="Real trading (not dry run)")
+    p_live.add_argument(
+        "--real", action="store_true", help="Real trading (not dry run)"
+    )
     p_live.add_argument("--testnet", action="store_true", help="Use testnet")
 
     args = parser.parse_args()

@@ -7,6 +7,7 @@
 * clientOrderId-based order identity replaces fuzzy matching when both
   sides carry it.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -20,7 +21,11 @@ import pytest
 from combo_bot.fusion_config import build_vol_target_sizer
 from combo_bot.live import LiveConfig, LiveTrader
 from combo_bot.types import (
-    AccountState, ExchangeParams, Order, OrderSource, Position, Side,
+    ExchangeParams,
+    Order,
+    OrderSource,
+    Position,
+    Side,
     SymbolState,
 )
 
@@ -62,10 +67,16 @@ class _Stub:
         return []
 
     async def create_order(self, symbol, ot, side, qty, price, params):
-        self.created.append({
-            "symbol": symbol, "type": ot, "side": side,
-            "qty": qty, "price": price, "params": params,
-        })
+        self.created.append(
+            {
+                "symbol": symbol,
+                "type": ot,
+                "side": side,
+                "qty": qty,
+                "price": price,
+                "params": params,
+            }
+        )
         return {"id": "ex-1", "status": "open"}
 
     async def cancel_order(self, *_a, **_k):
@@ -83,7 +94,10 @@ def _trader_with_symbol() -> LiveTrader:
     cfg = LiveConfig(symbols=["BTC/USDT:USDT"], dry_run=False)
     trader = LiveTrader(cfg, ex)
     trader.exchange_params["BTC/USDT:USDT"] = ExchangeParams(
-        qty_step=0.001, price_step=0.01, min_qty=0.001, min_cost=5.0,
+        qty_step=0.001,
+        price_step=0.01,
+        min_qty=0.001,
+        min_cost=5.0,
     )
     trader.account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
     return trader
@@ -106,8 +120,11 @@ def test_grid_entry_price_solved_from_aggregate():
     ss = trader.account.symbols["BTC/USDT:USDT"]
     ss.trend_long = Position(size=0.4, entry_price=48_000.0)
     trader._rebuild_bucket(
-        symbol="BTC/USDT:USDT", side=Side.LONG,
-        exchange_size=1.0, exchange_entry=50_000.0, ss=ss,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        exchange_size=1.0,
+        exchange_entry=50_000.0,
+        ss=ss,
     )
     assert ss.position_long.size == pytest.approx(0.6)
     expected = (1.0 * 50_000.0 - 0.4 * 48_000.0) / 0.6
@@ -127,8 +144,11 @@ def test_grid_entry_price_falls_back_when_trend_notional_exceeds_aggregate():
     # is 1.0 at 50k → 50k notional. (50k - 60k) / 0.5 = -20k → negative.
     ss.trend_long = Position(size=0.5, entry_price=120_000.0)
     trader._rebuild_bucket(
-        symbol="BTC/USDT:USDT", side=Side.LONG,
-        exchange_size=1.0, exchange_entry=50_000.0, ss=ss,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        exchange_size=1.0,
+        exchange_entry=50_000.0,
+        ss=ss,
     )
     # grid_entry would compute negative; we fall back to exchange avg.
     assert ss.position_long.entry_price > 0
@@ -141,8 +161,11 @@ def test_trend_tracking_clamped_when_it_exceeds_exchange_total():
     ss = trader.account.symbols["BTC/USDT:USDT"]
     ss.trend_long = Position(size=2.0, entry_price=50_000.0)  # absurd
     trader._rebuild_bucket(
-        symbol="BTC/USDT:USDT", side=Side.LONG,
-        exchange_size=1.0, exchange_entry=50_000.0, ss=ss,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        exchange_size=1.0,
+        exchange_entry=50_000.0,
+        ss=ss,
     )
     assert ss.trend_long.size == pytest.approx(1.0)
     assert ss.position_long.size == pytest.approx(0.0)
@@ -166,9 +189,7 @@ def test_realized_pnl_ledger_round_trips_through_state_file():
         trader_a.account.grid_loss_log = deque(
             [(1_700_000_000_000, -10.0), (1_700_000_100_000, -5.0)]
         )
-        trader_a.account.trend_loss_log = deque(
-            [(1_700_000_200_000, -3.0)]
-        )
+        trader_a.account.trend_loss_log = deque([(1_700_000_200_000, -3.0)])
         asyncio.run(trader_a._save_state())
 
         # Verify the JSON has them.
@@ -220,7 +241,8 @@ def test_vol_target_sizer_honors_explicit_periods_per_year():
     bar_interval derivation."""
     cfg = {
         "vol_target_sizer": {
-            "enabled": True, "periods_per_year": 12345,
+            "enabled": True,
+            "periods_per_year": 12345,
         },
         "bar_interval_minutes": 60.0,
     }
@@ -236,7 +258,10 @@ def test_vol_target_sizer_honors_explicit_periods_per_year():
 def test_create_order_stamps_client_order_id_into_ccxt_params():
     trader = _trader_with_symbol()
     o = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
         source=OrderSource.GRID,
     )
     asyncio.run(trader._create_order(o))
@@ -250,19 +275,27 @@ def test_create_order_stamps_client_order_id_into_ccxt_params():
 def test_orders_match_uses_client_order_id_when_present():
     trader = _trader_with_symbol()
     desired = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
-        source=OrderSource.GRID, client_order_id="cb-abc123",
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
+        source=OrderSource.GRID,
+        client_order_id="cb-abc123",
     )
     # Same cOID — must match even with totally different fuzzy fields.
     existing = {
-        "side": "buy", "price": 99_999.0, "amount": 99.0,  # would fail fuzzy
+        "side": "buy",
+        "price": 99_999.0,
+        "amount": 99.0,  # would fail fuzzy
         "clientOrderId": "cb-abc123",
     }
     assert trader._orders_match(desired, existing) is True
 
     # Same fuzzy match but different cOID — must NOT match.
     other = {
-        "side": "buy", "price": 50_000.0, "amount": 0.01,
+        "side": "buy",
+        "price": 50_000.0,
+        "amount": 0.01,
         "clientOrderId": "cb-different",
     }
     assert trader._orders_match(desired, other) is False
@@ -273,11 +306,17 @@ def test_orders_match_falls_back_to_fuzzy_when_no_cid_but_reduce_only_present():
     fuzzy fallback still works."""
     trader = _trader_with_symbol()
     desired = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
-        source=OrderSource.GRID, client_order_id="cb-abc123",
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
+        source=OrderSource.GRID,
+        client_order_id="cb-abc123",
     )
     existing_no_cid = {
-        "side": "buy", "price": 50_000.0, "amount": 0.01,
+        "side": "buy",
+        "price": 50_000.0,
+        "amount": 0.01,
         "reduceOnly": False,
     }
     assert trader._orders_match(desired, existing_no_cid) is True
@@ -291,11 +330,17 @@ def test_orders_match_conservatively_refuses_when_no_cid_and_no_reduce_only():
     of mystery intent (could be a manual order, a leftover, etc.)."""
     trader = _trader_with_symbol()
     desired = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
-        source=OrderSource.GRID, client_order_id="cb-abc123",
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
+        source=OrderSource.GRID,
+        client_order_id="cb-abc123",
     )
     mystery_existing = {
-        "side": "buy", "price": 50_000.0, "amount": 0.01,
+        "side": "buy",
+        "price": 50_000.0,
+        "amount": 0.01,
         # No clientOrderId, no reduceOnly field at all.
     }
     assert trader._orders_match(desired, mystery_existing) is False
@@ -313,7 +358,10 @@ def test_cid_persists_across_reconcile_ticks_for_same_desired():
     clientOrderId echo instead of falling back to fuzzy heuristics."""
     trader = _trader_with_symbol()
     o = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
         source=OrderSource.GRID,
     )
     asyncio.run(trader._reconcile_orders([o]))
@@ -326,16 +374,19 @@ def test_cid_persists_across_reconcile_ticks_for_same_desired():
     # Need to clear recent_creates dedup or it'll skip — that's a
     # SEPARATE guard. Bypass by changing qty so dedup misses.
     o2 = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
         source=OrderSource.GRID,
     )
     # Manually advance _recent_creates past its window.
     trader._recent_creates.clear()
     asyncio.run(trader._reconcile_orders([o2]))
     second_cid = trader.exchange.created[0]["params"]["clientOrderId"]
-    assert first_cid == second_cid, (
-        f"same desired identity must reuse cOID; got {first_cid} vs {second_cid}"
-    )
+    assert (
+        first_cid == second_cid
+    ), f"same desired identity must reuse cOID; got {first_cid} vs {second_cid}"
 
 
 def test_cid_differs_across_distinct_desired_identities():
@@ -345,20 +396,30 @@ def test_cid_differs_across_distinct_desired_identities():
     # not just account.symbols — reconcile only iterates config.symbols.
     ex = _Stub()
     cfg = LiveConfig(
-        symbols=["BTC/USDT:USDT", "ETH/USDT:USDT"], dry_run=False,
+        symbols=["BTC/USDT:USDT", "ETH/USDT:USDT"],
+        dry_run=False,
     )
     trader = LiveTrader(cfg, ex)
     for s in cfg.symbols:
         trader.exchange_params[s] = ExchangeParams(
-            qty_step=0.001, price_step=0.01, min_qty=0.001, min_cost=5.0,
+            qty_step=0.001,
+            price_step=0.01,
+            min_qty=0.001,
+            min_cost=5.0,
         )
         trader.account.symbols[s] = SymbolState(symbol=s)
     a = Order(
-        symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
         source=OrderSource.GRID,
     )
     b = Order(
-        symbol="ETH/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
+        symbol="ETH/USDT:USDT",
+        side=Side.LONG,
+        price=50_000.0,
+        qty=0.01,
         source=OrderSource.GRID,
     )
     asyncio.run(trader._reconcile_orders([a, b]))
@@ -382,15 +443,20 @@ def test_missing_side_in_fetch_positions_clears_grid_bucket():
     ss.position_long = Position(size=0.5, entry_price=50_000.0)
 
     # Exchange returns positions: short only. Long is conspicuously absent.
-    trader.exchange.positions = [{
-        "symbol": "BTC/USDT:USDT", "side": "short",
-        "contracts": 0.1, "entryPrice": 51_000.0, "markPrice": 50_500.0,
-    }]
+    trader.exchange.positions = [
+        {
+            "symbol": "BTC/USDT:USDT",
+            "side": "short",
+            "contracts": 0.1,
+            "entryPrice": 51_000.0,
+            "markPrice": 50_500.0,
+        }
+    ]
     asyncio.run(trader._refresh_account())
 
-    assert ss.position_long.size == 0.0, (
-        "long bucket must be cleared when the exchange stops echoing it"
-    )
+    assert (
+        ss.position_long.size == 0.0
+    ), "long bucket must be cleared when the exchange stops echoing it"
     assert ss.position_short.size == pytest.approx(0.1)
 
 
@@ -401,10 +467,15 @@ def test_zero_size_row_does_not_keep_bucket_alive():
     ss = trader.account.symbols["BTC/USDT:USDT"]
     ss.position_long = Position(size=0.5, entry_price=50_000.0)
 
-    trader.exchange.positions = [{
-        "symbol": "BTC/USDT:USDT", "side": "long",
-        "contracts": 0.0, "entryPrice": 0.0, "markPrice": 50_500.0,
-    }]
+    trader.exchange.positions = [
+        {
+            "symbol": "BTC/USDT:USDT",
+            "side": "long",
+            "contracts": 0.0,
+            "entryPrice": 0.0,
+            "markPrice": 50_500.0,
+        }
+    ]
     asyncio.run(trader._refresh_account())
 
     assert ss.position_long.size == 0.0
@@ -423,13 +494,17 @@ def test_ema_and_volatility_spans_use_grid_config():
     from combo_bot.grid_engine import GridConfig
 
     grid = GridConfig(
-        ema_span_0=100.0, ema_span_1=200.0,
+        ema_span_0=100.0,
+        ema_span_1=200.0,
         entry_volatility_ema_span_hours=42.0,
     )
     ex = _Stub()
     cfg = LiveConfig(
-        symbols=["BTC/USDT:USDT"], dry_run=False, grid=grid,
-        candle_timeframe="1m", bar_interval_minutes=1.0,
+        symbols=["BTC/USDT:USDT"],
+        dry_run=False,
+        grid=grid,
+        candle_timeframe="1m",
+        bar_interval_minutes=1.0,
     )
     trader = LiveTrader(cfg, ex)
     trader.exchange_params["BTC/USDT:USDT"] = ExchangeParams()
@@ -463,7 +538,10 @@ def test_live_tick_calls_record_equity_on_vol_target_sizer():
     cfg = LiveConfig(symbols=["BTC/USDT:USDT"], dry_run=True)
     trader = LiveTrader(cfg, ex, vol_target_sizer=sizer)
     trader.exchange_params["BTC/USDT:USDT"] = ExchangeParams(
-        qty_step=0.001, price_step=0.01, min_qty=0.001, min_cost=5.0,
+        qty_step=0.001,
+        price_step=0.01,
+        min_qty=0.001,
+        min_cost=5.0,
     )
     trader.account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
     # Drive a tick. The sizer must register equity each call.

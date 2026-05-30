@@ -7,6 +7,7 @@
   block-still-blocks part; round-13 expands with resolve flow)
 * CLI default state_file segregates testnet vs real
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +20,11 @@ import pytest
 from combo_bot.intent_journal import IntentJournal
 from combo_bot.live import LiveConfig, LiveTrader
 from combo_bot.types import (
-    ExchangeParams, Order, OrderSource, Position, Side, SymbolState,
+    ExchangeParams,
+    Order,
+    OrderSource,
+    Side,
+    SymbolState,
 )
 
 
@@ -29,39 +34,71 @@ class _Stub:
         self.opens_by_call: list[list[dict]] = []
         self.next_status = "open"
 
-    async def load_markets(self): return {}
-    def market(self, _): return {
-        "precision": {"amount": 0.001, "price": 0.01},
-        "limits": {"amount": {"min": 0.001}, "cost": {"min": 5.0}},
-        "maker": 0.0002, "taker": 0.0005,
-    }
-    async def fetch_balance(self, _=None): return {"USDT": {"free": 10_000.0, "total": 10_000.0}}
-    async def fetch_positions(self, _): return []
-    async def fetch_funding_rate(self, _): return {"fundingRate": 0.0}
-    async def fetch_ohlcv(self, *a, **k): return []
-    async def fetch_my_trades(self, *a, **k): return []
+    async def load_markets(self):
+        return {}
+
+    def market(self, _):
+        return {
+            "precision": {"amount": 0.001, "price": 0.01},
+            "limits": {"amount": {"min": 0.001}, "cost": {"min": 5.0}},
+            "maker": 0.0002,
+            "taker": 0.0005,
+        }
+
+    async def fetch_balance(self, _=None):
+        return {"USDT": {"free": 10_000.0, "total": 10_000.0}}
+
+    async def fetch_positions(self, _):
+        return []
+
+    async def fetch_funding_rate(self, _):
+        return {"fundingRate": 0.0}
+
+    async def fetch_ohlcv(self, *a, **k):
+        return []
+
+    async def fetch_my_trades(self, *a, **k):
+        return []
+
     async def fetch_open_orders(self, _):
         return self.opens_by_call.pop(0) if self.opens_by_call else []
+
     async def create_order(self, sym, ot, side, qty, price, params):
-        self.created.append({
-            "symbol": sym, "type": ot, "side": side,
-            "qty": qty, "price": price, "params": params,
-        })
+        self.created.append(
+            {
+                "symbol": sym,
+                "type": ot,
+                "side": side,
+                "qty": qty,
+                "price": price,
+                "params": params,
+            }
+        )
         return {"id": f"ex-{len(self.created)}", "status": self.next_status}
-    async def cancel_order(self, *a, **k): return {}
-    async def set_leverage(self, *a, **k): return {}
-    async def set_margin_mode(self, *a, **k): return {}
+
+    async def cancel_order(self, *a, **k):
+        return {}
+
+    async def set_leverage(self, *a, **k):
+        return {}
+
+    async def set_margin_mode(self, *a, **k):
+        return {}
 
 
 def _trader_with_state(state_dir: Path) -> LiveTrader:
     ex = _Stub()
     cfg = LiveConfig(
-        symbols=["BTC/USDT:USDT"], dry_run=False,
+        symbols=["BTC/USDT:USDT"],
+        dry_run=False,
         state_file=str(state_dir / "state.json"),
     )
     trader = LiveTrader(cfg, ex)
     trader.exchange_params["BTC/USDT:USDT"] = ExchangeParams(
-        qty_step=0.001, price_step=0.01, min_qty=0.001, min_cost=5.0,
+        qty_step=0.001,
+        price_step=0.01,
+        min_qty=0.001,
+        min_cost=5.0,
     )
     trader.account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
     return trader
@@ -77,8 +114,13 @@ def test_intent_journal_submit_then_replay():
         path = Path(tmp) / "journal.jsonl"
         j = IntentJournal(path)
         j.submit(
-            cid="cb-1", symbol="BTC", side="long", source="trend",
-            reduce_only=False, is_market=True, now_ms=1_000,
+            cid="cb-1",
+            symbol="BTC",
+            side="long",
+            source="trend",
+            reduce_only=False,
+            is_market=True,
+            now_ms=1_000,
         )
         # Re-open and replay.
         j2 = IntentJournal(path)
@@ -93,8 +135,13 @@ def test_intent_journal_terminal_supersedes_open():
         path = Path(tmp) / "journal.jsonl"
         j = IntentJournal(path)
         j.submit(
-            cid="cb-1", symbol="BTC", side="long", source="grid",
-            reduce_only=False, is_market=False, now_ms=1,
+            cid="cb-1",
+            symbol="BTC",
+            side="long",
+            source="grid",
+            reduce_only=False,
+            is_market=False,
+            now_ms=1,
         )
         j.open(cid="cb-1", exchange_id="ex-1", now_ms=2)
         j.mark_terminal(cid="cb-1", kind="filled", now_ms=3)
@@ -108,11 +155,25 @@ def test_intent_journal_compact_evicts_terminal_rows():
         path = Path(tmp) / "journal.jsonl"
         j = IntentJournal(path)
         # Two cIDs: one filled, one still in flight.
-        j.submit(cid="cb-1", symbol="BTC", side="long", source="grid",
-                 reduce_only=False, is_market=False, now_ms=1)
+        j.submit(
+            cid="cb-1",
+            symbol="BTC",
+            side="long",
+            source="grid",
+            reduce_only=False,
+            is_market=False,
+            now_ms=1,
+        )
         j.mark_terminal(cid="cb-1", kind="filled", now_ms=2)
-        j.submit(cid="cb-2", symbol="BTC", side="short", source="trend",
-                 reduce_only=False, is_market=True, now_ms=3)
+        j.submit(
+            cid="cb-2",
+            symbol="BTC",
+            side="short",
+            source="trend",
+            reduce_only=False,
+            is_market=True,
+            now_ms=3,
+        )
         before_compact = path.read_text().splitlines()
         assert len(before_compact) == 3
         j.compact()
@@ -136,7 +197,7 @@ def test_intent_journal_tolerates_only_unterminated_trailing_line():
         path.write_text(
             '{"ts":1,"kind":"submit","cid":"cb-1","symbol":"BTC",'
             '"side":"long","source":"grid","reduce_only":false,"is_market":false}\n'
-            'partial_crash_no_newline'
+            "partial_crash_no_newline"
         )
         j = IntentJournal(path)
         records = j.replay()
@@ -153,18 +214,20 @@ def test_create_order_writes_journal_before_network_call():
     with tempfile.TemporaryDirectory() as tmp:
         trader = _trader_with_state(Path(tmp))
         o = Order(
-            symbol="BTC/USDT:USDT", side=Side.LONG, price=50_000.0, qty=0.01,
-            source=OrderSource.TREND, is_market=True,
+            symbol="BTC/USDT:USDT",
+            side=Side.LONG,
+            price=50_000.0,
+            qty=0.01,
+            source=OrderSource.TREND,
+            is_market=True,
             client_order_id="cb-test-1",
         )
         asyncio.run(trader._create_order(o))
         # Journal on disk must already contain at least a submit row.
-        journal_path = (
-            Path(tmp) / "state.intent_journal.jsonl"
-        )
+        journal_path = Path(tmp) / "state.intent_journal.jsonl"
         assert journal_path.exists()
         lines = journal_path.read_text().splitlines()
-        kinds = [json.loads(l)["kind"] for l in lines if l.strip()]
+        kinds = [json.loads(line)["kind"] for line in lines if line.strip()]
         assert "submit" in kinds
 
 
@@ -179,8 +242,12 @@ def test_replay_restores_pending_and_attribution_after_crash():
         # but didn't get to _save_state before dying.
         trader_a = _trader_with_state(Path(tmp))
         trader_a.intent_journal.submit(
-            cid="cb-trend-crashy", symbol="BTC/USDT:USDT", side="long",
-            source="trend", reduce_only=False, is_market=True,
+            cid="cb-trend-crashy",
+            symbol="BTC/USDT:USDT",
+            side="long",
+            source="trend",
+            reduce_only=False,
+            is_market=True,
             now_ms=1_000,
         )
 
@@ -195,10 +262,7 @@ def test_replay_restores_pending_and_attribution_after_crash():
         # Attribution restored under the cID so a delayed fill is
         # routable to TREND.
         assert "cb-trend-crashy" in trader_b.fill_events.order_source
-        assert (
-            trader_b.fill_events.order_source["cb-trend-crashy"]
-            == OrderSource.TREND
-        )
+        assert trader_b.fill_events.order_source["cb-trend-crashy"] == OrderSource.TREND
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -224,18 +288,32 @@ def test_resolve_unknowns_promotes_to_pending_when_order_still_open():
         trader = _trader_with_state(Path(tmp))
         # Journal: still-open intent for a TREND long.
         trader.intent_journal.submit(
-            cid="cb-still-open", symbol="BTC/USDT:USDT", side="long",
-            source="trend", reduce_only=False, is_market=True, now_ms=1,
+            cid="cb-still-open",
+            symbol="BTC/USDT:USDT",
+            side="long",
+            source="trend",
+            reduce_only=False,
+            is_market=True,
+            now_ms=1,
         )
         trader.intent_journal.open(
-            cid="cb-still-open", exchange_id="ex-1", now_ms=2,
+            cid="cb-still-open",
+            exchange_id="ex-1",
+            now_ms=2,
         )
         trader._unknown_overlay[("BTC/USDT:USDT", Side.LONG)] = 1.0
-        trader.exchange.opens_by_call = [[{
-            "id": "ex-1", "clientOrderId": "cb-still-open",
-            "symbol": "BTC/USDT:USDT", "side": "buy",
-            "price": 50_000.0, "amount": 0.01,
-        }]]
+        trader.exchange.opens_by_call = [
+            [
+                {
+                    "id": "ex-1",
+                    "clientOrderId": "cb-still-open",
+                    "symbol": "BTC/USDT:USDT",
+                    "side": "buy",
+                    "price": 50_000.0,
+                    "amount": 0.01,
+                }
+            ]
+        ]
         asyncio.run(trader._resolve_unknowns())
         assert ("BTC/USDT:USDT", Side.LONG) not in trader._unknown_overlay
         assert ("BTC/USDT:USDT", Side.LONG) in trader._pending_overlay
@@ -249,11 +327,18 @@ def test_resolve_unknowns_clears_only_with_filled_qty_avg_payload():
     with tempfile.TemporaryDirectory() as tmp:
         trader = _trader_with_state(Path(tmp))
         trader.intent_journal.submit(
-            cid="cb-filled-via-fetch", symbol="BTC/USDT:USDT", side="long",
-            source="trend", reduce_only=False, is_market=True, now_ms=1,
+            cid="cb-filled-via-fetch",
+            symbol="BTC/USDT:USDT",
+            side="long",
+            source="trend",
+            reduce_only=False,
+            is_market=True,
+            now_ms=1,
         )
         trader.intent_journal.open(
-            cid="cb-filled-via-fetch", exchange_id="ex-99", now_ms=2,
+            cid="cb-filled-via-fetch",
+            exchange_id="ex-99",
+            now_ms=2,
         )
         trader._unknown_overlay[("BTC/USDT:USDT", Side.LONG)] = 1.0
         trader.exchange.opens_by_call = [[]]  # not in open orders
@@ -261,6 +346,7 @@ def test_resolve_unknowns_clears_only_with_filled_qty_avg_payload():
         # First: closed but NO filled/avg → must HOLD UNKNOWN.
         async def fetched_without_qty(*a, **k):
             return {"status": "closed", "id": "ex-99"}
+
         trader.exchange.fetch_order = fetched_without_qty  # type: ignore[method-assign]
         asyncio.run(trader._resolve_unknowns())
         assert ("BTC/USDT:USDT", Side.LONG) in trader._unknown_overlay, (
@@ -272,9 +358,12 @@ def test_resolve_unknowns_clears_only_with_filled_qty_avg_payload():
         # Second: closed WITH filled + average → bucket written, then clear.
         async def fetched_with_qty(*a, **k):
             return {
-                "status": "closed", "id": "ex-99",
-                "filled": 0.01, "average": 50_000.0,
+                "status": "closed",
+                "id": "ex-99",
+                "filled": 0.01,
+                "average": 50_000.0,
             }
+
         trader.exchange.fetch_order = fetched_with_qty  # type: ignore[method-assign]
         trader.exchange.opens_by_call = [[]]
         asyncio.run(trader._resolve_unknowns())
@@ -294,14 +383,20 @@ def test_resolve_unknowns_holds_block_when_fetch_order_cannot_confirm():
     with tempfile.TemporaryDirectory() as tmp:
         trader = _trader_with_state(Path(tmp))
         trader.intent_journal.submit(
-            cid="cb-mystery", symbol="BTC/USDT:USDT", side="long",
-            source="trend", reduce_only=False, is_market=True, now_ms=1,
+            cid="cb-mystery",
+            symbol="BTC/USDT:USDT",
+            side="long",
+            source="trend",
+            reduce_only=False,
+            is_market=True,
+            now_ms=1,
         )
         trader._unknown_overlay[("BTC/USDT:USDT", Side.LONG)] = 1.0
         trader.exchange.opens_by_call = [[]]
 
         async def boom(*a, **k):
             raise RuntimeError("exchange unreachable")
+
         trader.exchange.fetch_order = boom  # type: ignore[method-assign]
 
         asyncio.run(trader._resolve_unknowns())
@@ -324,17 +419,26 @@ def test_fill_carries_exact_cid_for_journal_attribution():
 
     class _Ex:
         async def fetch_my_trades(self, *_a, **_k):
-            return [{
-                "id": "trade-99", "timestamp": 1_000, "side": "buy",
-                "price": 50_000.0, "amount": 0.01,
-                "fee": {"cost": 0.05},
-                "order": "ord-2", "clientOrderId": "cb-grid-2",
-                "info": {},
-            }]
+            return [
+                {
+                    "id": "trade-99",
+                    "timestamp": 1_000,
+                    "side": "buy",
+                    "price": 50_000.0,
+                    "amount": 0.01,
+                    "fee": {"cost": 0.05},
+                    "order": "ord-2",
+                    "clientOrderId": "cb-grid-2",
+                    "info": {},
+                }
+            ]
 
     mgr = FillEventManager(_Ex(), FillEventManagerConfig(poll_interval_ms=0))
     mgr.register_outgoing(
-        "ord-2", OrderSource.GRID, Side.LONG, reduce_only=False,
+        "ord-2",
+        OrderSource.GRID,
+        Side.LONG,
+        reduce_only=False,
         client_order_id="cb-grid-2",
     )
     captured = []
@@ -350,7 +454,6 @@ def test_journal_marks_correct_cid_when_multiple_grid_share_triple():
     """The pre-fix mark-terminal used (source, symbol, side) only;
     if 3 grid LONG orders share that triple, the first journal cID
     got mis-marked filled even when a different cID actually filled."""
-    from combo_bot.intent_journal import IntentJournal
     from combo_bot.types import Fill
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -358,15 +461,25 @@ def test_journal_marks_correct_cid_when_multiple_grid_share_triple():
         # Three in-flight grid cIDs on the same (sym, side).
         for cid in ("cb-grid-A", "cb-grid-B", "cb-grid-C"):
             trader.intent_journal.submit(
-                cid=cid, symbol="BTC/USDT:USDT", side="long",
-                source="grid", reduce_only=False, is_market=False,
+                cid=cid,
+                symbol="BTC/USDT:USDT",
+                side="long",
+                source="grid",
+                reduce_only=False,
+                is_market=False,
                 now_ms=1,
             )
         # A fill arrives carrying the SPECIFIC cID for the middle one.
         fill = Fill(
-            timestamp=2, symbol="BTC/USDT:USDT", side=Side.LONG,
-            price=50_000.0, qty=0.01, fee=0.05, realized_pnl=0.0,
-            source=OrderSource.GRID, reduce_only=False,
+            timestamp=2,
+            symbol="BTC/USDT:USDT",
+            side=Side.LONG,
+            price=50_000.0,
+            qty=0.01,
+            fee=0.05,
+            realized_pnl=0.0,
+            source=OrderSource.GRID,
+            reduce_only=False,
             client_order_id="cb-grid-B",
         )
         # Drive through sink — feed fill_events the trade list directly
@@ -377,17 +490,21 @@ def test_journal_marks_correct_cid_when_multiple_grid_share_triple():
         # Easiest: invoke the inner enrich+sink behaviour with the
         # ledger-touching part. The minimal call is to manually run
         # what _refresh_fills' sink does:
-        from dataclasses import replace as _replace
         e = trader._enrich_fill_pnl(fill)
         # Locate-by-cid path:
         journal_cid = e.client_order_id
         if journal_cid and journal_cid in trader.intent_journal.records:
             rec = trader.intent_journal.records[journal_cid]
             if rec.get("kind") not in (
-                "filled", "rejected", "canceled", "resolved",
+                "filled",
+                "rejected",
+                "canceled",
+                "resolved",
             ):
                 trader.intent_journal.mark_terminal(
-                    cid=journal_cid, kind="filled", now_ms=3,
+                    cid=journal_cid,
+                    kind="filled",
+                    now_ms=3,
                 )
         assert trader.intent_journal.records["cb-grid-B"]["kind"] == "filled"
         # The OTHER two cIDs must still be in flight.
@@ -400,6 +517,7 @@ def test_cli_state_file_segregation_three_way_profile():
     exchange) must NOT default to ``state.real.json`` — that path is
     reserved for true production trading and must never share a
     journal with testnet experiments."""
+
     # We can't easily import the inline `cmd_live` body, so encode
     # the policy explicitly. (Round-13's analogous test does the
     # same.) Round-14 prioritizes testnet over real.
@@ -424,6 +542,7 @@ def test_cli_default_state_file_segregates_testnet_from_real():
     bucket state."""
     # Import inside the test so module-level argparse doesn't run.
     from combo_bot.live import LiveConfig
+
     # Verify the default in LiveConfig is the catch-all so a missing
     # cfg/path produces something safe.
     assert LiveConfig().state_file == "live_state.json"

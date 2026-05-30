@@ -60,6 +60,7 @@ class Position:
     and :meth:`update_best_price`; a missing ``side`` argument raises because
     the unsigned size alone cannot distinguish long from short P&L.
     """
+
     size: float = 0.0
     entry_price: float = 0.0
     # Most-favorable price seen since the position opened.
@@ -201,7 +202,9 @@ class EMAState:
 
     def update(self, price: float):
         for i in range(len(self.values)):
-            self.values[i] = self.alphas[i] * price + (1.0 - self.alphas[i]) * self.values[i]
+            self.values[i] = (
+                self.alphas[i] * price + (1.0 - self.alphas[i]) * self.values[i]
+            )
 
     @property
     def lower(self) -> float:
@@ -284,9 +287,7 @@ class VolatilityState:
         and not ``span_hours * 60`` hours.
         """
         self.ema_span_hours = span_hours
-        bars_per_span = max(
-            1.0, span_hours * 60.0 / max(bar_interval_minutes, 1e-9)
-        )
+        bars_per_span = max(1.0, span_hours * 60.0 / max(bar_interval_minutes, 1e-9))
         self.alpha = 2.0 / (bars_per_span + 1.0)
         self.value = initial_range
         self.initialized = True
@@ -420,11 +421,7 @@ class AccountState:
         outside the window). Prunes the bucket's log of entries older
         than 24h as a side effect — keeps the deque bounded.
         """
-        log = (
-            self.trend_loss_log
-            if source == OrderSource.TREND
-            else self.grid_loss_log
-        )
+        log = self.trend_loss_log if source == OrderSource.TREND else self.grid_loss_log
         cutoff = now_ms - _DAY_MS
         while log and log[0][0] < cutoff:
             log.popleft()

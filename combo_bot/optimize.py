@@ -185,25 +185,39 @@ class Optimizer:
     def _suggest_grid_params(self, trial: Trial) -> GridConfig:
         return GridConfig(
             entry_initial_ema_dist=trial.suggest_float(
-                "grid_entry_initial_ema_dist", 0.002, 0.02,
+                "grid_entry_initial_ema_dist",
+                0.002,
+                0.02,
             ),
             entry_grid_spacing_pct=trial.suggest_float(
-                "grid_entry_grid_spacing_pct", 0.01, 0.05,
+                "grid_entry_grid_spacing_pct",
+                0.01,
+                0.05,
             ),
             entry_grid_double_down_factor=trial.suggest_float(
-                "grid_double_down_factor", 0.8, 2.0,
+                "grid_double_down_factor",
+                0.8,
+                2.0,
             ),
             wallet_exposure_limit=trial.suggest_float(
-                "grid_wallet_exposure_limit", 0.5, 2.0,
+                "grid_wallet_exposure_limit",
+                0.5,
+                2.0,
             ),
             total_wallet_exposure_limit=trial.suggest_float(
-                "grid_total_wallet_exposure_limit", 1.0, 3.0,
+                "grid_total_wallet_exposure_limit",
+                1.0,
+                3.0,
             ),
             close_grid_markup_start=trial.suggest_float(
-                "grid_close_grid_markup_start", 0.002, 0.015,
+                "grid_close_grid_markup_start",
+                0.002,
+                0.015,
             ),
             close_grid_markup_end=trial.suggest_float(
-                "grid_close_grid_markup_end", 0.005, 0.03,
+                "grid_close_grid_markup_end",
+                0.005,
+                0.03,
             ),
         )
 
@@ -213,23 +227,33 @@ class Optimizer:
             macd_fast=trial.suggest_int("trend_macd_fast", 8, 16),
             macd_slow=trial.suggest_int("trend_macd_slow", 21, 34),
             strong_threshold=trial.suggest_float(
-                "trend_strong_threshold", 0.3, 0.8,
+                "trend_strong_threshold",
+                0.3,
+                0.8,
             ),
             weak_threshold=trial.suggest_float(
-                "trend_weak_threshold", 0.1, 0.4,
+                "trend_weak_threshold",
+                0.1,
+                0.4,
             ),
         )
 
     def _suggest_merger_params(self, trial: Trial) -> MergerConfig:
         return MergerConfig(
             grid_depth_limit_in_downtrend=trial.suggest_int(
-                "merger_grid_depth_limit_in_downtrend", 1, 5,
+                "merger_grid_depth_limit_in_downtrend",
+                1,
+                5,
             ),
             trend_position_max_pct=trial.suggest_float(
-                "merger_trend_position_max_pct", 0.0, 0.3,
+                "merger_trend_position_max_pct",
+                0.0,
+                0.3,
             ),
             mode_switch_strong_threshold=trial.suggest_float(
-                "merger_mode_switch_strong_threshold", 0.4, 0.9,
+                "merger_mode_switch_strong_threshold",
+                0.4,
+                0.9,
             ),
         )
 
@@ -365,27 +389,15 @@ def print_optimization_report(study: Study) -> None:  # type: ignore[type-arg]
     print(thin)
 
     # Top-5 trials
-    completed = [
-        t
-        for t in study.trials
-        if t.state == optuna.trial.TrialState.COMPLETE
-    ]
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     top_n = sorted(completed, key=lambda t: t.value, reverse=True)[:5]
     print("  Top 5 trials:")
     for t in top_n:
         print(f"    trial #{t.number:>4d}   score={t.value:>10.6f}")
 
     # Pruning stats
-    n_pruned = sum(
-        1
-        for t in study.trials
-        if t.state == optuna.trial.TrialState.PRUNED
-    )
-    n_failed = sum(
-        1
-        for t in study.trials
-        if t.state == optuna.trial.TrialState.FAIL
-    )
+    n_pruned = sum(1 for t in study.trials if t.state == optuna.trial.TrialState.PRUNED)
+    n_failed = sum(1 for t in study.trials if t.state == optuna.trial.TrialState.FAIL)
     print(thin)
     print(f"  Completed: {len(completed)}   Pruned: {n_pruned}   Failed: {n_failed}")
     print(f"{border}\n")

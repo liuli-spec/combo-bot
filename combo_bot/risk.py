@@ -2,8 +2,12 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 from combo_bot.types import (
-    AccountState, EMAState, Order, OrderSource, Side,
-    SymbolState, ExchangeParams,
+    AccountState,
+    Order,
+    OrderSource,
+    Side,
+    SymbolState,
+    ExchangeParams,
 )
 from combo_bot.grid_engine import quantize_qty
 from combo_bot.hsl import HslConfig, HslSupervisor, HslTier
@@ -46,11 +50,12 @@ class RiskConfig:
     unstuck_ema_dist: float = 0.02
     daily_loss_allowance_pct: float = 0.01
     # WEL ceiling for the trend bucket — separate from the grid bucket's
-    # GridConfig.wallet_exposure_limit. Used by the unstuck mechanism to
-    # decide when the trend bucket is "stuck". Mirrors MergerConfig
-    # .trend_position_max_pct but lives here so the risk layer can stay
-    # self-contained.
-    trend_wallet_exposure_limit: float = 0.15
+    # GridConfig.wallet_exposure_limit. Single source of truth for the
+    # trend bucket's exposure cap; DecisionMerger reads this same value
+    # via ``DecisionMerger(merger_cfg, trend_wallet_exposure_limit=...)``
+    # so overlay sizing and unstuck both derive from one number. Round
+    # 22 alignment with high-conviction profile re-tuning.
+    trend_wallet_exposure_limit: float = 0.35
     # Stage 6: passivbot-style hard-stop drawdown smoothing.
     # ``dd_ema_span_minutes <= 0`` disables smoothing (use raw dd, legacy
     # behavior). When enabled, ``score = min(raw, ema)`` — the minimum
@@ -66,6 +71,11 @@ class RiskConfig:
     # bleed because a cooldown timer ticked over.
     dd_ema_span_minutes: float = 30.0
     red_latch_enabled: bool = True
+    # Wall-clock minutes after a RED latch before the latch auto-releases.
+    # 0 = manual reset only (Passivbot semantic, safe default for real
+    # money). Set positive (e.g. 240) on aggressive profiles where the
+    # bot should self-heal without operator action.
+    red_latch_auto_release_minutes: int = 0
 
 
 class RiskManager:
@@ -82,6 +92,9 @@ class RiskManager:
                 dd_ema_span_minutes=self.config.dd_ema_span_minutes,
                 red_latch_enabled=self.config.red_latch_enabled,
                 cooldown_after_red_minutes=self.config.cooldown_after_red_minutes,
+                red_latch_auto_release_minutes=(
+                    self.config.red_latch_auto_release_minutes
+                ),
             )
         )
 
@@ -160,9 +173,7 @@ class RiskManager:
         """
         self._hsl.reset_red_latch()
 
-    def assess(
-        self, account: AccountState, timestamp_ms: int = 0
-    ) -> RiskTier:
+    def assess(self, account: AccountState, timestamp_ms: int = 0) -> RiskTier:
         """Classify the current account drawdown.
 
         Delegates to :class:`HslSupervisor.assess` and converts the
@@ -173,13 +184,18 @@ class RiskManager:
         return RiskTier(hsl_tier.value)
 
     def filter_orders(
-        self, orders: list[Order], account: AccountState, timestamp: int = 0,
+        self,
+        orders: list[Order],
+        account: AccountState,
+        timestamp: int = 0,
         exchange_params: dict[str, ExchangeParams] | None = None,
     ) -> list[Order]:
         tier = self.assess(account, timestamp)
 
         if tier == RiskTier.RED:
-            self.red_cooldown_until = timestamp + self.config.cooldown_after_red_minutes * 60_000
+            self.red_cooldown_until = (
+                timestamp + self.config.cooldown_after_red_minutes * 60_000
+            )
             return self._panic_close_all(account)
 
         # Global realized-loss gate (Stage 4 follow-up). Was a dead
@@ -191,7 +207,10 @@ class RiskManager:
         # the RED branch above — once we're in graceful loss-shedding,
         # the latch / panic close is the right circuit, not this gate.
         orders = self._enforce_realized_loss_gate(
-            orders, account, timestamp, exchange_params,
+            orders,
+            account,
+            timestamp,
+            exchange_params,
         )
 
         if timestamp < self.red_cooldown_until:
@@ -222,7 +241,10 @@ class RiskManager:
         return self._enforce_exposure_limits(orders, account)
 
     def _enforce_realized_loss_gate(
-        self, orders: list[Order], account: AccountState, timestamp: int,
+        self,
+        orders: list[Order],
+        account: AccountState,
+        timestamp: int,
         exchange_params: dict[str, ExchangeParams] | None = None,
     ) -> list[Order]:
         """Cap projected 24h realized loss at ``balance * max_realized_loss_pct``.
@@ -252,17 +274,18 @@ class RiskManager:
             return orders
 
         budget = balance * cap_pct
-        already_lost = (
-            -account.loss_24h(OrderSource.GRID, timestamp)
-            -account.loss_24h(OrderSource.TREND, timestamp)
-        )
+        already_lost = -account.loss_24h(
+            OrderSource.GRID, timestamp
+        ) - account.loss_24h(OrderSource.TREND, timestamp)
         remaining = budget - already_lost
         if remaining <= 0:
             # Already over budget. Drop all reduce_only LOSS orders;
             # let profit-taking and non-reduce pass.
             return [
-                o for o in orders
-                if not o.reduce_only or o.is_market
+                o
+                for o in orders
+                if not o.reduce_only
+                or o.is_market
                 or self._projected_loss(o, account) <= 0
             ]
 
@@ -287,13 +310,15 @@ class RiskManager:
                 remaining = 0.0
                 continue
             from dataclasses import replace as _replace
+
             result.append(_replace(o, qty=new_qty))
             remaining = 0.0
         return result
 
     @staticmethod
     def _projected_loss(
-        order: Order, account: AccountState,
+        order: Order,
+        account: AccountState,
         exchange_params: dict[str, ExchangeParams] | None = None,
     ) -> float:
         """Estimate the realized loss this reduce-only order would book.
@@ -323,7 +348,9 @@ class RiskManager:
         return max(loss, 0.0)
 
     def _apply_source_pause(
-        self, orders: list[Order], account: AccountState,
+        self,
+        orders: list[Order],
+        account: AccountState,
         tier: RiskTier = RiskTier.GREEN,
     ) -> list[Order]:
         """Drop new entries for any source whose bucket is in deep drawdown.
@@ -378,15 +405,17 @@ class RiskManager:
                 (Side.SHORT, OrderSource.TREND, ss.trend_short),
             ):
                 if pos.is_open:
-                    orders.append(Order(
-                        symbol=symbol,
-                        side=side,
-                        price=ss.last_price,
-                        qty=abs(pos.size),
-                        source=source,
-                        reduce_only=True,
-                        is_market=True,
-                    ))
+                    orders.append(
+                        Order(
+                            symbol=symbol,
+                            side=side,
+                            price=ss.last_price,
+                            qty=abs(pos.size),
+                            source=source,
+                            reduce_only=True,
+                            is_market=True,
+                        )
+                    )
         return orders
 
     def compute_unstuck_orders(
@@ -434,30 +463,54 @@ class RiskManager:
         for symbol, ss in account.symbols.items():
             ep = exchange_params.get(symbol) if exchange_params else None
             candidate = self._unstuck_for_bucket(
-                symbol, ss, Side.LONG, OrderSource.GRID,
-                ss.position_long, grid_wallet_exposure_limit,
-                balance, allowance_budget - grid_loss_spent, ep,
+                symbol,
+                ss,
+                Side.LONG,
+                OrderSource.GRID,
+                ss.position_long,
+                grid_wallet_exposure_limit,
+                balance,
+                allowance_budget - grid_loss_spent,
+                ep,
             )
             if candidate is not None:
                 candidates.append(candidate)
             candidate = self._unstuck_for_bucket(
-                symbol, ss, Side.SHORT, OrderSource.GRID,
-                ss.position_short, grid_wallet_exposure_limit,
-                balance, allowance_budget - grid_loss_spent, ep,
+                symbol,
+                ss,
+                Side.SHORT,
+                OrderSource.GRID,
+                ss.position_short,
+                grid_wallet_exposure_limit,
+                balance,
+                allowance_budget - grid_loss_spent,
+                ep,
             )
             if candidate is not None:
                 candidates.append(candidate)
             candidate = self._unstuck_for_bucket(
-                symbol, ss, Side.LONG, OrderSource.TREND,
-                ss.trend_long, self.config.trend_wallet_exposure_limit,
-                balance, allowance_budget - trend_loss_spent, ep,
+                symbol,
+                ss,
+                Side.LONG,
+                OrderSource.TREND,
+                ss.trend_long,
+                self.config.trend_wallet_exposure_limit,
+                balance,
+                allowance_budget - trend_loss_spent,
+                ep,
             )
             if candidate is not None:
                 candidates.append(candidate)
             candidate = self._unstuck_for_bucket(
-                symbol, ss, Side.SHORT, OrderSource.TREND,
-                ss.trend_short, self.config.trend_wallet_exposure_limit,
-                balance, allowance_budget - trend_loss_spent, ep,
+                symbol,
+                ss,
+                Side.SHORT,
+                OrderSource.TREND,
+                ss.trend_short,
+                self.config.trend_wallet_exposure_limit,
+                balance,
+                allowance_budget - trend_loss_spent,
+                ep,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -612,16 +665,61 @@ class RiskManager:
         orders fill. Without this, every order is checked against the
         current snapshot only and N entries each below the cap can
         collectively breach it N-fold.
+
+        Round-22 TWEL fairness: candidate entries are processed in
+        ascending order of their bucket's pre-projection wallet
+        exposure so the most-underweighted (symbol, side) bucket gets
+        first call on a tight budget. Reduce-only orders keep their
+        original ordering and always pass.
         """
-        filtered = []
         denom = max(account.balance, 1e-12)
-        base_twe = (
-            account.total_wallet_exposure(Side.LONG)
-            + account.total_wallet_exposure(Side.SHORT)
-        )
+        base_twe = account.total_wallet_exposure(
+            Side.LONG
+        ) + account.total_wallet_exposure(Side.SHORT)
         # Per-(symbol, side) base WE cache so we don't pay the sum
         # over open buckets every iteration.
         base_we_per_key: dict[tuple[str, Side], float] = {}
+
+        def _key_base_we(o: Order) -> float:
+            ss_local = account.symbols.get(o.symbol)
+            if ss_local is None:
+                return 0.0
+            key_local = (o.symbol, o.side)
+            cached = base_we_per_key.get(key_local)
+            if cached is not None:
+                return cached
+            cm_local = ss_local.c_mult
+            if o.side == Side.LONG:
+                buckets_local = (ss_local.position_long, ss_local.trend_long)
+            else:
+                buckets_local = (ss_local.position_short, ss_local.trend_short)
+            v = sum(
+                abs(p.size) * p.entry_price * cm_local / denom
+                for p in buckets_local
+                if p.is_open
+            )
+            base_we_per_key[key_local] = v
+            return v
+
+        # Stable sort: entries by base WE ascending, reduce-only kept in
+        # their original order so they always pass through unchanged.
+        entries_with_idx = [(i, o) for i, o in enumerate(orders) if not o.reduce_only]
+        entries_with_idx.sort(key=lambda iv: (_key_base_we(iv[1]), iv[0]))
+        ordered: list[Order] = [None] * len(orders)  # type: ignore[list-item]
+        # Place reduce-only at their original positions.
+        for i, o in enumerate(orders):
+            if o.reduce_only:
+                ordered[i] = o
+        # Fill the remaining slots in TWEL-fair order.
+        cursor = 0
+        for _, entry in entries_with_idx:
+            while cursor < len(ordered) and ordered[cursor] is not None:
+                cursor += 1
+            ordered[cursor] = entry
+            cursor += 1
+        orders = ordered
+
+        filtered = []
         twe_added = 0.0
         we_added: dict[tuple[str, Side], float] = {}
         for o in orders:
@@ -649,7 +747,8 @@ class RiskManager:
                         buckets = (ss.position_short, ss.trend_short)
                     base_we_per_key[key] = sum(
                         abs(p.size) * p.entry_price * cm / denom
-                        for p in buckets if p.is_open
+                        for p in buckets
+                        if p.is_open
                     )
                 base_we = base_we_per_key[key]
                 already_added = we_added.get(key, 0.0)

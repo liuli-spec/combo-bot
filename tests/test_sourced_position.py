@@ -11,7 +11,6 @@ from __future__ import annotations
 import pytest
 
 from combo_bot.backtest import Backtester, BacktestConfig
-from combo_bot.regime import RegimeArbiterConfig
 from combo_bot.risk import RiskConfig, RiskManager
 from combo_bot.types import (
     AccountState,
@@ -23,7 +22,6 @@ from combo_bot.types import (
     Side,
     SymbolState,
 )
-
 
 # ---------------------------------------------------------------------------
 # AccountState aggregation across buckets
@@ -68,8 +66,12 @@ class TestFillRouting:
         account.symbols["BTC"] = SymbolState("BTC", last_price=50000)
         ep = {"BTC": ExchangeParams()}
         candle = Candle(
-            timestamp=1, open=50000, high=50500, low=49500,
-            close=50000, volume=1.0,
+            timestamp=1,
+            open=50000,
+            high=50500,
+            low=49500,
+            close=50000,
+            volume=1.0,
         )
         return backtester, account, ep, candle
 
@@ -112,7 +114,9 @@ class TestFillRouting:
         ss.position_long = Position(0.1, 50000)
         ss.trend_long = Position(0.05, 50000)
 
-        close = Order("BTC", Side.LONG, 50500, 0.05, OrderSource.TREND, reduce_only=True)
+        close = Order(
+            "BTC", Side.LONG, 50500, 0.05, OrderSource.TREND, reduce_only=True
+        )
         bt._simulate_fills([close], {"BTC": c}, acc, ep, 1)
 
         assert ss.position_long.is_open
@@ -127,8 +131,13 @@ class TestFillRouting:
         ss.trend_long = Position(0.05, 50000)
 
         close = Order(
-            "BTC", Side.LONG, 50500, 0.1, OrderSource.RISK,
-            reduce_only=True, is_market=True,
+            "BTC",
+            Side.LONG,
+            50500,
+            0.1,
+            OrderSource.RISK,
+            reduce_only=True,
+            is_market=True,
         )
         bt._simulate_fills([close], {"BTC": c}, acc, ep, 1)
 
@@ -160,7 +169,12 @@ class TestPnLAttribution:
         """Grid TP fill should produce a non-zero realized PnL with source=GRID."""
         bt, acc, ep, c = setup
         close = Order(
-            "BTC", Side.LONG, 51000, 0.1, OrderSource.GRID, reduce_only=True,
+            "BTC",
+            Side.LONG,
+            51000,
+            0.1,
+            OrderSource.GRID,
+            reduce_only=True,
         )
         fills = bt._simulate_fills([close], {"BTC": c}, acc, ep, 1)
         assert len(fills) == 1
@@ -171,7 +185,12 @@ class TestPnLAttribution:
     def test_trend_fill_attributed_to_trend_pnl(self, setup):
         bt, acc, ep, c = setup
         close = Order(
-            "BTC", Side.LONG, 51000, 0.05, OrderSource.TREND, reduce_only=True,
+            "BTC",
+            Side.LONG,
+            51000,
+            0.05,
+            OrderSource.TREND,
+            reduce_only=True,
         )
         fills = bt._simulate_fills([close], {"BTC": c}, acc, ep, 1)
         assert len(fills) == 1
@@ -233,13 +252,15 @@ class TestExposureLimits:
         """A trend entry that fits its own bucket but breaks the combined
         per-symbol exposure cap should be rejected.
         """
-        risk = RiskManager(RiskConfig(
-            max_single_exposure=0.5,
-            max_drawdown_pct=1.0,
-            yellow_threshold=1.0,
-            orange_threshold=1.0,
-            red_threshold=1.0,
-        ))
+        risk = RiskManager(
+            RiskConfig(
+                max_single_exposure=0.5,
+                max_drawdown_pct=1.0,
+                yellow_threshold=1.0,
+                orange_threshold=1.0,
+                red_threshold=1.0,
+            )
+        )
         acc = AccountState(balance=10000, equity=10000, equity_peak=10000)
         ss = SymbolState("BTC", last_price=50000)
         # Grid bucket already at 40% exposure.
@@ -253,13 +274,15 @@ class TestExposureLimits:
         assert len(filtered) == 0
 
     def test_small_trend_entry_passes_under_combined_cap(self):
-        risk = RiskManager(RiskConfig(
-            max_single_exposure=0.5,
-            max_drawdown_pct=1.0,
-            yellow_threshold=1.0,
-            orange_threshold=1.0,
-            red_threshold=1.0,
-        ))
+        risk = RiskManager(
+            RiskConfig(
+                max_single_exposure=0.5,
+                max_drawdown_pct=1.0,
+                yellow_threshold=1.0,
+                orange_threshold=1.0,
+                red_threshold=1.0,
+            )
+        )
         acc = AccountState(balance=10000, equity=10000, equity_peak=10000)
         ss = SymbolState("BTC", last_price=50000)
         ss.position_long = Position(0.08, 50000)  # 40% WE

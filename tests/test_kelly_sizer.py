@@ -29,9 +29,14 @@ def _fill(
     source: OrderSource = OrderSource.TREND,
 ) -> Fill:
     return Fill(
-        timestamp=0, symbol="BTC", side=Side.LONG,
-        price=price, qty=qty, fee=0.0,
-        realized_pnl=pnl, source=source,
+        timestamp=0,
+        symbol="BTC",
+        side=Side.LONG,
+        price=price,
+        qty=qty,
+        fee=0.0,
+        realized_pnl=pnl,
+        source=source,
     )
 
 
@@ -53,9 +58,13 @@ class TestColdStart:
         assert s.fraction(OrderSource.TREND) == 1.0
 
     def test_at_min_samples_starts_computing(self):
-        s = KellySizer(KellySizerConfig(
-            min_samples=5, fractional_kelly=1.0, max_fraction=10.0,
-        ))
+        s = KellySizer(
+            KellySizerConfig(
+                min_samples=5,
+                fractional_kelly=1.0,
+                max_fraction=10.0,
+            )
+        )
         # 5 identical positive samples — mean > 0, var = 0 → max_fraction.
         for _ in range(5):
             s.record_fill(_fill(pnl=50.0))
@@ -92,12 +101,15 @@ class TestRecordRules:
 
 class TestEdgeSign:
     def test_positive_edge_returns_positive_fraction(self):
-        s = KellySizer(KellySizerConfig(
-            min_samples=10, fractional_kelly=0.25, max_fraction=10.0,
-        ))
+        s = KellySizer(
+            KellySizerConfig(
+                min_samples=10,
+                fractional_kelly=0.25,
+                max_fraction=10.0,
+            )
+        )
         # Returns of +1% with small variance: clear positive edge.
-        for pnl in [50.0, 60.0, 40.0, 55.0, 45.0,
-                    50.0, 60.0, 40.0, 55.0, 45.0]:
+        for pnl in [50.0, 60.0, 40.0, 55.0, 45.0, 50.0, 60.0, 40.0, 55.0, 45.0]:
             s.record_fill(_fill(pnl=pnl, qty=0.1, price=50_000.0))
         # Returns are around 0.01 each (50/5000), mean ~0.01, var tiny.
         # Kelly = mean/var → very large → clamped by max_fraction.
@@ -131,10 +143,14 @@ class TestFractionalKelly:
     def test_fractional_kelly_multiplier_scales_output(self):
         # Identical setup as positive-edge test, but with halved fk.
         cfg_full = KellySizerConfig(
-            min_samples=5, fractional_kelly=1.0, max_fraction=10.0,
+            min_samples=5,
+            fractional_kelly=1.0,
+            max_fraction=10.0,
         )
         cfg_half = KellySizerConfig(
-            min_samples=5, fractional_kelly=0.5, max_fraction=10.0,
+            min_samples=5,
+            fractional_kelly=0.5,
+            max_fraction=10.0,
         )
         full = KellySizer(cfg_full)
         half = KellySizer(cfg_half)
@@ -151,9 +167,13 @@ class TestFractionalKelly:
         assert f > 0 and h > 0
 
     def test_max_fraction_caps_output(self):
-        s = KellySizer(KellySizerConfig(
-            min_samples=5, fractional_kelly=1.0, max_fraction=0.3,
-        ))
+        s = KellySizer(
+            KellySizerConfig(
+                min_samples=5,
+                fractional_kelly=1.0,
+                max_fraction=0.3,
+            )
+        )
         # Very strong edge → full Kelly huge → capped to 0.3.
         for _ in range(5):
             s.record_fill(_fill(pnl=100.0))
@@ -167,9 +187,12 @@ class TestFractionalKelly:
 
 class TestWindow:
     def test_old_samples_drop_from_window(self):
-        s = KellySizer(KellySizerConfig(
-            window=5, min_samples=3,
-        ))
+        s = KellySizer(
+            KellySizerConfig(
+                window=5,
+                min_samples=3,
+            )
+        )
         for _ in range(5):
             s.record_fill(_fill(pnl=-100.0))  # 5 losses fill window
         for _ in range(5):
@@ -208,7 +231,8 @@ class TestBacktesterIntegration:
 
         candles = make_candles([50_000 + i * 80 for i in range(400)])
         cfg = BacktestConfig(
-            starting_balance=10_000, symbols=["BTC"],
+            starting_balance=10_000,
+            symbols=["BTC"],
             grid=GridConfig(max_grid_levels=2),
         )
 
@@ -221,7 +245,8 @@ class TestBacktesterIntegration:
         result = bt.run({"BTC": candles})
 
         overlay_entries = [
-            f for f in result.fills
+            f
+            for f in result.fills
             if f.source == OrderSource.TREND and f.realized_pnl == 0
         ]
         # With Kelly = 0 the overlay is suppressed end-to-end.
@@ -236,7 +261,8 @@ class TestBacktesterIntegration:
 
         candles = make_candles([50_000 + i * 80 for i in range(400)])
         cfg = BacktestConfig(
-            starting_balance=10_000, symbols=["BTC"],
+            starting_balance=10_000,
+            symbols=["BTC"],
             grid=GridConfig(max_grid_levels=2),
         )
 
@@ -251,15 +277,16 @@ class TestBacktesterIntegration:
         a few samples in the grid bucket."""
         from combo_bot.backtest import Backtester, BacktestConfig
         from combo_bot.grid_engine import GridConfig
-        from tests.conftest import make_candles
 
         # Use a longer oscillating series so the one-bar fill delay
         # (look-ahead fix) still allows grid entries to fill when
         # price dips toward the EMA band.
         from tests.conftest import make_oscillating_candles
+
         candles = make_oscillating_candles(n=2000, base=50_000, amplitude=500)
         cfg = BacktestConfig(
-            starting_balance=10_000, symbols=["BTC"],
+            starting_balance=10_000,
+            symbols=["BTC"],
             grid=GridConfig(
                 entry_initial_ema_dist=0.001,
                 entry_grid_spacing_pct=0.01,

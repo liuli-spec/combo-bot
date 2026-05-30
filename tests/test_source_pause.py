@@ -60,8 +60,8 @@ class TestAccountSourceBookkeeping:
         acc = _account()
         ss = acc.symbols["BTC"]
         ss.last_price = 55_000.0
-        ss.position_long = Position(0.1, 50_000.0)   # +500 grid upnl
-        ss.trend_long = Position(0.05, 50_000.0)     # +250 trend upnl
+        ss.position_long = Position(0.1, 50_000.0)  # +500 grid upnl
+        ss.trend_long = Position(0.05, 50_000.0)  # +250 trend upnl
         acc.grid_realized_pnl = 200.0
         acc.trend_realized_pnl = -100.0
 
@@ -215,7 +215,7 @@ class TestPauseReset:
         acc.trend_equity_peak = 5000.0
         acc.trend_equity = -3000.0  # 80% dd
         acc.grid_equity_peak = 8000.0
-        acc.grid_equity = -2000.0   # 100% dd
+        acc.grid_equity = -2000.0  # 100% dd
 
         orders = [
             Order("BTC", Side.LONG, 50_000, 0.01, OrderSource.TREND),
