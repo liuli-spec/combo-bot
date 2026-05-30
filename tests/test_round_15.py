@@ -81,9 +81,14 @@ def test_trend_sl_tp_exits_routed_through_confirm_trade_exit():
         current_time_ms=0,
         exchange_params=ExchangeParams(),
     )
-    survived = bt.strategy_runner.filter_exits(trend_exits, ctx)
-    # Vetoed → empty.
-    assert survived == []
+    # Round-25 P1 #4: confirm_trade_exit moved out of filter_exits
+    # into the final_confirm pass. The exit order must still be
+    # routed THROUGH the confirm hook somewhere — we test that by
+    # invoking filter_exits then final_confirm.
+    after_filter = bt.strategy_runner.filter_exits(trend_exits, ctx)
+    assert len(after_filter) == 1, "filter_exits no longer vetoes"
+    survived = bt.strategy_runner.final_confirm(after_filter, lambda _o: ctx)
+    assert survived == [], "final_confirm must veto when confirm_trade_exit=False"
     assert (
         _VetoTrendExitStrategy.saw_calls
     ), "confirm_trade_exit must be called for trend SL/TP exits"
@@ -151,12 +156,19 @@ def test_confirm_trade_exit_receives_final_price_after_adjustments():
         source=OrderSource.GRID,
         reduce_only=True,
     )
-    out = runner.filter_exits([exit_order], ctx)
+    # Round-25 P1 #4: confirm runs via final_confirm AFTER filter_exits
+    # has applied custom_exit_price / adjust_exit_price. The order
+    # passed into the confirm hook must carry the adjusted price.
+    after_filter = runner.filter_exits([exit_order], ctx)
+    assert after_filter[0].price == pytest.approx(51_100.0), (
+        "filter_exits must still apply custom_exit_price even after the "
+        "confirm hook was moved out"
+    )
+    runner.final_confirm(after_filter, lambda _o: ctx)
     assert seen_prices == [51_100.0], (
         f"confirm_trade_exit must see the price AFTER custom_/adjust_; "
         f"saw {seen_prices}"
     )
-    assert out[0].price == pytest.approx(51_100.0)
 
 
 # ────────────────────────────────────────────────────────────────────

@@ -134,6 +134,27 @@ def run_rust_backtest(
 
     `candles` may be a list of Candle dataclasses or a pre-built [N, 5] numpy
     array (open, high, low, close, volume).
+
+    .. warning::
+
+        **Rust backtest is GRID-ONLY.** The Rust core's per-bar loop
+        runs ``orchestrate()`` with both sides hardcoded to
+        ``TradingMode::Normal`` (see ``rust/src/backtest.rs:210``).
+        This means:
+
+        * No trend overlay (no TREND-bucket entries, no SL/TP exits).
+        * No RegimeArbiter mode transitions (no TP_ONLY in adverse
+          regimes, no GRACEFUL_STOP, no PANIC close on RED).
+        * No strategy callbacks (populate_*, confirm_*, custom_stop).
+        * No HSL latch / unstuck.
+
+        The Python ``Backtester`` is the ONLY backtest path that
+        exercises the full decision stack. Use the Rust path only
+        when you specifically need raw grid performance metrics on
+        a single config — DO NOT use it to estimate live performance
+        of a configuration that involves trend / strategy logic.
+        The Python and Rust results will diverge significantly any
+        time the regime arbiter would have changed mode.
     """
     if not RUST_AVAILABLE:
         raise RuntimeError(

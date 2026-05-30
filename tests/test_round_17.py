@@ -327,7 +327,10 @@ def test_confirm_trade_exit_for_market_sees_current_price_not_threshold():
         reduce_only=True,
         is_market=True,
     )
-    runner.filter_exits([market_exit], ctx)
+    # Round-25 P1 #4: confirm moved to final_confirm; the market-order
+    # rule (use ctx.current_price instead of order.price) still holds.
+    after_filter = runner.filter_exits([market_exit], ctx)
+    runner.final_confirm(after_filter, lambda _o: ctx)
     assert seen_prices == [pytest.approx(current)], (
         f"confirm_trade_exit must see ctx.current_price={current} for "
         f"market exits, not the SL threshold; saw {seen_prices}"

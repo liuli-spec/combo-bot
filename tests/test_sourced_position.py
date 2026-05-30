@@ -249,8 +249,11 @@ class TestPanicCloseIsolation:
 
 class TestExposureLimits:
     def test_single_symbol_exposure_sums_grid_plus_trend(self):
-        """A trend entry that fits its own bucket but breaks the combined
-        per-symbol exposure cap should be rejected.
+        """A trend entry that fits its own bucket but exceeds the
+        combined per-symbol exposure cap is now TRIMMED to the headroom
+        (Round-23 Passivbot partial-fit semantic) instead of being
+        dropped outright. The crucial invariant is unchanged: combined
+        exposure across grid + trend buckets MUST NOT exceed the cap.
         """
         risk = RiskManager(
             RiskConfig(
@@ -267,11 +270,28 @@ class TestExposureLimits:
         ss.position_long = Position(0.08, 50000)
         acc.symbols["BTC"] = ss
 
-        # Trend entry would add another 15% (notional 1500 / 10000) and
-        # push combined to 55%, exceeding 50% cap.
+        # Trend entry would add another 15% and push combined to 55%.
+        # Partial-fit trims it to 10% (fits the remaining headroom).
         orders = [Order("BTC", Side.LONG, 50000, 0.03, OrderSource.TREND)]
         filtered = risk.filter_orders(orders, acc)
-        assert len(filtered) == 0
+        assert len(filtered) == 1, (
+            f"partial-fit must trim the trend entry rather than drop it; "
+            f"got {len(filtered)} orders"
+        )
+        # Trimmed qty ≈ 0.02 (cost 1000 → WE 0.1). Floating-point math
+        # produces a value just below 0.02 — assert with tolerance.
+        trimmed = filtered[0]
+        assert trimmed.qty <= 0.02 + 1e-9, (
+            f"trimmed qty must not exceed the 0.1-WE headroom (qty 0.02); "
+            f"got {trimmed.qty}"
+        )
+        # Combined exposure stays AT or below the cap, never above.
+        combined_we = (
+            ss.position_long.size * 50000 / 10000 + trimmed.qty * trimmed.price / 10000
+        )
+        assert (
+            combined_we <= 0.5 + 1e-9
+        ), f"combined grid+trend WE must not exceed 0.5 cap; got {combined_we}"
 
     def test_small_trend_entry_passes_under_combined_cap(self):
         risk = RiskManager(

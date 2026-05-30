@@ -52,8 +52,22 @@ def _ep_to_dict(ep: ExchangeParams) -> dict:
     return asdict(ep)
 
 
-def _position_to_dict(pos: Position) -> dict:
-    return {"size": pos.size, "price": pos.entry_price}
+def _position_to_dict(pos: Position, side: Side | None = None) -> dict:
+    """Convert a Python ``Position`` to the dict shape the Rust core expects.
+
+    Round-26 fix: Python guarantees ``Position.size >= 0`` (see types.py
+    docstring), but the Rust core uses sign to encode direction —
+    ``calc_closes_short`` early-returns when ``size >= 0`` because it
+    interprets that as "no short position". Without an explicit sign
+    flip here the adapter silently fed Rust an empty short, which then
+    emitted no close orders. Caller MUST pass ``side`` so this layer
+    can do the conversion; ``side=None`` preserves the legacy behaviour
+    (long-only) for callers that don't yet pass it.
+    """
+    size = pos.size
+    if side == Side.SHORT and size > 0:
+        size = -size
+    return {"size": size, "price": pos.entry_price}
 
 
 def _state_to_dict(
@@ -151,7 +165,7 @@ def compute_grid_orders_rust(
     bp_dict = _config_to_dict(grid_config)
     ep_dict = _ep_to_dict(exchange_params)
     sp_dict = _state_to_dict(balance, bid, ask, ema_state, volatility)
-    pos_dict = _position_to_dict(position)
+    pos_dict = _position_to_dict(position, side=side)
     trail_dict = _trailing_to_dict(trailing or TrailingState(), side)
 
     orders: list[Order] = []

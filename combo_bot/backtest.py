@@ -19,8 +19,8 @@ from combo_bot.grid_engine import (
     GridEngine,
     ForagerScorer,
     ForagerWeights,
-    build_forager_candidates,
     calc_wallet_exposure,
+    compute_active_sides,
 )
 from combo_bot.trend_signal import TrendConfig, TrendEngine
 from combo_bot.merger import MergerConfig, DecisionMerger
@@ -146,6 +146,19 @@ class Backtester:
         # eliminates look-ahead bias — matches Rust backtest semantics).
         pending_orders: list[Order] = []
 
+        # Round-23: backtest now invokes the Freqtrade lifecycle hooks
+        # so a strategy validated against live behaves identically in
+        # backtest. Wrapped so a misbehaving callback can't kill the
+        # run.
+        try:
+            self.strategy.bot_start()
+        except Exception:
+            import logging
+
+            logging.getLogger("combo_bot.backtest").exception(
+                "[strategy] bot_start raised — continuing"
+            )
+
         for step in range(n_steps):
             candles = {s: candle_data[s][step] for s in symbols}
             ts = next(iter(candles.values())).timestamp
@@ -154,21 +167,14 @@ class Backtester:
             self._update_prices(account, candles)
             self._update_emas(account, candles)
             self._update_volatility(account, candles)
+            # Round-25 P1 #1: append data BEFORE bot_loop_start so the
+            # strategy can read the current bar in the hook; populate_*
+            # then runs AFTER bot_loop_start so it can use any instance
+            # vars the strategy just set. This matches Freqtrade's
+            # refresh→bot_loop_start→analyze ordering exactly.
             for s in symbols:
                 if self._strategy_uses_dataframe:
                     self.data_provider.append(s, candles[s])
-                    # Apply the strategy's populate_* callbacks so the
-                    # signal columns (enter_long / enter_short / etc.)
-                    # actually exist on the cached DataFrame that
-                    # read_strategy_signals reads from. Without this
-                    # call the populate hooks were dead code — the
-                    # strategy's entry/exit logic never reached the
-                    # regime arbiter, so user-defined signals silently
-                    # never fired. Strategies are expected to mutate
-                    # the DataFrame in place (freqtrade convention);
-                    # callbacks that return a new DataFrame won't
-                    # propagate back to the cache.
-                    self._apply_strategy_populates(s)
                 self.trend.update(s, candles[s].close)
             if self.correlation_gate is not None:
                 self.correlation_gate.update_prices(
@@ -217,35 +223,62 @@ class Backtester:
             if self.risk.check_liquidation(account):
                 break
 
+            # Round-25 P1 #1: bot_loop_start fires AFTER data append +
+            # equity update but BEFORE populate_*, so any instance vars
+            # the hook sets (e.g. cached external state) are visible to
+            # the populate callbacks — exactly Freqtrade ordering.
+            try:
+                from datetime import datetime, timezone
+
+                self.strategy.bot_loop_start(
+                    current_time=datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc),
+                )
+            except Exception:
+                import logging
+
+                logging.getLogger("combo_bot.backtest").exception(
+                    "[strategy] bot_loop_start raised — continuing"
+                )
+
+            # Now run populate_* with the hook's side-effects already
+            # in place. Skipped when the strategy doesn't override the
+            # DataFrame callbacks (fast path for engine-only configs).
+            if self._strategy_uses_dataframe:
+                for s in symbols:
+                    self._apply_strategy_populates(s)
+
             # ── compute orders for NEXT tick ──────────────────────
             all_orders: list[Order] = []
 
-            # Round-22: Forager symbol selection. When the universe is
-            # larger than the configured active-position count, only the
-            # top-scoring symbols receive new entries this tick;
-            # everything else still emits reduce-only closes so existing
-            # positions can wind down naturally. Symbols already holding
-            # a position on EITHER side stay active so the engine can
-            # keep managing them (closes, unstuck, trailing exits).
-            n_active = max(1, self.config.grid.n_positions)
+            # Round-24 per-side active sets (Passivbot orchestrator
+            # semantic): a strategy ``enter_long`` only activates the
+            # LONG side of that symbol, never the SHORT side. Open
+            # positions on each side are always active and consume the
+            # budget first; strategy entries take precedence over
+            # Forager picks for the remaining slots.
+            # Round-25 P1 #2: n_positions=0 is the explicit "disable
+            # new entries on this side" config (Passivbot semantic).
+            # Negative values are treated as zero. Open positions stay
+            # active for management regardless.
+            n_active = max(0, self.config.grid.n_positions)
             tick_signals = {s: self.trend.compute(s) for s in symbols}
-            if len(symbols) > n_active:
-                forced = {
-                    s
-                    for s in symbols
-                    if account.symbols[s].position_long.is_open
-                    or account.symbols[s].position_short.is_open
-                    or account.symbols[s].trend_long.is_open
-                    or account.symbols[s].trend_short.is_open
-                }
-                ranked = ForagerScorer.select_symbols(
-                    build_forager_candidates(symbols, candles, account, tick_signals),
-                    n_active,
-                    self.config.forager_weights,
-                )
-                active_set = set(ranked) | forced
-            else:
-                active_set = set(symbols)
+            tick_strategy_signals: dict[str, tuple[bool, bool, bool, bool]] = {}
+            for s in symbols:
+                if self._strategy_uses_dataframe:
+                    tick_strategy_signals[s] = read_strategy_signals(
+                        self.data_provider, s
+                    )
+                else:
+                    tick_strategy_signals[s] = (False, False, False, False)
+            active_long_set, active_short_set = compute_active_sides(
+                symbols=symbols,
+                account=account,
+                candles=candles,
+                signals=tick_signals,
+                strategy_signals=tick_strategy_signals,
+                n_positions=n_active,
+                weights=self.config.forager_weights,
+            )
 
             for s in symbols:
                 ss = account.symbols[s]
@@ -254,16 +287,12 @@ class Backtester:
                 candle = candles[s]
                 price = candle.close
 
-                if self._strategy_uses_dataframe:
-                    (
-                        strat_enter_long,
-                        strat_enter_short,
-                        strat_exit_long,
-                        strat_exit_short,
-                    ) = read_strategy_signals(self.data_provider, s)
-                else:
-                    strat_enter_long = strat_enter_short = False
-                    strat_exit_long = strat_exit_short = False
+                (
+                    strat_enter_long,
+                    strat_enter_short,
+                    strat_exit_long,
+                    strat_exit_short,
+                ) = tick_strategy_signals[s]
                 fr = self._funding_rate_for(funding_rates, s, step)
                 regime_view = self.regime_arbiter.compute(
                     signal,
@@ -417,12 +446,18 @@ class Backtester:
                         trend_entries,
                         ctx_overlay,
                     )
+                # Round-26: pass bar low/high so trend SL/TP triggers
+                # whenever the bar's INTRABAR print pierced the level,
+                # not just when the close did. Without this the
+                # backtest silently misses stops that live would catch.
                 trend_exits_long = self.merger.generate_trend_exit_orders(
                     s,
                     ss.trend_long,
                     Side.LONG,
                     price,
                     ep,
+                    bar_low=candle.low,
+                    bar_high=candle.high,
                 )
                 trend_exits_short = self.merger.generate_trend_exit_orders(
                     s,
@@ -430,6 +465,8 @@ class Backtester:
                     Side.SHORT,
                     price,
                     ep,
+                    bar_low=candle.low,
+                    bar_high=candle.high,
                 )
                 # Run trend SL/TP exits through the strategy exit hook.
                 # Pre-fix this bypassed StrategyRunner.filter_exits, so
@@ -556,28 +593,30 @@ class Backtester:
                                 self.strategy_runner.filter_entries([adj], ctx_apply)
                             )
 
-                # Round-22 Forager gate: non-active symbols may still
-                # emit reduce-only orders (closes, SL/TP, unstuck) so
-                # existing positions can wind down — but no new exposure.
-                if s in active_set:
-                    all_orders.extend(grid_long)
-                    all_orders.extend(grid_short)
-                    all_orders.extend(trailing_entries)
-                    all_orders.extend(trend_entries)
-                    all_orders.extend(trend_exits_long)
-                    all_orders.extend(trend_exits_short)
-                    all_orders.extend(strategy_orders)
-                else:
-                    for bucket in (
-                        grid_long,
-                        grid_short,
-                        trailing_entries,
-                        trend_entries,
-                        trend_exits_long,
-                        trend_exits_short,
-                        strategy_orders,
-                    ):
-                        all_orders.extend(o for o in bucket if o.reduce_only)
+                # Round-24 per-side Forager gate: each order is gated
+                # by its own side's active set. Reduce-only orders
+                # always pass so existing positions can wind down on
+                # either side regardless of activation status.
+                long_active = s in active_long_set
+                short_active = s in active_short_set
+                for bucket in (
+                    grid_long,
+                    grid_short,
+                    trailing_entries,
+                    trend_entries,
+                    trend_exits_long,
+                    trend_exits_short,
+                    strategy_orders,
+                ):
+                    for o in bucket:
+                        if o.reduce_only:
+                            all_orders.append(o)
+                            continue
+                        side_active = (
+                            long_active if o.side == Side.LONG else short_active
+                        )
+                        if side_active:
+                            all_orders.append(o)
 
             all_orders = self.protections.filter_orders(all_orders, ts)
             if self.correlation_gate is not None:
@@ -599,7 +638,38 @@ class Backtester:
                 account,
                 ts,
                 exchange_params=exchange_params,
+                grid_total_wallet_exposure_limit=(
+                    self.config.grid.total_wallet_exposure_limit
+                ),
             )
+
+            # Round-25 P1 #4: confirm_trade_entry/exit runs as the
+            # LAST gate (Freqtrade semantic) so the strategy sees
+            # qty AFTER correlation / vol-target / risk partial-fit.
+            def _resolve_ctx(order: Order) -> TradeContext:
+                ss = account.symbols[order.symbol]
+                ep = exchange_params[order.symbol]
+                if order.source == OrderSource.TREND:
+                    pos = ss.trend_long if order.side == Side.LONG else ss.trend_short
+                else:
+                    pos = (
+                        ss.position_long
+                        if order.side == Side.LONG
+                        else ss.position_short
+                    )
+                return TradeContext(
+                    symbol=order.symbol,
+                    side=order.side,
+                    position=pos,
+                    account=account,
+                    candle=candles[order.symbol],
+                    signal=tick_signals[order.symbol],
+                    current_time_ms=ts,
+                    exchange_params=ep,
+                    source=order.source,
+                )
+
+            all_orders = self.strategy_runner.final_confirm(all_orders, _resolve_ctx)
 
             pending_orders = all_orders
 
@@ -1035,7 +1105,22 @@ class Backtester:
             if ds_std > 1e-12:
                 sortino = mean_r / ds_std * np.sqrt(365)
 
-        calmar = adg * 365 / max(max_dd, 1e-12) if max_dd > 0 else 0.0
+        # Calmar uses simple annualization (adg * 365), matching the
+        # convention several backtest frameworks use. The strict
+        # compound annualization is ``(1+adg)**365 - 1`` — for typical
+        # adg values the simple form under-states; for ranking
+        # strategies it doesn't matter, but consumers expecting CAGR
+        # should derive it themselves.
+        #
+        # Round-26 footgun guard: sub-1-day backtests inflate adg
+        # because the ``max(duration_days, 1)`` clamp in the adg
+        # calculation above turns the total return into a "daily"
+        # return. We return 0 for runs shorter than one full day
+        # rather than emit a misleading Calmar.
+        if duration_days >= 1.0 and max_dd > 0:
+            calmar = adg * 365 / max(max_dd, 1e-12)
+        else:
+            calmar = 0.0
 
         return BacktestResult(
             fills=fills,

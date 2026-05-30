@@ -667,12 +667,26 @@ def test_risk_filter_accumulates_projected_exposure():
         for _ in range(3)
     ]
     out = risk._enforce_exposure_limits(orders, account)
-    # max_single_exposure=0.5; first order takes us to 0.4 (passes);
-    # second would take us to 0.8 (drops); third also drops.
-    assert len(out) == 1, (
-        f"expected only 1 of 3 orders to pass cumulative single-exposure cap; "
-        f"got {len(out)} — projection bug?"
+    # Round-23 partial-fit semantic (Passivbot risk.rs): first order
+    # takes us to WE 0.4 at full size; second is TRIMMED to fit the
+    # remaining 0.1 headroom (qty 0.02, WE 0.1) putting us exactly at
+    # the 0.5 cap; third has no headroom and is dropped. The total
+    # accepted exposure is still the cap — what changed is partial
+    # acceptance instead of full drop.
+    assert len(out) == 2, (
+        f"expected first full-size + second trimmed-to-fit = 2 orders; "
+        f"got {len(out)}"
     )
+    assert out[0].qty == pytest.approx(0.08), "first must be full size"
+    assert out[1].qty == pytest.approx(0.02, abs=1e-9), (
+        f"second must be trimmed to fit the 0.1 headroom (qty 0.02); "
+        f"got qty={out[1].qty}"
+    )
+    # Total accepted WE = 0.4 + 0.1 = 0.5 (exactly at cap, not over).
+    total_we = sum(o.qty * o.price * 1.0 / account.balance for o in out)
+    assert total_we == pytest.approx(
+        0.5, abs=1e-9
+    ), f"trimmed accepted total must sit AT the cap, not over; got {total_we}"
 
 
 def test_correlation_gate_accumulates_same_tick_entries():

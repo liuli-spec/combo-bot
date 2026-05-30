@@ -98,7 +98,12 @@ class TestStrategyRunner:
         filtered = runner.filter_entries(orders, default_ctx)
         assert len(filtered) == 2
 
-    def test_filter_entries_vetoes_on_callback_false(self, default_ctx):
+    def test_final_confirm_vetoes_on_callback_false(self, default_ctx):
+        # Round-25: confirm_trade_entry no longer fires inside
+        # filter_entries — it runs in the final_confirm pass after
+        # all upstream sizing/risk passes. filter_entries should
+        # therefore pass the order through unchanged; final_confirm
+        # drops it.
         class VetoStrategy(DefaultStrategy):
             def confirm_trade_entry(self, ctx, qty, price):
                 return False
@@ -106,7 +111,11 @@ class TestStrategyRunner:
         runner = StrategyRunner(VetoStrategy())
         orders = [Order("BTC", Side.LONG, 49000, 0.01, OrderSource.GRID)]
         filtered = runner.filter_entries(orders, default_ctx)
-        assert len(filtered) == 0
+        assert (
+            len(filtered) == 1
+        ), "filter_entries no longer vetoes; confirm moved to final_confirm"
+        confirmed = runner.final_confirm(filtered, lambda _o: default_ctx)
+        assert len(confirmed) == 0, "final_confirm must drop the vetoed entry"
 
     def test_filter_exits_passes_reduce_only(self, default_ctx):
         runner = StrategyRunner(DefaultStrategy())
@@ -117,6 +126,10 @@ class TestStrategyRunner:
         assert len(filtered) == 1
 
     def test_confirm_trade_entry_sees_final_price_and_qty(self, default_ctx):
+        # Round-25 P1 #4: confirm runs in final_confirm AFTER
+        # filter_entries (custom_entry_price + custom_stake_amount).
+        # Verify the confirm callback observes the post-adjust price
+        # and qty.
         seen: list[tuple[float, float]] = []
 
         class FinalOrderStrategy(DefaultStrategy):
@@ -136,11 +149,14 @@ class TestStrategyRunner:
         runner = StrategyRunner(FinalOrderStrategy())
         orders = [Order("BTC", Side.LONG, 49000, 0.01, OrderSource.GRID)]
         filtered = runner.filter_entries(orders, default_ctx)
-
+        # filter_entries sets price/qty.
         assert len(filtered) == 1
-        assert seen == [(2.0, 125.0)]
         assert filtered[0].price == pytest.approx(125.0)
         assert filtered[0].qty == pytest.approx(2.0)
+        # final_confirm sees the adjusted values and accepts.
+        confirmed = runner.final_confirm(filtered, lambda _o: default_ctx)
+        assert seen == [(2.0, 125.0)]
+        assert len(confirmed) == 1
 
 
 class TestCustomExit:

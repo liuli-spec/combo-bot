@@ -20,12 +20,11 @@ from combo_bot.types import (
     SymbolState,
 )
 from combo_bot.grid_engine import (
-    ForagerScorer,
     ForagerWeights,
     GridConfig,
     GridEngine,
-    build_forager_candidates,
     calc_wallet_exposure,
+    compute_active_sides,
 )
 from combo_bot.trend_signal import TrendConfig, TrendEngine
 from combo_bot.merger import MergerConfig, DecisionMerger
@@ -125,6 +124,11 @@ class LiveTrader:
         # live tick semantics agree: each new bar's close is consumed
         # EXACTLY ONCE by trend.update / data_provider.append.
         self._last_candle_ts: dict[str, int] = {}
+        # Round-25: symbols that received new bars during the most
+        # recent _refresh_candles. Populated by _refresh_candles and
+        # consumed by _tick AFTER bot_loop_start runs so populate_*
+        # sees any state the hook just set (Freqtrade ordering).
+        self._symbols_with_new_bars: set[str] = set()
         # ── execution guards (modelled on passivbot executor / reconciler) ──
         # Cap scales with symbol count so busy multi-symbol books don't
         # evict legitimate entries.
@@ -321,15 +325,6 @@ class LiveTrader:
                     logger.warning("Could not set leverage/margin for %s", symbol)
 
     async def _tick(self):
-        # Freqtrade-style per-tick hook — lets strategies refresh any
-        # external state (e.g. a remote signal feed) before the rest
-        # of the tick runs. Wrapped so it can't crash the tick.
-        try:
-            from datetime import datetime, timezone
-
-            self.strategy.bot_loop_start(current_time=datetime.now(tz=timezone.utc))
-        except Exception:
-            logger.exception("[strategy] bot_loop_start raised — continuing")
         # Pull fills first so source-isolated buckets (especially TREND)
         # are updated before aggregate exchange positions are split into
         # grid-vs-trend in _refresh_account.
@@ -343,6 +338,22 @@ class LiveTrader:
             return
         await self._refresh_candles()
 
+        # Round-25 P1 #1: Freqtrade order is refresh→bot_loop_start
+        # →analyze. So bot_loop_start runs AFTER all data refresh
+        # (fills, account, candles) but BEFORE the populate_* pass.
+        # populate_* runs immediately after, scoped to symbols that
+        # actually got new bars this tick.
+        try:
+            from datetime import datetime, timezone
+
+            self.strategy.bot_loop_start(current_time=datetime.now(tz=timezone.utc))
+        except Exception:
+            logger.exception("[strategy] bot_loop_start raised — continuing")
+
+        for sym_with_new in self._symbols_with_new_bars:
+            self._apply_strategy_populates(sym_with_new)
+        self._symbols_with_new_bars.clear()
+
         self.account.update_equity()
         # Feed the vol-target sizer's rolling equity sample so live
         # actually warms up the same way backtest does. Without this
@@ -353,40 +364,31 @@ class LiveTrader:
             self.vol_target_sizer.record_equity(self.account.equity)
         all_desired_orders: list[Order] = []
 
-        # Round-22 Forager: pick top-N active symbols once per tick;
-        # non-active symbols only get reduce-only treatment so existing
-        # exposure can wind down. Symbols already holding a position on
-        # any bucket stay active so the engine can keep managing them.
+        # Round-24 per-side active sets — see the parallel comment in
+        # Backtester.run for the rationale.
         now_for_signals = self._now_ms()
         tick_signals = {s: self.trend.compute(s) for s in self.config.symbols}
-        n_active = max(1, self.config.grid.n_positions)
-        if len(self.config.symbols) > n_active:
-            forced_active = {
-                s
-                for s in self.config.symbols
-                if (
-                    self.account.symbols[s].position_long.is_open
-                    or self.account.symbols[s].position_short.is_open
-                    or self.account.symbols[s].trend_long.is_open
-                    or self.account.symbols[s].trend_short.is_open
-                )
-            }
-            tick_candles = {
-                s: self._latest_candle(
-                    s, self.account.symbols[s].last_price, now_for_signals
-                )
-                for s in self.config.symbols
-            }
-            ranked = ForagerScorer.select_symbols(
-                build_forager_candidates(
-                    self.config.symbols, tick_candles, self.account, tick_signals
-                ),
-                n_active,
-                self.config.forager_weights,
+        tick_strategy_signals: dict[str, tuple[bool, bool, bool, bool]] = {
+            s: read_strategy_signals(self.data_provider, s) for s in self.config.symbols
+        }
+        # Round-25 P1 #2: n_positions=0 disables new entries on both
+        # sides (Passivbot semantic). Open positions keep being managed.
+        n_active = max(0, self.config.grid.n_positions)
+        tick_candles = {
+            s: self._latest_candle(
+                s, self.account.symbols[s].last_price, now_for_signals
             )
-            active_set = set(ranked) | forced_active
-        else:
-            active_set = set(self.config.symbols)
+            for s in self.config.symbols
+        }
+        active_long_set, active_short_set = compute_active_sides(
+            symbols=list(self.config.symbols),
+            account=self.account,
+            candles=tick_candles,
+            signals=tick_signals,
+            strategy_signals=tick_strategy_signals,
+            n_positions=n_active,
+            weights=self.config.forager_weights,
+        )
 
         for symbol in self.config.symbols:
             ss = self.account.symbols[symbol]
@@ -394,9 +396,12 @@ class LiveTrader:
             signal = tick_signals[symbol]
             price = ss.last_price
 
-            strat_enter_long, strat_enter_short, strat_exit_long, strat_exit_short = (
-                read_strategy_signals(self.data_provider, symbol)
-            )
+            (
+                strat_enter_long,
+                strat_enter_short,
+                strat_exit_long,
+                strat_exit_short,
+            ) = tick_strategy_signals[symbol]
             fr = self._funding_rates.get(symbol, 0.0)
             regime_view = self.regime_arbiter.compute(
                 signal,
@@ -655,9 +660,11 @@ class LiveTrader:
             ss.mode_long = regime_view.long_mode
             ss.mode_short = regime_view.short_mode
 
-            # Round-22 Forager gate: non-active symbols may still emit
-            # reduce-only orders so existing positions can wind down,
-            # but no new exposure is allowed this tick.
+            # Round-24 per-side Forager gate. Each order is gated by
+            # its own side's active set. Reduce-only orders always pass
+            # so existing positions can wind down on either side.
+            long_active = symbol in active_long_set
+            short_active = symbol in active_short_set
             tick_bundle = (
                 grid_long
                 + grid_short
@@ -667,10 +674,13 @@ class LiveTrader:
                 + trend_exits_s
                 + strategy_orders
             )
-            if symbol in active_set:
-                all_desired_orders.extend(tick_bundle)
-            else:
-                all_desired_orders.extend(o for o in tick_bundle if o.reduce_only)
+            for o in tick_bundle:
+                if o.reduce_only:
+                    all_desired_orders.append(o)
+                    continue
+                side_active = long_active if o.side == Side.LONG else short_active
+                if side_active:
+                    all_desired_orders.append(o)
 
         tick_ms = self._now_ms()
         # Stage 10: feed the correlation tracker once per tick from
@@ -715,6 +725,34 @@ class LiveTrader:
             self.account,
             tick_ms,
             exchange_params=self.exchange_params,
+            grid_total_wallet_exposure_limit=(
+                self.config.grid.total_wallet_exposure_limit
+            ),
+        )
+
+        # Round-25 P1 #4: confirm_trade_entry/exit runs as the LAST
+        # gate so the strategy sees qty AFTER all upstream scaling.
+        def _resolve_ctx(order: Order) -> TradeContext:
+            ss = self.account.symbols[order.symbol]
+            ep = self.exchange_params[order.symbol]
+            if order.source == OrderSource.TREND:
+                pos = ss.trend_long if order.side == Side.LONG else ss.trend_short
+            else:
+                pos = ss.position_long if order.side == Side.LONG else ss.position_short
+            return TradeContext(
+                symbol=order.symbol,
+                side=order.side,
+                position=pos,
+                account=self.account,
+                candle=self._latest_candle(order.symbol, ss.last_price, tick_ms),
+                signal=tick_signals.get(order.symbol),
+                current_time_ms=tick_ms,
+                exchange_params=ep,
+                source=order.source,
+            )
+
+        all_desired_orders = self.strategy_runner.final_confirm(
+            all_desired_orders, _resolve_ctx
         )
 
         await self._reconcile_orders(all_desired_orders)
@@ -985,6 +1023,10 @@ class LiveTrader:
             return 0.0
 
     async def _refresh_candles(self):
+        # Round-25 P1 #1: track which symbols got new bars so the
+        # caller can run populate_* AFTER bot_loop_start (Freqtrade
+        # refresh→bot_loop_start→analyze ordering). Reset every call.
+        self._symbols_with_new_bars: set[str] = set()
         for symbol in self.config.symbols:
             try:
                 ohlcv = await self.exchange.fetch_ohlcv(
@@ -1047,10 +1089,12 @@ class LiveTrader:
                         ss.volatility.update(lr)
                 if new_rows:
                     self._last_candle_ts[symbol] = int(new_rows[-1][0])
-                # Apply populate_* once after all new rows are appended
-                # so the strategy sees the full new window in one shot.
-                if new_rows:
-                    self._apply_strategy_populates(symbol)
+                    # Populate is deferred until AFTER bot_loop_start
+                    # so any external state the hook sets is visible
+                    # to populate_indicators / populate_entry_trend /
+                    # populate_exit_trend. The _tick loop does the
+                    # deferred populate after firing the hook.
+                    self._symbols_with_new_bars.add(symbol)
 
                 # Per-tick state that should ALWAYS reflect the latest
                 # bar even on a no-new-bar tick (the watermark may not
@@ -1438,14 +1482,43 @@ class LiveTrader:
                 if not ts_ms:
                     continue
                 age_s = max(0, (now_ms - int(ts_ms)) // 1000)
-                side = (
-                    Side.LONG if str(e.get("side", "")).lower() == "buy" else Side.SHORT
-                )
+                exchange_side = str(e.get("side", "")).lower()
                 reduce_only = bool(
                     e.get("reduceOnly")
                     or e.get("info", {}).get("reduceOnly") in (True, "true")
                 )
-                pos = ss.position_long if side == Side.LONG else ss.position_short
+                # Round-23: for reduce-only orders the POSITION side is
+                # the OPPOSITE of the exchange-leg side (a reduce-only
+                # sell closes a long; a reduce-only buy closes a short).
+                # Without this flip we'd hand the strategy a context
+                # whose .side and .position were both wrong, and a
+                # check_exit_timeout that branches on position would
+                # cancel the wrong leg. For entries (non-reduce-only)
+                # the legacy buy/sell → LONG/SHORT mapping is correct.
+                if reduce_only:
+                    side = Side.LONG if exchange_side == "sell" else Side.SHORT
+                else:
+                    side = Side.LONG if exchange_side == "buy" else Side.SHORT
+                # Pick the bucket the order is acting on. For reduce-only
+                # we prefer the bucket that actually holds an open
+                # position on this side — TREND first (overlay closes are
+                # usually market reduce-only), then GRID. For entries we
+                # default to the GRID bucket since the trend overlay
+                # entry is is_market=True and rarely sits in the open-
+                # orders book long enough to time out.
+                if reduce_only:
+                    if side == Side.LONG:
+                        if ss.trend_long.is_open:
+                            pos = ss.trend_long
+                        else:
+                            pos = ss.position_long
+                    else:
+                        if ss.trend_short.is_open:
+                            pos = ss.trend_short
+                        else:
+                            pos = ss.position_short
+                else:
+                    pos = ss.position_long if side == Side.LONG else ss.position_short
                 ctx = TradeContext(
                     symbol=symbol,
                     side=side,

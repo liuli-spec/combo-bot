@@ -395,44 +395,40 @@ def test_leverage_hook_cannot_exceed_operator_ceiling():
 
 
 # ────────────────────────────────────────────────────────────────────
-# Risk TWEL fairness
+# Risk TWEL ranking — superseded by round-25 distance-based test
 # ────────────────────────────────────────────────────────────────────
 
 
-def test_risk_twel_ranking_favors_underweighted_bucket_when_budget_tight():
-    """When two entries compete for a budget that fits only one, the
-    one targeting the LESS-loaded bucket must win — even if the
-    over-loaded bucket's entry appears first in the input list. This
-    is the Passivbot TWEL allocation semantic.
+def test_risk_twel_ranking_orders_entries_deterministically_when_budget_tight():
+    """Round-22 introduced TWEL ranking; round-25 switched the sort
+    key from "bucket base WE" (fairness) to "distance from market
+    price" (fill likelihood, matches Passivbot risk.rs). When both
+    entries are at the same distance from their respective marks the
+    sort breaks ties by input index, which is the behaviour this
+    test now pins. The distance-based variant is in test_round_25.py.
     """
     from combo_bot.risk import RiskConfig, RiskManager
     from combo_bot.types import (
         AccountState,
         Order,
         OrderSource,
-        Position,
         Side,
         SymbolState,
     )
 
     account = AccountState(balance=10_000.0, equity=10_000.0, equity_peak=10_000.0)
-    # ETH already loaded at WE=0.05; BTC empty (WE=0).
-    account.symbols["BTC/USDT:USDT"] = SymbolState(symbol="BTC/USDT:USDT")
-    account.symbols["ETH/USDT:USDT"] = SymbolState(
-        symbol="ETH/USDT:USDT",
-        position_long=Position(size=2.5, entry_price=2_000.0),  # cost=5000 → WE 0.5
+    account.symbols["BTC/USDT:USDT"] = SymbolState(
+        symbol="BTC/USDT:USDT", last_price=50_000.0
     )
-    # ETH first in the input list → without fairness, ETH would
-    # consume the budget by virtue of going first.
-    # Actually the test scenario: both entries are equally sized but
-    # ETH already holds WE 0.5 so its bucket is over-loaded; BTC is
-    # at WE=0. Only one 0.05 entry fits the 0.10 TWE cap (current TWE
-    # is already 0.5 from ETH, so neither would fit). Let me restructure:
-    # Use a TWE cap of 0.55 so exactly ONE more 0.05 entry fits beyond
-    # the existing 0.5 from ETH.
+    account.symbols["ETH/USDT:USDT"] = SymbolState(
+        symbol="ETH/USDT:USDT", last_price=2_000.0
+    )
+    # Both entries are AT their respective marks → distance 0 each →
+    # stable tiebreak by input index. With a 0.05-WE budget headroom
+    # for only ONE entry, the first one wins.
     risk2 = RiskManager(
         RiskConfig(
-            max_total_wallet_exposure=0.55,
+            max_total_wallet_exposure=0.05,
             max_single_exposure=1.0,
             yellow_threshold=0.99,
             orange_threshold=0.99,
@@ -453,17 +449,11 @@ def test_risk_twel_ranking_favors_underweighted_bucket_when_budget_tight():
         qty=0.01,  # cost=500 → WE 0.05
         source=OrderSource.GRID,
     )
-    out = risk2.filter_orders(
-        [eth_entry, btc_entry],  # ETH first in input order
-        account,
-        timestamp=0,
-    )
-    # BTC bucket is underweighted (WE=0 base), ETH is heavy (WE=0.5
-    # base). With a budget that fits only one extra 0.05, BTC must win.
+    out = risk2.filter_orders([eth_entry, btc_entry], account, timestamp=0)
     assert len(out) == 1
-    assert out[0].symbol == "BTC/USDT:USDT", (
-        "TWEL fairness: when budget fits only one entry, the "
-        "less-loaded (BTC, WE=0) bucket must beat the more-loaded "
-        "(ETH, WE=0.5) bucket — regardless of input list order; "
-        f"got {out[0].symbol}"
+    # Stable tiebreak by input index → ETH (first in input) wins
+    # when neither entry has a distance advantage.
+    assert out[0].symbol == "ETH/USDT:USDT", (
+        f"with equal distance, stable sort by input index must keep "
+        f"ETH (first in list); got {out[0].symbol}"
     )

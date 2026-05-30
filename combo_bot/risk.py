@@ -189,6 +189,7 @@ class RiskManager:
         account: AccountState,
         timestamp: int = 0,
         exchange_params: dict[str, ExchangeParams] | None = None,
+        grid_total_wallet_exposure_limit: float | None = None,
     ) -> list[Order]:
         tier = self.assess(account, timestamp)
 
@@ -238,7 +239,12 @@ class RiskManager:
             # accumulates same-tick projection (see _enforce_exposure_limits).
             orders = self._limit_new_entries(orders, account, scale=0.5)
 
-        return self._enforce_exposure_limits(orders, account)
+        return self._enforce_exposure_limits(
+            orders,
+            account,
+            exchange_params=exchange_params,
+            grid_total_wallet_exposure_limit=grid_total_wallet_exposure_limit,
+        )
 
     def _enforce_realized_loss_gate(
         self,
@@ -654,7 +660,11 @@ class RiskManager:
         return filtered
 
     def _enforce_exposure_limits(
-        self, orders: list[Order], account: AccountState
+        self,
+        orders: list[Order],
+        account: AccountState,
+        exchange_params: dict[str, ExchangeParams] | None = None,
+        grid_total_wallet_exposure_limit: float | None = None,
     ) -> list[Order]:
         """Drop entries that would breach the WE caps.
 
@@ -666,11 +676,27 @@ class RiskManager:
         current snapshot only and N entries each below the cap can
         collectively breach it N-fold.
 
-        Round-22 TWEL fairness: candidate entries are processed in
-        ascending order of their bucket's pre-projection wallet
-        exposure so the most-underweighted (symbol, side) bucket gets
-        first call on a tight budget. Reduce-only orders keep their
-        original ordering and always pass.
+        Round-25 P1 #3 TWEL by entry distance (Passivbot risk.rs
+        semantic): candidate entries are sorted by ascending distance
+        from the symbol's current mark price (``|price/mark - 1|``).
+        Closest-to-market entries fill first because they are most
+        likely to actually execute this tick; the marginal one trims
+        to fit the tightest cap and the remainder (farther from the
+        mark) are dropped. This replaces the round-22 "by bucket base
+        WE" fairness sort — different goal, closer to the reference.
+
+        Round-23 additions still apply:
+          * ``grid_total_wallet_exposure_limit`` (when provided)
+            enforces the previously-dead ``GridConfig.total_wallet
+            _exposure_limit`` field against the GRID bucket
+            specifically. The trend bucket is unaffected. ``None``
+            preserves the legacy "single global TWE cap" behaviour.
+          * partial-fit trim: when an entry would push TWE / single-
+            symbol / grid TWE past the cap, the order qty is scaled
+            DOWN to fit the smallest remaining headroom instead of
+            being dropped outright. If the trimmed qty falls below
+            ``ep.min_qty`` / ``ep.min_cost`` the order is dropped —
+            that's what the live executor would do anyway.
         """
         denom = max(account.balance, 1e-12)
         base_twe = account.total_wallet_exposure(
@@ -680,37 +706,30 @@ class RiskManager:
         # over open buckets every iteration.
         base_we_per_key: dict[tuple[str, Side], float] = {}
 
-        def _key_base_we(o: Order) -> float:
+        def _distance_to_mark(o: Order) -> float:
+            """Distance from the order's entry price to the symbol's
+            current mark price, normalized. Lower = closer to fill.
+            Falls back to the order's own price (distance 0) when no
+            mark is available (e.g. early-tick test scaffolding) so
+            the sort stays deterministic via the stable-index tiebreak.
+            """
             ss_local = account.symbols.get(o.symbol)
-            if ss_local is None:
+            mark = ss_local.last_price if ss_local is not None else 0.0
+            if mark <= 0 or o.price <= 0:
                 return 0.0
-            key_local = (o.symbol, o.side)
-            cached = base_we_per_key.get(key_local)
-            if cached is not None:
-                return cached
-            cm_local = ss_local.c_mult
-            if o.side == Side.LONG:
-                buckets_local = (ss_local.position_long, ss_local.trend_long)
-            else:
-                buckets_local = (ss_local.position_short, ss_local.trend_short)
-            v = sum(
-                abs(p.size) * p.entry_price * cm_local / denom
-                for p in buckets_local
-                if p.is_open
-            )
-            base_we_per_key[key_local] = v
-            return v
+            return abs(o.price / mark - 1.0)
 
-        # Stable sort: entries by base WE ascending, reduce-only kept in
-        # their original order so they always pass through unchanged.
+        # Stable sort: entries by distance-to-mark ascending, original
+        # index breaks ties so behaviour stays deterministic when all
+        # entries are at the same price (common test scenario).
+        # Reduce-only orders keep their original positions and always
+        # pass through unchanged.
         entries_with_idx = [(i, o) for i, o in enumerate(orders) if not o.reduce_only]
-        entries_with_idx.sort(key=lambda iv: (_key_base_we(iv[1]), iv[0]))
+        entries_with_idx.sort(key=lambda iv: (_distance_to_mark(iv[1]), iv[0]))
         ordered: list[Order] = [None] * len(orders)  # type: ignore[list-item]
-        # Place reduce-only at their original positions.
         for i, o in enumerate(orders):
             if o.reduce_only:
                 ordered[i] = o
-        # Fill the remaining slots in TWEL-fair order.
         cursor = 0
         for _, entry in entries_with_idx:
             while cursor < len(ordered) and ordered[cursor] is not None:
@@ -719,8 +738,22 @@ class RiskManager:
             cursor += 1
         orders = ordered
 
+        # Grid-bucket TWE base = sum of grid-bucket exposure across the
+        # account. Only computed once; trend-bucket exposure is
+        # explicitly excluded so the new ``grid_total_wallet_exposure
+        # _limit`` constrains the GRID bucket alone.
+        base_grid_twe = 0.0
+        if grid_total_wallet_exposure_limit is not None:
+            for ss_acc in account.symbols.values():
+                for p in (ss_acc.position_long, ss_acc.position_short):
+                    if p.is_open:
+                        base_grid_twe += (
+                            abs(p.size) * p.entry_price * ss_acc.c_mult / denom
+                        )
+
         filtered = []
         twe_added = 0.0
+        grid_twe_added = 0.0
         we_added: dict[tuple[str, Side], float] = {}
         for o in orders:
             if o.reduce_only:
@@ -729,17 +762,28 @@ class RiskManager:
 
             ss = account.symbols.get(o.symbol)
             cm = ss.c_mult if ss else 1.0
-            cost = o.qty * o.price * cm
-            cost_we = cost / denom
+            cost_we_full = (o.qty * o.price * cm) / denom
 
-            if base_twe + twe_added + cost_we > self.config.max_total_wallet_exposure:
-                continue
+            # Compute the headroom each active cap leaves. A negative
+            # headroom means the bucket is already past the cap; the
+            # entry must be dropped.
+            twe_headroom = self.config.max_total_wallet_exposure - (
+                base_twe + twe_added
+            )
+            grid_headroom = float("inf")
+            if (
+                grid_total_wallet_exposure_limit is not None
+                and o.source == OrderSource.GRID
+            ):
+                grid_headroom = grid_total_wallet_exposure_limit - (
+                    base_grid_twe + grid_twe_added
+                )
 
-            if ss:
-                # Single-symbol exposure must sum grid + trend buckets —
-                # otherwise the trend overlay sneaks past the per-symbol
-                # cap by living in a separate bucket.
-                key = (o.symbol, o.side)
+            key = (o.symbol, o.side) if ss else None
+            single_headroom = float("inf")
+            base_we_for_key = 0.0
+            already_added_for_key = 0.0
+            if ss and key is not None:
                 if key not in base_we_per_key:
                     if o.side == Side.LONG:
                         buckets = (ss.position_long, ss.trend_long)
@@ -750,14 +794,52 @@ class RiskManager:
                         for p in buckets
                         if p.is_open
                     )
-                base_we = base_we_per_key[key]
-                already_added = we_added.get(key, 0.0)
-                if base_we + already_added + cost_we > self.config.max_single_exposure:
-                    continue
-                we_added[key] = already_added + cost_we
+                base_we_for_key = base_we_per_key[key]
+                already_added_for_key = we_added.get(key, 0.0)
+                single_headroom = self.config.max_single_exposure - (
+                    base_we_for_key + already_added_for_key
+                )
 
-            twe_added += cost_we
-            filtered.append(o)
+            min_headroom = min(twe_headroom, grid_headroom, single_headroom)
+            if min_headroom <= 0:
+                # No room at all — drop.
+                continue
+
+            if cost_we_full <= min_headroom:
+                # Fits as-is, no trim required.
+                accepted_qty = o.qty
+                cost_we_used = cost_we_full
+                accepted = o
+            else:
+                # Partial-fit trim: scale the qty to exactly fit the
+                # tightest cap, then quantize + revalidate against
+                # min_qty / min_cost when ep is available.
+                scale = min_headroom / cost_we_full
+                trimmed_qty = o.qty * scale
+                ep = (exchange_params or {}).get(o.symbol)
+                if ep is not None:
+                    if ep.qty_step > 0:
+                        trimmed_qty = quantize_qty(trimmed_qty, ep.qty_step)
+                    if trimmed_qty < ep.min_qty:
+                        continue
+                    trim_cost = trimmed_qty * o.price * cm
+                    if trim_cost < ep.min_cost:
+                        continue
+                if trimmed_qty <= 0:
+                    continue
+                accepted_qty = trimmed_qty
+                cost_we_used = (trimmed_qty * o.price * cm) / denom
+                accepted = replace(o, qty=accepted_qty)
+
+            if ss and key is not None:
+                we_added[key] = already_added_for_key + cost_we_used
+            twe_added += cost_we_used
+            if (
+                grid_total_wallet_exposure_limit is not None
+                and o.source == OrderSource.GRID
+            ):
+                grid_twe_added += cost_we_used
+            filtered.append(accepted)
         return filtered
 
     def check_liquidation(self, account: AccountState) -> bool:

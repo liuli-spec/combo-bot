@@ -12,7 +12,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from combo_bot.types import (
     AccountState,
@@ -233,12 +233,18 @@ class StrategyRunner:
     # --- entry filtering ----------------------------------------------------
 
     def filter_entries(self, orders: list[Order], context: TradeContext) -> list[Order]:
-        """Apply entry-side strategy hooks to a list of orders.
+        """Apply entry-side price + sizing hooks to a list of orders.
 
-        Order processing mirrors freqtrade's final-confirm semantics:
+        Round-25 P1 #4: ``confirm_trade_entry`` is NO LONGER called
+        here. It now runs in a final pass (:meth:`final_confirm`)
+        AFTER correlation / vol-target / risk-partial-fit have all
+        had a chance to scale qty down. Otherwise the strategy was
+        confirming on a qty the bot never actually transacted on.
+
+        Remaining processing here mirrors Freqtrade's pre-confirm
+        sequence:
           1. ``custom_entry_price`` / ``adjust_entry_price`` — adjust price.
           2. ``custom_stake_amount`` — adjust qty for new entries.
-          3. ``confirm_trade_entry`` — drop vetoed final orders.
         """
         result: list[Order] = []
         for order in orders:
@@ -272,10 +278,7 @@ class StrategyRunner:
             # Notional INCLUDES contract multiplier. For c_mult != 1
             # (index-multiplied / coin-margined), qty * price is just
             # the dimensionless count × index — the real USD-equivalent
-            # stake is qty * price * c_mult. Pre-fix used the wrong
-            # denominator and ``custom_stake_amount`` returned a stake
-            # that, when divided back by final_price, produced a qty
-            # off by c_mult.
+            # stake is qty * price * c_mult.
             proposed_stake = order.qty * final_price * c_mult
             min_stake = ctx.exchange_params.min_cost
             max_stake = max(ctx.account.balance, proposed_stake)
@@ -284,9 +287,6 @@ class StrategyRunner:
             )
             denom = final_price * c_mult
             new_qty = new_stake / denom if denom > 0 else order.qty
-
-            if not self.strategy.confirm_trade_entry(ctx, new_qty, final_price):
-                continue
 
             if order.is_market:
                 # Don't overwrite the order's stated price for market
@@ -344,22 +344,82 @@ class StrategyRunner:
                 adjusted = self.strategy.adjust_exit_price(ctx, new_price, exit_reason)
                 final_price = adjusted if adjusted is not None else new_price
 
-            if not self.strategy.confirm_trade_exit(
-                ctx, order.qty, final_price, exit_reason
-            ):
-                continue
-
-            # Preserve the order's stated price for market orders —
-            # downstream (live executor / backtest sim) ignores it
-            # anyway, but mutating it to the confirm-reference price
-            # would lose the SL threshold the order was originally
-            # built around (useful for logs/debug).
+            # Round-25 P1 #4: confirm_trade_exit moved to final_confirm
+            # pass so the strategy sees the FINAL qty after risk
+            # filtering / trimming, not the pre-filter qty.
             if order.is_market:
+                # Preserve the order's stated price for market orders.
                 result.append(order)
             else:
                 result.append(replace(order, price=final_price))
 
         return result
+
+    # --- final confirm pass (Round-25 P1 #4) -------------------------------
+
+    def final_confirm(
+        self,
+        orders: list[Order],
+        ctx_resolver: "Callable[[Order], TradeContext]",
+    ) -> list[Order]:
+        """Run ``confirm_trade_entry`` / ``confirm_trade_exit`` against
+        the FINAL qty after all upstream sizing / risk passes.
+
+        Freqtrade calls the confirm hook as the last gate before
+        submitting to the exchange. Up to round 24 we ran it inside
+        ``filter_entries`` / ``filter_exits`` — but correlation,
+        vol-target, and risk partial-fit can ALL shrink qty after
+        that, so the strategy never saw the number actually
+        transacted. This pass runs once at the end of the pipeline
+        per Backtester / LiveTrader to close that gap.
+
+        ``ctx_resolver`` is a callable that builds a fresh
+        :class:`TradeContext` for each order — backtest and live each
+        supply their own resolver so this layer doesn't need to
+        know about candle caches, signals, or per-symbol state.
+        Orders are kept in their input order; a vetoed order is
+        dropped and no attempt is made to "scale to acceptable".
+        """
+        accepted: list[Order] = []
+        for order in orders:
+            try:
+                ctx = ctx_resolver(order)
+            except Exception:
+                # Resolver failed (e.g. missing symbol state) — fail
+                # CLOSED for entries, OPEN for reduce-only so we
+                # never silently strand exits.
+                if order.reduce_only:
+                    accepted.append(order)
+                continue
+            # Market orders: surface ctx.current_price instead of the
+            # order's stated price. For market entries the live
+            # executor sends price=None and the fill lands near the
+            # current execution reference. For market exits the
+            # order.price typically encodes a stoploss threshold,
+            # which would mislead the strategy about the actual exit
+            # rate. Limit orders use the (post-adjust) order price.
+            if order.is_market and ctx.current_price > 0:
+                confirm_price = ctx.current_price
+            else:
+                confirm_price = order.price
+            try:
+                if order.reduce_only:
+                    exit_reason = self._exit_reason_for(order)
+                    ok = self.strategy.confirm_trade_exit(
+                        ctx, order.qty, confirm_price, exit_reason
+                    )
+                else:
+                    ok = self.strategy.confirm_trade_entry(
+                        ctx, order.qty, confirm_price
+                    )
+            except Exception:
+                # Same fail-closed/open policy on hook crash.
+                if order.reduce_only:
+                    accepted.append(order)
+                continue
+            if ok:
+                accepted.append(order)
+        return accepted
 
     # --- adaptive exit checks -----------------------------------------------
 

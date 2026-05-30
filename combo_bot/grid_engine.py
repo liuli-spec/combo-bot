@@ -635,3 +635,95 @@ def build_forager_candidates(
             conviction,
         )
     return out
+
+
+def compute_active_sides(
+    symbols: list[str],
+    account: "AccountState",
+    candles: dict[str, "Candle"],
+    signals: dict[str, "TrendSignal"],
+    strategy_signals: dict[str, tuple[bool, bool, bool, bool]],
+    n_positions: int,
+    weights: ForagerWeights,
+) -> tuple[set[str], set[str]]:
+    """Return ``(active_long_set, active_short_set)`` for one tick.
+
+    Round-24 fix for the symbol-level active set: Passivbot's
+    orchestrator maintains active sets PER POSITION SIDE so a strategy
+    that fires ``enter_long`` doesn't accidentally unlock the symbol's
+    short grid as well.
+
+    Allocation per side (independent of the other side):
+
+    1. Already-open positions on this side are ALWAYS in the active
+       set — existing risk must be managed (closes, unstuck, trailing
+       exits) regardless of n_positions. If you have 8 longs and
+       n_positions=7, all 8 stay active; new entries on that side
+       just won't open until count drops back below the cap.
+    2. Remaining budget = ``max(0, n_positions - len(open_on_side))``.
+    3. Strategy-driven entry candidates (``enter_long`` for the long
+       side, ``enter_short`` for the short side) consume the budget
+       first — operator intent beats the Forager heuristic.
+    4. Forager fills any leftover budget from symbols not yet in
+       the active set.
+
+    The two sides are computed INDEPENDENTLY: ``active_long_set`` may
+    contain symbols not in ``active_short_set`` and vice versa, which
+    is exactly what callers need to gate ``grid_long`` vs ``grid_short``
+    separately.
+    """
+
+    def _allocate(
+        committed_open: set[str],
+        strategy_entries: list[str],
+    ) -> set[str]:
+        active = set(committed_open)
+        remaining = max(0, n_positions - len(active))
+        if remaining <= 0:
+            return active
+        # Strategy candidates (operator intent) consume budget first.
+        for s in strategy_entries:
+            if remaining <= 0:
+                break
+            if s in active:
+                continue
+            active.add(s)
+            remaining -= 1
+        if remaining <= 0:
+            return active
+        # Forager fills any leftover budget from symbols not yet active.
+        ranking_universe = [s for s in symbols if s not in active]
+        if not ranking_universe:
+            return active
+        ranked = ForagerScorer.select_symbols(
+            build_forager_candidates(ranking_universe, candles, account, signals),
+            remaining,
+            weights,
+        )
+        active.update(ranked)
+        return active
+
+    open_long: set[str] = set()
+    open_short: set[str] = set()
+    for s in symbols:
+        ss = account.symbols.get(s)
+        if ss is None:
+            continue
+        if ss.position_long.is_open or ss.trend_long.is_open:
+            open_long.add(s)
+        if ss.position_short.is_open or ss.trend_short.is_open:
+            open_short.add(s)
+
+    long_candidates: list[str] = []
+    short_candidates: list[str] = []
+    for s in symbols:
+        sig = strategy_signals.get(s, (False, False, False, False))
+        enter_l, enter_s, _exit_l, _exit_s = sig
+        if enter_l and s not in open_long:
+            long_candidates.append(s)
+        if enter_s and s not in open_short:
+            short_candidates.append(s)
+
+    active_long = _allocate(open_long, long_candidates)
+    active_short = _allocate(open_short, short_candidates)
+    return active_long, active_short

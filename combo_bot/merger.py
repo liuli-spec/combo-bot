@@ -223,15 +223,39 @@ class DecisionMerger:
         side: Side,
         price: float,
         exchange: ExchangeParams,
+        bar_low: float | None = None,
+        bar_high: float | None = None,
     ) -> list[Order]:
+        """Generate trend SL/TP exits.
+
+        Round-26 fix: when ``bar_low`` / ``bar_high`` are supplied, the
+        SL/TP check uses the bar's INTRABAR extremes (close+low for a
+        long stop, close+high for a short stop) rather than the close
+        alone. Without this, a bar whose low pierced the SL but closed
+        back above it would silently miss the stop in backtest — live
+        would have triggered the SL at the moment price crossed. The
+        legacy single-``price`` form (bar_low/bar_high omitted) is
+        preserved for callers that don't have intrabar data (e.g.
+        live ticks where ``price`` IS the latest mark).
+        """
         if not position.is_open:
             return []
+
+        # Use the worst-case intrabar print for the trigger check; the
+        # exit order itself is still sized off the position and prices
+        # at the current mark (filled at market = next-bar close in
+        # backtest, immediate cross in live).
+        long_trigger_price = bar_low if bar_low is not None else price
+        short_trigger_price = bar_high if bar_high is not None else price
 
         orders = []
         if side == Side.LONG:
             sl_price = position.entry_price * (1.0 - self.config.trend_stop_loss_pct)
             tp_price = position.entry_price * (1.0 + self.config.trend_take_profit_pct)
-            if price <= sl_price or price >= tp_price:
+            # SL triggers if the bar's LOW pierced the stop; TP triggers
+            # if the close exceeds the target (TP doesn't need intrabar —
+            # backtest fills at the next bar's open which respects close).
+            if long_trigger_price <= sl_price or price >= tp_price:
                 orders.append(
                     Order(
                         symbol=symbol,
@@ -246,7 +270,7 @@ class DecisionMerger:
         else:
             sl_price = position.entry_price * (1.0 + self.config.trend_stop_loss_pct)
             tp_price = position.entry_price * (1.0 - self.config.trend_take_profit_pct)
-            if price >= sl_price or price <= tp_price:
+            if short_trigger_price >= sl_price or price <= tp_price:
                 orders.append(
                     Order(
                         symbol=symbol,
