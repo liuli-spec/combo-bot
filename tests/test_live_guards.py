@@ -245,17 +245,25 @@ def test_dedup_window_grows_with_loop_interval():
 def test_rejected_order_only_clears_its_own_symbol_record():
     """When BTC's order is rejected, ETH's same px/qty record must survive."""
     trader, ex = _trader(["BTC/USDT:USDT", "ETH/USDT:USDT"], dry_run=False)
-    # Seed both symbols' recent_creates with the same (price, qty).
+    # Seed both symbols' recent_creates with full desired-identity tuples.
     now = 1_000_000.0
-    trader._recent_creates.append((now, "BTC/USDT:USDT", 50000.0, 0.01))
-    trader._recent_creates.append((now, "ETH/USDT:USDT", 50000.0, 0.01))
+    btc_identity = trader._desired_identity(
+        Order(symbol="BTC/USDT:USDT", side=Side.LONG, price=50000.0,
+              qty=0.01, source=OrderSource.GRID)
+    )
+    eth_identity = trader._desired_identity(
+        Order(symbol="ETH/USDT:USDT", side=Side.LONG, price=50000.0,
+              qty=0.01, source=OrderSource.GRID)
+    )
+    trader._recent_creates.append((now, btc_identity))
+    trader._recent_creates.append((now, eth_identity))
     # Now simulate BTC order rejected → only BTC entry should be removed.
     ex.next_status = "rejected"
     btc_order = Order(symbol="BTC/USDT:USDT", side=Side.LONG, price=50000.0,
                       qty=0.01, source=OrderSource.GRID)
     asyncio.run(trader._create_order(btc_order))
     remaining = list(trader._recent_creates)
-    symbols_left = {s for (_, s, _, _) in remaining}
+    symbols_left = {ident[0] for (_, ident) in remaining}
     assert symbols_left == {"ETH/USDT:USDT"}
 
 

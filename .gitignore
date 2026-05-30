@@ -56,6 +56,8 @@ data/
 
 # Live state
 live_state.json
+*.intent_journal.jsonl
+*.intent_journal.jsonl.compacting
 
 # Optuna
 *.db

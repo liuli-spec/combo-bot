@@ -384,7 +384,9 @@ class Backtester:
                 exchange_params=exchange_params,
             )
             all_orders.extend(unstuck_orders)
-            all_orders = self.risk.filter_orders(all_orders, account, ts)
+            all_orders = self.risk.filter_orders(
+                all_orders, account, ts, exchange_params=exchange_params,
+            )
 
             pending_orders = all_orders
 
@@ -660,6 +662,7 @@ class Backtester:
                 fee=fee,
                 realized_pnl=pnl,
                 source=order.source,
+                reduce_only=order.reduce_only,
             ))
 
         return step_fills

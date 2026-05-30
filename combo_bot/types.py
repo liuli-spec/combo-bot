@@ -110,6 +110,11 @@ class Order:
     # current candle close (taker fee). Live executor sends it as a market
     # order. Use for forced exits (panic close, trend SL/TP hit).
     is_market: bool = False
+    # Optional client-side identifier the live executor uses to match
+    # exchange-returned orders without falling back to fuzzy (price,
+    # qty) matching. Empty string means "no cOID set yet" — the live
+    # trader generates a UUID-derived value before sending.
+    client_order_id: str = ""
 
     @property
     def exchange_side(self) -> str:

@@ -179,14 +179,58 @@ def cmd_live(args):
 
     cfg = load_config(args.config)
 
+    # Same timeframe → bar_interval mapping the backtest CLI uses so
+    # users can write ``"timeframe": "1h"`` once and have funding,
+    # volatility EMA, vol-target annualization, and live OHLCV fetch
+    # all agree.
+    _TF_TO_MIN = {
+        "1m": 1.0, "3m": 3.0, "5m": 5.0, "15m": 15.0, "30m": 30.0,
+        "1h": 60.0, "2h": 120.0, "4h": 240.0, "6h": 360.0, "8h": 480.0,
+        "12h": 720.0, "1d": 1440.0,
+    }
+    timeframe = str(cfg.get("timeframe", "1m"))
+    bar_min = cfg.get("bar_interval_minutes")
+    if bar_min is None:
+        bar_min = _TF_TO_MIN.get(timeframe, 1.0)
+
+    # Default state file is segregated by run profile (real vs
+    # testnet/dry) so the two never share pending/cID/trend bucket
+    # data. An explicit ``state_file`` in the config overrides this
+    # default — useful for multi-symbol fleets sharing config but
+    # not state.
+    profile = "real" if args.real else "testnet"
+    default_state = f"state.{profile}.json"
+    state_file = cfg.get("state_file", default_state)
+
     live_cfg = LiveConfig(
         symbols=cfg.get("symbols", []),
         leverage=cfg.get("leverage", 5),
+        margin_mode=cfg.get("margin_mode", "cross"),
         dry_run=not args.real,
-        grid=GridConfig(**cfg.get("grid", {})),
-        trend=TrendConfig(**cfg.get("trend", {})),
-        merger=MergerConfig(**cfg.get("merger", {})),
-        risk=RiskConfig(**cfg.get("risk", {})),
+        candle_timeframe=timeframe,
+        bar_interval_minutes=float(bar_min),
+        loop_interval_seconds=float(cfg.get("loop_interval_seconds", 60.0)),
+        max_orders_per_batch=int(cfg.get("max_orders_per_batch", 5)),
+        order_match_tolerance_pct=float(
+            cfg.get("order_match_tolerance_pct", 0.002)
+        ),
+        state_file=state_file,
+        grid=GridConfig(**{
+            k: v for k, v in cfg.get("grid", {}).items()
+            if not k.startswith("_")
+        }),
+        trend=TrendConfig(**{
+            k: v for k, v in cfg.get("trend", {}).items()
+            if not k.startswith("_")
+        }),
+        merger=MergerConfig(**{
+            k: v for k, v in cfg.get("merger", {}).items()
+            if not k.startswith("_")
+        }),
+        risk=RiskConfig(**{
+            k: v for k, v in cfg.get("risk", {}).items()
+            if not k.startswith("_")
+        }),
         regime=build_regime_config(cfg),
     )
 

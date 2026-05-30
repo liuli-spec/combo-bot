@@ -89,10 +89,36 @@ class FillEventManager:
         # which combo-bot Side the trade represents (a buy can be a
         # LONG entry OR a SHORT close).
         self.order_meta: dict[str, dict] = {}
+        # Wall-clock at which the live trader started. Trades with
+        # timestamp strictly less than this are treated as historical
+        # noise (the first fetch_my_trades call commonly returns
+        # several days of history when since=None) and skipped.
+        # 0 = not yet set (tests poll_interval_ms=0 path).
+        self._bot_start_ms: int = 0
 
     # ------------------------------------------------------------------
     # Outgoing-order bookkeeping (called from LiveTrader._create_order)
     # ------------------------------------------------------------------
+
+    def _trade_belongs_to_us(self, trade: dict) -> bool:
+        """True when the trade's order or clientOrderId is registered
+        in our outgoing-order tables."""
+        order_id = str(trade.get("order") or trade.get("orderId") or "")
+        if order_id and order_id in self.order_source:
+            return True
+        cid = str(
+            trade.get("clientOrderId")
+            or (trade.get("info") or {}).get("clientOrderId")
+            or ""
+        )
+        return bool(cid and cid in self.order_source)
+
+    def set_bot_start(self, ts_ms: int) -> None:
+        """Mark the wall-clock at which the live trader started so
+        historical trades (returned by fetch_my_trades when no
+        watermark exists yet) are filtered out instead of polluting
+        the ledger."""
+        self._bot_start_ms = int(ts_ms)
 
     def register_outgoing(
         self,
@@ -100,16 +126,23 @@ class FillEventManager:
         source: OrderSource,
         side: Side,
         reduce_only: bool,
+        client_order_id: str = "",
     ) -> None:
         """Record metadata about an order we just placed so the trade
-        that fills it can be attributed correctly when it arrives."""
-        if not exchange_order_id or exchange_order_id == "?":
-            return
-        self.order_source[exchange_order_id] = source
-        self.order_meta[exchange_order_id] = {
-            "side": side,
-            "reduce_only": reduce_only,
-        }
+        that fills it can be attributed correctly when it arrives.
+
+        Indexes by BOTH the exchange-assigned id AND (when present)
+        the clientOrderId. Some exchanges echo only one of the two
+        fields on the resulting trade — registering both means a
+        TREND fill can't silently fall back to GRID just because the
+        trade's ``order`` field was empty.
+        """
+        meta = {"side": side, "reduce_only": reduce_only}
+        for key in (exchange_order_id, client_order_id):
+            if not key or key == "?":
+                continue
+            self.order_source[str(key)] = source
+            self.order_meta[str(key)] = meta
         # Coarse cap: drop the oldest 25% when we exceed cap to keep
         # the map bounded. Trade history beyond this isn't useful for
         # near-term attribution anyway.
@@ -143,6 +176,10 @@ class FillEventManager:
                 }
                 for oid, meta in self.order_meta.items()
             },
+            # Persist bot_start_ms so a restart that crashed BEFORE the
+            # first fill-poll completed doesn't move the cold-start
+            # cutoff forward and silently drop the real fill.
+            "bot_start_ms": int(self._bot_start_ms),
         }
 
     def load_snapshot(self, data: dict[str, Any] | None) -> None:
@@ -193,6 +230,10 @@ class FillEventManager:
                     "reduce_only": bool(meta.get("reduce_only", False)),
                 }
 
+        bot_start = data.get("bot_start_ms")
+        if self._can_int(bot_start):
+            self._bot_start_ms = int(bot_start)
+
     @staticmethod
     def _can_int(value: Any) -> bool:
         try:
@@ -240,6 +281,17 @@ class FillEventManager:
         seen_set = set(seen)
         fresh: list[Fill] = []
         max_ts = since_ms or 0
+        # The bot_start filter is ONLY safe for a true cold start:
+        # * no persisted watermark for this symbol AND
+        # * the trade isn't one we know we sent
+        # Otherwise we'd silently drop a pre-restart real fill that
+        # happened while the process was down — exchange aggregate
+        # would include it, our ledger wouldn't, and the next
+        # _refresh_account would attribute it to the grid bucket.
+        cold_start_for_symbol = (
+            self._bot_start_ms > 0 and symbol not in self._last_ts_ms
+        )
+
         for t in trades:
             tid = str(t.get("id") or "")
             if not tid or tid in seen_set:
@@ -247,6 +299,19 @@ class FillEventManager:
             ts = int(t.get("timestamp") or 0)
             if ts <= 0:
                 continue
+            # Bot-start guard runs only in the cold-start-no-watermark
+            # path and only when the trade ISN'T tied to one of our
+            # outgoing orders. A trade we issued must always reach the
+            # ledger, even if it pre-dates the wall-clock bot_start_ms
+            # (a crash between create_order and the next save_state
+            # would leave bot_start_ms newer than the real fill).
+            if cold_start_for_symbol and ts < self._bot_start_ms:
+                if not self._trade_belongs_to_us(t):
+                    seen.append(tid)
+                    seen_set.add(tid)
+                    if ts > max_ts:
+                        max_ts = ts
+                    continue
             fill = self._to_fill(symbol, t)
             if fill is None:
                 continue
@@ -292,9 +357,26 @@ class FillEventManager:
         except (TypeError, ValueError):
             fee = 0.0
 
+        # Try the exchange's order id first; fall back to clientOrderId
+        # echoed on the trade or its info subobject. Some exchanges
+        # (notably when the order was fully filled at create time)
+        # surface only the cOID on subsequent trade-history rows.
         order_id = str(trade.get("order") or trade.get("orderId") or "")
-        source = self.order_source.get(order_id, OrderSource.GRID)
-        meta = self.order_meta.get(order_id, {})
+        cid = str(
+            trade.get("clientOrderId")
+            or (trade.get("info") or {}).get("clientOrderId")
+            or ""
+        )
+        source = (
+            self.order_source.get(order_id)
+            or (self.order_source.get(cid) if cid else None)
+            or OrderSource.GRID
+        )
+        meta = (
+            self.order_meta.get(order_id)
+            or (self.order_meta.get(cid) if cid else None)
+            or {}
+        )
         side = self._infer_side(trade, meta)
 
         info = trade.get("info") or {}

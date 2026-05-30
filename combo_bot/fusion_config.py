@@ -84,7 +84,32 @@ def build_vol_target_sizer(cfg: dict[str, Any]) -> VolTargetSizer | None:
     block = cfg.get("vol_target_sizer")
     if not _block_enabled(block):
         return None
-    return VolTargetSizer(_build_dataclass(VolTargetSizerConfig, block))
+    sizer_cfg = _build_dataclass(VolTargetSizerConfig, block)
+    # When the user didn't pin periods_per_year explicitly, derive it
+    # from bar_interval_minutes so Sharpe-style annualization matches the
+    # candle cadence backtest/live actually consume. Without this an
+    # hourly live deployment annualizes with the 1m default (525600) and
+    # over-throttles size by ~60×.
+    if "periods_per_year" not in (block or {}):
+        bar_min = float(cfg.get("bar_interval_minutes") or 0.0)
+        if bar_min <= 0:
+            bar_min = _timeframe_to_minutes(str(cfg.get("timeframe", "1m")))
+        if bar_min > 0:
+            sizer_cfg.periods_per_year = int(round(525_600 / bar_min))
+    return VolTargetSizer(sizer_cfg)
+
+
+# Shared with main.py CLI; mirrored here so fusion_config doesn't need
+# to reach back through it.
+_TIMEFRAME_TO_MIN = {
+    "1m": 1.0, "3m": 3.0, "5m": 5.0, "15m": 15.0, "30m": 30.0,
+    "1h": 60.0, "2h": 120.0, "4h": 240.0, "6h": 360.0, "8h": 480.0,
+    "12h": 720.0, "1d": 1440.0,
+}
+
+
+def _timeframe_to_minutes(tf: str) -> float:
+    return _TIMEFRAME_TO_MIN.get(tf, 1.0)
 
 
 def build_protections(cfg: dict[str, Any]) -> list[IProtection]:

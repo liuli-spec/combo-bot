@@ -173,13 +173,26 @@ class RiskManager:
         return RiskTier(hsl_tier.value)
 
     def filter_orders(
-        self, orders: list[Order], account: AccountState, timestamp: int = 0
+        self, orders: list[Order], account: AccountState, timestamp: int = 0,
+        exchange_params: dict[str, ExchangeParams] | None = None,
     ) -> list[Order]:
         tier = self.assess(account, timestamp)
 
         if tier == RiskTier.RED:
             self.red_cooldown_until = timestamp + self.config.cooldown_after_red_minutes * 60_000
             return self._panic_close_all(account)
+
+        # Global realized-loss gate (Stage 4 follow-up). Was a dead
+        # config field. Active path: sum already-realized 24h losses
+        # across both buckets, project the realized loss each
+        # reduce_only close would BOOK against the local bucket
+        # entry_price, and trim qty so combined doesn't exceed
+        # ``balance * max_realized_loss_pct``. PANIC paths bypass via
+        # the RED branch above — once we're in graceful loss-shedding,
+        # the latch / panic close is the right circuit, not this gate.
+        orders = self._enforce_realized_loss_gate(
+            orders, account, timestamp, exchange_params,
+        )
 
         if timestamp < self.red_cooldown_until:
             return [o for o in orders if o.reduce_only]
@@ -207,6 +220,107 @@ class RiskManager:
             orders = self._limit_new_entries(orders, account, scale=0.5)
 
         return self._enforce_exposure_limits(orders, account)
+
+    def _enforce_realized_loss_gate(
+        self, orders: list[Order], account: AccountState, timestamp: int,
+        exchange_params: dict[str, ExchangeParams] | None = None,
+    ) -> list[Order]:
+        """Cap projected 24h realized loss at ``balance * max_realized_loss_pct``.
+
+        Walks reduce_only orders and estimates the realized loss each
+        would book against the LOCAL bucket entry. Already-realized 24h
+        losses are summed in. When the cumulative would breach the cap,
+        we either:
+
+        * drop the order entirely (if even a quantized minimum step
+          would still breach), or
+        * trim qty to the remaining budget.
+
+        Non-reduce orders pass through — this gate is about realising
+        loss, not about new exposure. ``max_realized_loss_pct <= 0``
+        disables the gate (matches the legacy "config exists but
+        nothing reads it" behaviour, so users opt in by setting > 0).
+        ``is_market`` orders also pass through unmodified because they
+        represent forced exits (panic, trend SL/TP, strategy custom_exit)
+        — gating the bot's own bailout path defeats the whole point.
+        """
+        cap_pct = self.config.max_realized_loss_pct
+        if cap_pct <= 0:
+            return orders
+        balance = account.balance
+        if balance <= 0:
+            return orders
+
+        budget = balance * cap_pct
+        already_lost = (
+            -account.loss_24h(OrderSource.GRID, timestamp)
+            -account.loss_24h(OrderSource.TREND, timestamp)
+        )
+        remaining = budget - already_lost
+        if remaining <= 0:
+            # Already over budget. Drop all reduce_only LOSS orders;
+            # let profit-taking and non-reduce pass.
+            return [
+                o for o in orders
+                if not o.reduce_only or o.is_market
+                or self._projected_loss(o, account) <= 0
+            ]
+
+        result: list[Order] = []
+        for o in orders:
+            if not o.reduce_only or o.is_market:
+                result.append(o)
+                continue
+            projected = self._projected_loss(o, account, exchange_params)
+            if projected <= 0:
+                result.append(o)
+                continue
+            if projected <= remaining:
+                result.append(o)
+                remaining -= projected
+                continue
+            # Would overspend. Trim qty proportionally to fit the budget.
+            ratio = remaining / max(projected, 1e-12)
+            new_qty = o.qty * ratio
+            if new_qty <= 0:
+                # No room left — drop. Future reduce orders also drop.
+                remaining = 0.0
+                continue
+            from dataclasses import replace as _replace
+            result.append(_replace(o, qty=new_qty))
+            remaining = 0.0
+        return result
+
+    @staticmethod
+    def _projected_loss(
+        order: Order, account: AccountState,
+        exchange_params: dict[str, ExchangeParams] | None = None,
+    ) -> float:
+        """Estimate the realized loss this reduce-only order would book.
+
+        Returns 0 when the close would be a profit (or no bucket exists).
+        Uses the local bucket's entry_price as the reference. Positive
+        numbers indicate a realized LOSS magnitude.
+        """
+        ss = account.symbols.get(order.symbol)
+        if ss is None:
+            return 0.0
+        bucket = ss.bucket(order.source, order.side)
+        if not bucket.is_open or bucket.entry_price <= 0:
+            return 0.0
+        # Honor contract multiplier — coin-margined / index-multiplied
+        # symbols have c_mult != 1, and a unit gap of $1 between fill
+        # and entry doesn't mean $1 of realized P&L per contract.
+        # Pre-fix this gate could be off by a factor of c_mult and a
+        # 1000× index would have leaked 1000× the configured budget.
+        ep = exchange_params.get(order.symbol) if exchange_params else None
+        c_mult = ep.c_mult if ep is not None else 1.0
+        if order.side == Side.LONG:
+            pnl_per_unit = order.price - bucket.entry_price
+        else:
+            pnl_per_unit = bucket.entry_price - order.price
+        loss = -order.qty * pnl_per_unit * c_mult
+        return max(loss, 0.0)
 
     def _apply_source_pause(
         self, orders: list[Order], account: AccountState,
