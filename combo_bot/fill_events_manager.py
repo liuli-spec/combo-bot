@@ -76,6 +76,18 @@ class FillEventManager:
     ) -> None:
         self.exchange = exchange
         self.config = config or FillEventManagerConfig()
+        # Symbols whose pagination has confirmed stuck (same-ms full
+        # page + fromId not advancing or unsupported). Polling for
+        # these returns [] until an operator calls clear_stuck — the
+        # alternative is silently losing every fill past the stuck
+        # millisecond, which would compound forever.
+        self._stuck_symbols: set[str] = set()
+        # Per-symbol consecutive stuck count. We only escalate to
+        # _stuck_symbols after a few attempts so a single anomalous
+        # poll doesn't pause a real-money feed.
+        self._stuck_count: dict[str, int] = {}
+        # How many consecutive stuck polls before we hard-stop.
+        self._stuck_escalate_after: int = 3
         # Per-symbol watermark: highest trade timestamp seen.
         self._last_ts_ms: dict[str, int] = {}
         # Per-symbol last poll wallclock — gates poll_interval_ms.
@@ -246,6 +258,14 @@ class FillEventManager:
     # Polling
     # ------------------------------------------------------------------
 
+    def clear_stuck(self, symbol: str) -> None:
+        """Operator-callable reset for a symbol parked by the
+        pagination-stuck detector. Call after manually verifying that
+        the exchange's fill stream is making forward progress again."""
+        self._stuck_symbols.discard(symbol)
+        self._stuck_count.pop(symbol, None)
+        logger.warning("[fill_events] %s manually cleared from stuck set", symbol)
+
     async def poll(
         self,
         symbol: str,
@@ -256,6 +276,19 @@ class FillEventManager:
         new :class:`Fill` records to ``sink``. Returns the same list so
         the caller can also branch on it (e.g. log).
         """
+        if symbol in self._stuck_symbols:
+            # Symbol is parked. Don't query, don't sink. Operator must
+            # clear via clear_stuck() — silently continuing here would
+            # mean missing every fill past the stuck millisecond, and
+            # the missed fills are exactly the ones that drift trend
+            # bucket vs exchange aggregate.
+            logger.error(
+                "[fill_events] %s in STUCK set — skipping poll. "
+                "Operator must investigate exchange pagination + call "
+                "FillEventManager.clear_stuck(%r)",
+                symbol, symbol,
+            )
+            return []
         # First poll for this symbol always goes through; afterwards
         # throttle by poll_interval_ms so we don't hammer the exchange.
         if symbol in self._last_poll_ms:
@@ -265,15 +298,104 @@ class FillEventManager:
         self._last_poll_ms[symbol] = now_ms
 
         since_ms = self._last_ts_ms.get(symbol)
-        try:
-            trades = await self.exchange.fetch_my_trades(
-                symbol, since=since_ms, limit=self.config.page_size,
+        # Paginated drain: keep asking for trades until a page returns
+        # fewer rows than ``page_size``. Without pagination, a burst of
+        # >page_size same-millisecond trades drops everything past the
+        # first page — the ``max_ts + 1`` watermark advance jumps over
+        # those un-fetched siblings, and we'd never see them.
+        #
+        # Cursor-stuck detection: when a full page comes back with the
+        # max timestamp at or below our cursor (every trade in the
+        # page shares the cursor's millisecond), bumping the watermark
+        # past that millisecond would skip un-fetched siblings. We:
+        #   * try the Binance-style ``fromId`` paginator if possible;
+        #   * otherwise leave the watermark stuck on this ms so the
+        #     next poll re-fetches it, relying on trade_id dedup to
+        #     skip rows we've already seen.
+        trades: list[dict] = []
+        cursor = since_ms
+        max_pages = 16  # bounded to keep tick latency predictable
+        cursor_stuck_at_ts: int | None = None
+        last_seen_trade_id: str | None = None
+        for _ in range(max_pages):
+            try:
+                params = {}
+                if last_seen_trade_id is not None:
+                    # Best-effort fromId hint — Binance USDM honors it.
+                    params["fromId"] = last_seen_trade_id
+                page = await self.exchange.fetch_my_trades(
+                    symbol, since=cursor, limit=self.config.page_size,
+                    params=params if params else None,
+                )
+            except TypeError:
+                # ccxt fetch_my_trades signature varies — fall back to
+                # the no-params form when the broker doesn't accept it.
+                try:
+                    page = await self.exchange.fetch_my_trades(
+                        symbol, since=cursor, limit=self.config.page_size,
+                    )
+                except Exception:
+                    logger.exception(
+                        "fetch_my_trades failed for %s since=%s",
+                        symbol, cursor,
+                    )
+                    break
+            except Exception:
+                logger.exception(
+                    "fetch_my_trades failed for %s since=%s", symbol, cursor,
+                )
+                break
+            if not page:
+                break
+            trades.extend(page)
+            if len(page) < self.config.page_size:
+                cursor_stuck_at_ts = None
+                # Short page = clean drain; any transient stuck
+                # counter resets so a future blip doesn't escalate.
+                self._stuck_count.pop(symbol, None)
+                break
+            page_max = max(
+                int(p.get("timestamp") or 0) for p in page
             )
-        except Exception:
-            logger.exception(
-                "fetch_my_trades failed for %s since=%s", symbol, since_ms,
+            page_max_id = page[-1].get("id")
+            if cursor is not None and page_max <= cursor:
+                # Same-ms burst — record so the watermark advance below
+                # doesn't jump past the unfetched siblings.
+                cursor_stuck_at_ts = page_max
+                if page_max_id and str(page_max_id) != last_seen_trade_id:
+                    # Try the next page via fromId; if it returns
+                    # nothing new we'll exit the loop next iteration.
+                    last_seen_trade_id = str(page_max_id)
+                    continue
+                # Same-ms stuck AND fromId didn't help. Bump consecutive
+                # stuck counter; after N consecutive stuck polls we
+                # park the symbol and ERROR so the operator notices.
+                self._stuck_count[symbol] = (
+                    self._stuck_count.get(symbol, 0) + 1
+                )
+                cnt = self._stuck_count[symbol]
+                if cnt >= self._stuck_escalate_after:
+                    self._stuck_symbols.add(symbol)
+                    logger.error(
+                        "[fill_events] %s STUCK after %d consecutive "
+                        "same-ms full-page polls (ts=%s) — pausing fill "
+                        "ingestion for this symbol. Operator must call "
+                        "FillEventManager.clear_stuck(%r) once the "
+                        "exchange paginates past this millisecond.",
+                        symbol, cnt, page_max, symbol,
+                    )
+                else:
+                    logger.warning(
+                        "[fill_events] %s pagination stuck at ts=%s "
+                        "(attempt %d/%d) — leaving watermark at this "
+                        "ms; trade_id dedup will skip seen rows",
+                        symbol, page_max, cnt, self._stuck_escalate_after,
+                    )
+                break
+            cursor = page_max
+            last_seen_trade_id = (
+                str(page_max_id) if page_max_id is not None else None
             )
-            return []
         if not trades:
             return []
 
@@ -327,8 +449,16 @@ class FillEventManager:
             drop = len(seen) - cap
             del seen[:drop]
 
-        if max_ts > (since_ms or 0):
-            # Advance by 1ms past the latest so we don't re-fetch
+        if cursor_stuck_at_ts is not None:
+            # Same-ms burst that couldn't be drained even with fromId.
+            # Hold the watermark AT (not past) that millisecond so the
+            # next poll re-fetches it; trade_id dedup will skip the
+            # rows we already saw and let the un-fetched siblings
+            # through. Better to re-fetch a known millisecond than to
+            # silently lose orders.
+            self._last_ts_ms[symbol] = cursor_stuck_at_ts
+        elif max_ts > (since_ms or 0):
+            # Normal advance: +1ms past the latest so we don't re-fetch
             # boundary trades next poll (Binance returns trades with
             # ``timestamp >= since``, inclusive).
             self._last_ts_ms[symbol] = max_ts + 1
@@ -395,6 +525,9 @@ class FillEventManager:
             realized_pnl=realized_pnl,
             source=source,
             reduce_only=bool(meta.get("reduce_only", False)),
+            exchange_order_id=order_id,
+            client_order_id=cid,
+            trade_id=str(trade.get("id") or ""),
         )
 
     @staticmethod

@@ -152,6 +152,27 @@ class LiveTrader:
         # ``_resolve_unknowns`` pass that consults the exchange for
         # ground truth. Round-13 P1.a.
         self._unknown_overlay: dict[tuple[str, Side], float] = {}
+        # Orders whose bucket position was written via fetch_order's
+        # filled/avg payload during UNKNOWN resolution. When trades
+        # for the same order eventually arrive through fetch_my_trades
+        # we must NOT re-apply them to the bucket (that would double
+        # the position). Fees, protections, and the realized-PnL
+        # ledger still get every trade.
+        #
+        # Schema: ``{key: {"qty": float, "seen": float, "ts": float}}``
+        # where ``key`` is the cID or exchange order id. ``qty`` is
+        # the qty fetch_order reported as filled; ``seen`` accumulates
+        # trade qty as it arrives. Marker is popped only when
+        # ``seen >= qty`` (so multi-fill market orders survive their
+        # second/third trade without re-applying the bucket write).
+        # Both cID and exchange_id keys point to the SAME dict so
+        # popping one pops the other implicitly via shared object id.
+        self._resolved_via_fetch: dict[str, dict] = {}
+        # How long a resolved-via-fetch marker survives. Generous: a
+        # late trade should arrive within a few minutes; if a real
+        # trade arrives an hour after the fetch_order resolution it's
+        # likely a different order anyway.
+        self._resolved_via_fetch_ttl_ms: int = 60 * 60 * 1_000
         # Durable intent journal — see combo_bot/intent_journal.py.
         # Path is derived from state_file so different deployments
         # (testnet vs real, dry vs live) stay isolated.
@@ -356,19 +377,52 @@ class LiveTrader:
                 )
             trend_exits_l = self.merger.generate_trend_exit_orders(symbol, ss.trend_long, Side.LONG, price, ep)
             trend_exits_s = self.merger.generate_trend_exit_orders(symbol, ss.trend_short, Side.SHORT, price, ep)
+            # Trend SL/TP exits also go through the strategy exit hook —
+            # mirror of backtest.py change. Without this,
+            # confirm_trade_exit=False can't veto a fixed trend exit.
+            if trend_exits_l:
+                ctx_trend_l = TradeContext(
+                    symbol=symbol, side=Side.LONG, position=ss.trend_long,
+                    account=self.account, candle=last_candle, signal=signal,
+                    current_time_ms=now_ms, exchange_params=ep,
+                )
+                trend_exits_l = self.strategy_runner.filter_exits(
+                    trend_exits_l, ctx_trend_l,
+                )
+            if trend_exits_s:
+                ctx_trend_s = TradeContext(
+                    symbol=symbol, side=Side.SHORT, position=ss.trend_short,
+                    account=self.account, candle=last_candle, signal=signal,
+                    current_time_ms=now_ms, exchange_params=ep,
+                )
+                trend_exits_s = self.strategy_runner.filter_exits(
+                    trend_exits_s, ctx_trend_s,
+                )
 
             strategy_orders: list[Order] = []
 
             # ── grid-bucket strategy callbacks ────────────────────
+            # Round-16 P1: strategy-emitted exits + adjusts also pass
+            # through filter_exits / filter_entries, so confirm hooks
+            # apply to the bot's own SL / DCA decisions.
             for ctx, pos in ((ctx_long, ss.position_long), (ctx_short, ss.position_short)):
                 if not pos.is_open:
                     continue
                 fx = self.strategy_runner.check_custom_exit(ctx)
                 if fx is not None:
-                    strategy_orders.append(fx)
+                    strategy_orders.extend(
+                        self.strategy_runner.filter_exits([fx], ctx)
+                    )
                 adj = self.strategy_runner.check_position_adjustment(ctx)
                 if adj is not None:
-                    strategy_orders.append(adj)
+                    if adj.reduce_only:
+                        strategy_orders.extend(
+                            self.strategy_runner.filter_exits([adj], ctx)
+                        )
+                    else:
+                        strategy_orders.extend(
+                            self.strategy_runner.filter_entries([adj], ctx)
+                        )
 
             # ── trend-bucket strategy callbacks ───────────────────
             # Trend positions are also strategy-managed: custom_stoploss,
@@ -388,10 +442,19 @@ class LiveTrader:
                 )
                 fx = self.strategy_runner.check_custom_exit(ctx_trend)
                 if fx is not None:
-                    strategy_orders.append(fx)
+                    strategy_orders.extend(
+                        self.strategy_runner.filter_exits([fx], ctx_trend)
+                    )
                 adj = self.strategy_runner.check_position_adjustment(ctx_trend)
                 if adj is not None:
-                    strategy_orders.append(adj)
+                    if adj.reduce_only:
+                        strategy_orders.extend(
+                            self.strategy_runner.filter_exits([adj], ctx_trend)
+                        )
+                    else:
+                        strategy_orders.extend(
+                            self.strategy_runner.filter_entries([adj], ctx_trend)
+                        )
 
             ss.mode_long = regime_view.long_mode
             ss.mode_short = regime_view.short_mode
@@ -818,31 +881,61 @@ class LiveTrader:
             # and emitted realized_pnl=0 for what was actually a
             # closing trade. Sequential apply keeps the bucket state
             # consistent with the timeline.
+            # Age out resolved-via-fetch markers, BUT only those that
+            # are already "complete" (real trades have caught up with
+            # the fetch_order-reported qty). An incomplete marker
+            # (seen < qty) must be retained indefinitely — if the
+            # exchange's trade stream is delayed past the TTL and we
+            # dropped the marker, the eventually-arriving trades
+            # would double-write the bucket. Operators can clear a
+            # stuck incomplete marker manually via _resolved_via_fetch.
+            rvf_cutoff = self._now_ms() - self._resolved_via_fetch_ttl_ms
+            self._resolved_via_fetch = {
+                k: rec for k, rec in self._resolved_via_fetch.items()
+                if self._rvf_marker_alive(rec, rvf_cutoff)
+            }
             sorted_fills = sorted(fills, key=lambda f: f.timestamp)
             enriched: list[Fill] = []
             for f in sorted_fills:
                 e = self._enrich_fill_pnl(f)
                 enriched.append(e)
-                # Best-effort journal mark — fills attributed via cID
-                # close out the durable intent. We look up the cID via
-                # FillEventManager's index in reverse to find which
-                # cID this trade belongs to.
-                for jcid, meta in self.intent_journal.records.items():
-                    if meta.get("kind") in ("filled", "rejected",
-                                              "canceled", "resolved"):
-                        continue
-                    if meta.get("source") == e.source.value and \
-                       meta.get("symbol") == e.symbol and \
-                       meta.get("side") == e.side.value:
+                # Mark the exact journal entry terminal using the
+                # Fill's own cID / exchange_order_id. The previous
+                # round used (source, symbol, side) which silently
+                # mis-attributed when multiple grid orders shared the
+                # same triple — leaving the truly-filled cID alive
+                # in the journal and compaction would evict the wrong
+                # row, so restart-replay missed real in-flight orders.
+                journal_cid = e.client_order_id
+                if not journal_cid and e.exchange_order_id:
+                    # Find the journal entry whose exchange_id matches.
+                    for jcid, rec in self.intent_journal.records.items():
+                        if rec.get("exchange_id") == e.exchange_order_id:
+                            journal_cid = jcid
+                            break
+                if journal_cid and journal_cid in self.intent_journal.records:
+                    rec = self.intent_journal.records[journal_cid]
+                    if rec.get("kind") not in (
+                        "filled", "rejected", "canceled", "resolved",
+                    ):
                         try:
                             self.intent_journal.mark_terminal(
-                                cid=jcid, kind="filled",
+                                cid=journal_cid, kind="filled",
                                 now_ms=self._now_ms(),
                             )
                         except Exception:
-                            pass
-                        break
-                if e.source == OrderSource.TREND:
+                            logger.exception("journal mark_terminal failed")
+                # Was this trade's order ALREADY written into the
+                # bucket via fetch_order during UNKNOWN resolution? If
+                # so we MUST NOT apply it again — that would double
+                # the trend position. We still book fee / PnL ledger
+                # below; only the bucket write is suppressed.
+                rvf_marker = (
+                    self._resolved_via_fetch.get(e.client_order_id)
+                    or self._resolved_via_fetch.get(e.exchange_order_id)
+                )
+                already_in_bucket = rvf_marker is not None
+                if e.source == OrderSource.TREND and not already_in_bucket:
                     self._apply_fill_to_trend_bucket(
                         Order(
                             symbol=e.symbol,
@@ -863,6 +956,25 @@ class LiveTrader:
                     if not e.reduce_only:
                         self._pending_overlay.pop((e.symbol, e.side), None)
                         self._unknown_overlay.pop((e.symbol, e.side), None)
+                elif already_in_bucket and rvf_marker is not None:
+                    # Real trade arrived for an order whose bucket was
+                    # ALREADY written via fetch_order. Accumulate the
+                    # trade qty; only release the dedup marker once the
+                    # trade stream's total catches up with what
+                    # fetch_order reported as ``filled``. This handles
+                    # the common case of an exchange splitting one
+                    # market order into N partial trades (each its own
+                    # trade_id) — the pre-fix marker would have been
+                    # popped on the first trade and the second would
+                    # have doubled the bucket.
+                    rvf_marker["seen"] = float(
+                        rvf_marker.get("seen", 0.0)
+                    ) + float(e.qty)
+                    if rvf_marker["seen"] + 1e-9 >= float(
+                        rvf_marker.get("qty", 0.0)
+                    ):
+                        self._resolved_via_fetch.pop(e.client_order_id, None)
+                        self._resolved_via_fetch.pop(e.exchange_order_id, None)
                 net = e.realized_pnl - e.fee
                 self.account.add_realized_pnl(e.source, net, e.timestamp)
             # Bulk fan-out at the END so protections / Kelly see the
@@ -1135,34 +1247,45 @@ class LiveTrader:
             logger.exception("Failed to cancel %s %s", symbol, order_id)
 
     async def _resolve_unknowns(self) -> None:
-        """For each (symbol, side) in unknown_overlay, ask the exchange
-        what actually happened. Two outcomes:
+        """For each (symbol, side) in unknown_overlay, consult the
+        exchange for ground truth.
 
-        * The cID (or the matching position) is still open → the order
-          really IS in flight; demote back to pending.
-        * The cID is nowhere in open orders AND the symbol position
-          shows the expected size delta → the order filled in a window
-          our fetch_my_trades didn't cover. Clear the unknown.
+        Strong-evidence resolution rules (round-14 P0):
 
-        Anything else (cID absent, no matching position diff) is left
-        UNKNOWN and the side stays blocked. Operators see the persistent
-        WARNING and intervene.
+        * cID present in ``fetch_open_orders`` → order is genuinely
+          in-flight; demote unknown back to pending.
+        * ``fetch_order(cid)`` returns a TERMINAL status the exchange
+          itself confirms (``filled / closed / canceled / rejected``)
+          → clear unknown + journal mark_terminal.
+        * Anything else — cID absent from open orders AND ``fetch_order``
+          fails or returns indeterminate — KEEPS the unknown slot. The
+          previous "absent ⇒ resolved" path silently cleared market
+          orders that filled out of band (market orders never appear
+          in open orders by definition), letting the next overlay
+          decision re-emit a duplicate market entry.
+
+        Real fills clear unknown via the FillEventManager sink, not
+        here — once the trade is on the wire, ``_sink`` pops both
+        ``_pending_overlay`` and ``_unknown_overlay`` directly.
         """
         if not self._unknown_overlay:
             return
-        # Resolve per symbol.
-        resolved: list[tuple[str, Side]] = []
+
+        terminal_statuses = {
+            "closed", "filled", "canceled", "cancelled",
+            "rejected", "expired",
+        }
+
         for (symbol, side), ts in list(self._unknown_overlay.items()):
             try:
                 opens = await self.exchange.fetch_open_orders(symbol)
             except Exception:
                 logger.exception(
-                    "[overlay] fetch_open_orders failed during resolve "
-                    "for %s — leaving %s in UNKNOWN", symbol, side.value,
+                    "[overlay] fetch_open_orders failed for %s — "
+                    "leaving %s in UNKNOWN", symbol, side.value,
                 )
                 continue
-            # Find OUR cIDs for this (symbol, side) that the journal
-            # still considers non-terminal.
+            # Find OUR cIDs the journal still treats as non-terminal.
             ours = {
                 cid for cid, rec in self.intent_journal.non_terminal().items()
                 if rec.get("symbol") == symbol
@@ -1170,7 +1293,8 @@ class LiveTrader:
                 and rec.get("source") == OrderSource.TREND.value
                 and not rec.get("reduce_only", False)
             }
-            still_open = False
+            # Are any of OUR cIDs still open on the exchange?
+            still_open_cid: str | None = None
             for o in opens:
                 ecid = (
                     o.get("clientOrderId")
@@ -1178,37 +1302,348 @@ class LiveTrader:
                     or ""
                 )
                 if str(ecid) in ours:
-                    still_open = True
+                    still_open_cid = str(ecid)
                     break
-            if still_open:
+            if still_open_cid is not None:
                 logger.info(
-                    "[overlay] %s %s resolved: order still OPEN — back to pending",
-                    symbol, side.value,
+                    "[overlay] %s %s: cID %s still OPEN — back to pending",
+                    symbol, side.value, still_open_cid,
                 )
                 self._pending_overlay[(symbol, side)] = self._now_ms()
-                resolved.append((symbol, side))
+                self._unknown_overlay.pop((symbol, side), None)
                 continue
-            # Not in open orders: either filled or cancelled out of band.
-            # The trend bucket will be updated by the next fill_events
-            # poll if the fill is real; in the meantime clear the unknown
-            # and let the next tick decide based on the actual bucket
-            # state. Mark all the candidate journal cIDs as resolved
-            # so they don't get replayed again on next restart.
+            # Not in open orders. For market orders that's the COMMON
+            # case (they fill instantly and disappear). We MUST do
+            # more than just confirm "terminal status" — clearing
+            # UNKNOWN without writing the fill into the trend bucket
+            # would let the very next tick see an empty bucket and
+            # re-emit a duplicate market entry. So:
+            #
+            # * fetch_order returns CANCELED/REJECTED/EXPIRED → safe to
+            #   clear (no exposure was added).
+            # * fetch_order returns CLOSED/FILLED **with usable filled
+            #   qty + avg price** → apply to trend bucket here, then
+            #   clear UNKNOWN + journal mark filled.
+            # * fetch_order returns CLOSED but no qty/avg, or fails,
+            #   or returns indeterminate → HOLD UNKNOWN + WARN. Next
+            #   _sink call from FillEventManager will clear when the
+            #   real fill arrives.
+            unresolved: set[str] = set(ours)
             for cid in ours:
-                try:
-                    self.intent_journal.mark_terminal(
-                        cid=cid, kind="resolved", now_ms=self._now_ms(),
-                        reason="unknown_resolve_no_open",
+                exchange_id = (
+                    self.intent_journal.records.get(cid, {}).get("exchange_id", "")
+                )
+                fetched = await self._fetch_order_safely(
+                    symbol, cid=cid, exchange_id=exchange_id,
+                )
+                if fetched is None:
+                    continue
+                status = str(fetched.get("status", "")).lower()
+                if status not in terminal_statuses:
+                    continue
+                if status in ("canceled", "cancelled", "rejected", "expired"):
+                    # No exposure — this cID is resolved.
+                    unresolved.discard(cid)
+                    try:
+                        self.intent_journal.mark_terminal(
+                            cid=cid, kind="canceled", now_ms=self._now_ms(),
+                            reason=f"resolve_unknown:{status}",
+                        )
+                    except Exception:
+                        logger.exception("journal mark_terminal failed")
+                    continue
+                # status in ("closed", "filled"): exposure happened.
+                # We need filled qty + avg to update the bucket.
+                applied = self._apply_resolved_fill_to_bucket(
+                    fetched, symbol=symbol, side=side, source=OrderSource.TREND,
+                    cid=cid,
+                )
+                if applied:
+                    unresolved.discard(cid)
+                    try:
+                        self.intent_journal.mark_terminal(
+                            cid=cid, kind="filled", now_ms=self._now_ms(),
+                            reason=f"resolve_unknown:{status}",
+                        )
+                    except Exception:
+                        logger.exception("journal mark_terminal failed")
+                else:
+                    logger.warning(
+                        "[overlay] %s %s cID=%s reports %s but lacks "
+                        "filled qty/avg — HOLDING UNKNOWN until the "
+                        "FillEventManager surfaces the trade",
+                        symbol, side.value, cid, status,
                     )
-                except Exception:
-                    pass
-            logger.info(
-                "[overlay] %s %s resolved: no open order; clearing UNKNOWN",
-                symbol, side.value,
+            # Only clear the side's UNKNOWN slot when EVERY journal
+            # cID for that side is fully resolved. Pre-fix, the very
+            # first canceled cID would unlock the side even while
+            # other cIDs were still ambiguously open — letting the
+            # next tick re-emit a duplicate market entry.
+            if not unresolved and ours:
+                # All journal cIDs for this side are terminal — safe
+                # to clear. The ``ours`` guard prevents the empty-
+                # journal case from sneaking through here; that path
+                # belongs to the stale-sweep below which requires
+                # exchange-confirmed flatness, not just absence of
+                # cIDs.
+                logger.info(
+                    "[overlay] %s %s cleared — all %d cIDs resolved",
+                    symbol, side.value, len(ours),
+                )
+                self._unknown_overlay.pop((symbol, side), None)
+            elif ours and len(unresolved) < len(ours):
+                logger.warning(
+                    "[overlay] %s %s partially resolved: %d/%d cIDs "
+                    "still unresolved (%s) — HOLDING block",
+                    symbol, side.value,
+                    len(unresolved), len(ours), sorted(unresolved),
+                )
+            else:
+                # Nothing resolved. Hold + WARN — silently clearing
+                # here is exactly what re-opens a duplicate market entry.
+                logger.warning(
+                    "[overlay] %s %s STILL UNKNOWN: cID(s) %s not in open "
+                    "orders and no resolvable fetch_order. Holding the "
+                    "block; operator should verify exchange state.",
+                    symbol, side.value, sorted(ours) or "<none>",
+                )
+        # Round-15 P2: stale-UNKNOWN sweep. If a (sym, side) is in
+        # _unknown_overlay but NO cID in the non-terminal journal
+        # matches it, we have a dangling block. Decide based on the
+        # trend bucket: open → already reconciled, clear safely; empty
+        # → genuinely stale state, clear with ERROR so operators
+        # notice but we don't permanently disable the side.
+        nt = self.intent_journal.non_terminal()
+        for (symbol, side), ts in list(self._unknown_overlay.items()):
+            has_journal_cid = any(
+                rec.get("symbol") == symbol
+                and rec.get("side") == side.value
+                and rec.get("source") == OrderSource.TREND.value
+                and not rec.get("reduce_only", False)
+                for rec in nt.values()
             )
-            resolved.append((symbol, side))
-        for key in resolved:
-            self._unknown_overlay.pop(key, None)
+            if has_journal_cid:
+                continue
+            ss = self.account.symbols.get(symbol)
+            if ss is None:
+                self._unknown_overlay.pop((symbol, side), None)
+                continue
+            trend_bucket = (
+                ss.trend_long if side == Side.LONG else ss.trend_short
+            )
+            if trend_bucket.is_open:
+                logger.info(
+                    "[overlay] %s %s: no journal cIDs, trend bucket "
+                    "already populated — clearing stale UNKNOWN",
+                    symbol, side.value,
+                )
+                self._unknown_overlay.pop((symbol, side), None)
+                continue
+            # Empty trend bucket AND no journal cIDs. Auto-clearing
+            # here is dangerous (round-16 P0 #2) — if a real fill
+            # landed on the exchange but never made it into our
+            # bucket, the next tick would re-emit. Only clear when
+            # the EXCHANGE'S aggregate position on this side is
+            # confirmed flat. Otherwise hold + ERROR for operator
+            # intervention.
+            grid_bucket = (
+                ss.position_long if side == Side.LONG else ss.position_short
+            )
+            local_total = abs(trend_bucket.size) + abs(grid_bucket.size)
+            if local_total > 1e-9:
+                logger.error(
+                    "[overlay] %s %s: stale UNKNOWN with no journal "
+                    "cIDs; local position total %.6f is non-zero — "
+                    "HOLDING block; operator must verify exchange "
+                    "state and clear manually",
+                    symbol, side.value, local_total,
+                )
+                continue
+            # Pull a fresh authoritative read from the exchange to
+            # confirm true flatness, not just our cached belief.
+            confirmed_flat = await self._exchange_side_is_flat(
+                symbol, side,
+            )
+            if confirmed_flat:
+                logger.warning(
+                    "[overlay] %s %s: stale UNKNOWN with empty buckets "
+                    "AND exchange-confirmed flat — clearing block",
+                    symbol, side.value,
+                )
+                self._unknown_overlay.pop((symbol, side), None)
+            else:
+                logger.error(
+                    "[overlay] %s %s: stale UNKNOWN with empty local "
+                    "buckets but exchange shows non-flat (or query "
+                    "failed) — HOLDING block; operator intervention "
+                    "required",
+                    symbol, side.value,
+                )
+
+    async def _exchange_side_is_flat(self, symbol: str, side: Side) -> bool:
+        """Return True iff the exchange's aggregate position on this
+        (symbol, side) is ≤ epsilon. Returns False on any error so
+        the caller errs on the side of HOLDING the block."""
+        try:
+            positions = await self.exchange.fetch_positions([symbol])
+        except Exception:
+            logger.exception(
+                "[overlay] fetch_positions failed during flat-check for %s",
+                symbol,
+            )
+            return False
+        for p in positions:
+            if p.get("symbol") != symbol:
+                continue
+            if str(p.get("side", "")).lower() != side.value:
+                continue
+            try:
+                contracts = abs(float(p.get("contracts", 0) or 0))
+            except (TypeError, ValueError):
+                contracts = 0.0
+            if contracts > 1e-9:
+                return False
+        return True
+
+    def _apply_resolved_fill_to_bucket(
+        self, fetched: dict, *, symbol: str, side: Side,
+        source: OrderSource, cid: str,
+    ) -> bool:
+        """Apply a fetch_order's filled qty/avg into the local trend
+        bucket. Returns True when applied, False when the order's
+        payload lacks the fields we need to do that safely.
+
+        ccxt normalises filled qty as ``filled`` and avg price as
+        ``average``; some exchanges only carry these under ``info``.
+        """
+        if source != OrderSource.TREND:
+            return False
+        try:
+            filled = float(fetched.get("filled", 0) or 0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        try:
+            avg = float(fetched.get("average", 0) or 0)
+        except (TypeError, ValueError):
+            avg = 0.0
+        # Fallbacks via the raw info subobject.
+        if filled <= 0 or avg <= 0:
+            info = fetched.get("info") or {}
+            if filled <= 0:
+                try:
+                    filled = float(info.get("executedQty", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+            if avg <= 0:
+                try:
+                    avg = float(info.get("avgPrice", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+        if filled <= 0 or avg <= 0:
+            return False
+        # Apply the fill: synthesise a minimal Order surrogate that
+        # _apply_fill_to_trend_bucket already knows how to consume.
+        synthetic = Order(
+            symbol=symbol, side=side, price=avg, qty=filled,
+            source=source, reduce_only=False, is_market=True,
+            client_order_id=cid,
+        )
+        try:
+            self._apply_fill_to_trend_bucket(synthetic, filled)
+            # Also free pending — the fill is now in the bucket.
+            self._pending_overlay.pop((symbol, side), None)
+            # Mark this order's identifiers so future trades for the
+            # SAME order (arriving via fetch_my_trades, possibly split
+            # into multiple partial fills) don't get re-applied to the
+            # bucket → double position. The marker tracks total filled
+            # qty so we only release it when the trade stream has
+            # caught up. Both cID and exchange_id keys point at the
+            # SAME marker dict — popping is per-key but completion is
+            # tracked once.
+            marker = {
+                "qty": float(filled),
+                "seen": 0.0,
+                "ts": float(self._now_ms()),
+            }
+            if cid:
+                self._resolved_via_fetch[cid] = marker
+            exchange_id = str(fetched.get("id") or "")
+            if exchange_id:
+                self._resolved_via_fetch[exchange_id] = marker
+            logger.info(
+                "[overlay] %s %s: applied resolved fill qty=%.6f avg=%.4f "
+                "to trend bucket from fetch_order(cid=%s)",
+                symbol, side.value, filled, avg, cid,
+            )
+            return True
+        except Exception:
+            logger.exception("[overlay] failed to apply resolved fill")
+            return False
+
+    async def _fetch_order_safely(
+        self, symbol: str, *, cid: str = "", exchange_id: str = "",
+    ) -> dict | None:
+        """Best-effort wrapper around ccxt.fetch_order. Tries the
+        exchange id first (universally supported), falls back to cID
+        via ``params``. Returns ``None`` on any exception so the
+        caller can keep the unknown state intact rather than treating
+        the absence as a resolution signal."""
+        try:
+            if exchange_id:
+                return await self.exchange.fetch_order(exchange_id, symbol)
+            if cid:
+                return await self.exchange.fetch_order(
+                    None, symbol, params={"clientOrderId": cid},
+                )
+        except Exception:
+            logger.exception(
+                "[overlay] fetch_order failed for cid=%s exchange_id=%s",
+                cid, exchange_id,
+            )
+        return None
+
+    @staticmethod
+    def _rvf_marker_alive(rec: dict, ts_cutoff: float) -> bool:
+        """A resolved-via-fetch marker should be kept if either:
+
+        * The trade stream hasn't caught up yet (``seen < qty``) —
+          dropping it now would let the eventually-arriving trades
+          double-write the bucket.
+        * It's complete but still within the TTL window — keeping it
+          a little longer guards against re-orderings of the trade
+          stream and is cheap.
+        """
+        try:
+            seen = float(rec.get("seen", 0.0))
+            qty = float(rec.get("qty", 0.0))
+            ts = float(rec.get("ts", 0.0))
+        except (TypeError, ValueError):
+            return False
+        if seen + 1e-9 < qty:
+            # Incomplete — protect forever, until real trades catch up
+            # OR an operator manually clears the marker.
+            return True
+        return ts >= ts_cutoff
+
+    def _serialize_rvf_markers(self):
+        """Yield (keys_list, qty, seen, ts) rows for state file —
+        groups keys that share the same marker dict so loading can
+        restore the shared-object invariant."""
+        seen_ids: set[int] = set()
+        groups: dict[int, tuple[list[str], dict]] = {}
+        for key, rec in self._resolved_via_fetch.items():
+            rid = id(rec)
+            if rid not in groups:
+                groups[rid] = ([key], rec)
+            else:
+                groups[rid][0].append(key)
+        for keys, rec in groups.values():
+            yield {
+                "keys": list(keys),
+                "qty": float(rec.get("qty", 0.0)),
+                "seen": float(rec.get("seen", 0.0)),
+                "ts": float(rec.get("ts", 0.0)),
+            }
 
     def _replay_intent_journal(self) -> None:
         """Resurrect attribution + pending overlay from the durable
@@ -1782,6 +2217,14 @@ class LiveTrader:
                 [sym, side.value, float(ts)]
                 for (sym, side), ts in self._unknown_overlay.items()
             ],
+            # Resolved-via-fetch markers: each row is one logical
+            # marker. ``keys`` is the (cid, exchange_id) pair that
+            # both pointed at it before serialisation; on load both
+            # keys are re-pointed to the same restored dict. Without
+            # this, a process restart between fetch_order's bucket
+            # write and the late trade's arrival would drop the
+            # dedup info → the trade re-applies → double position.
+            "resolved_via_fetch": list(self._serialize_rvf_markers()),
         }
         try:
             Path(self.config.state_file).write_text(json.dumps(state, indent=2))
@@ -1888,6 +2331,29 @@ class LiveTrader:
                         self._unknown_overlay[(sym, side)] = ts
                     except (TypeError, ValueError):
                         continue
+
+            rvf = data.get("resolved_via_fetch") or []
+            if isinstance(rvf, list):
+                self._resolved_via_fetch.clear()
+                for row in rvf:
+                    if not isinstance(row, dict):
+                        continue
+                    keys = row.get("keys") or []
+                    if not isinstance(keys, list) or not keys:
+                        continue
+                    try:
+                        marker = {
+                            "qty": float(row.get("qty", 0.0)),
+                            "seen": float(row.get("seen", 0.0)),
+                            "ts": float(row.get("ts", 0.0)),
+                        }
+                    except (TypeError, ValueError):
+                        continue
+                    for k in keys:
+                        if k:
+                            # All keys share the same marker dict so
+                            # popping later still works in lockstep.
+                            self._resolved_via_fetch[str(k)] = marker
 
             cid_cache = data.get("cid_cache") or []
             if isinstance(cid_cache, list):

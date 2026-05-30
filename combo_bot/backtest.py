@@ -306,24 +306,60 @@ class Backtester:
                 trend_exits_short = self.merger.generate_trend_exit_orders(
                     s, ss.trend_short, Side.SHORT, price, ep,
                 )
+                # Run trend SL/TP exits through the strategy exit hook.
+                # Pre-fix this bypassed StrategyRunner.filter_exits, so
+                # ``confirm_trade_exit=False`` couldn't veto a trend
+                # bucket's fixed SL/TP — diverging from Freqtrade's
+                # "every exit goes through the confirm hook" semantic.
+                if trend_exits_long:
+                    ctx_trend_long = TradeContext(
+                        symbol=s, side=Side.LONG, position=ss.trend_long,
+                        account=account, candle=candle, signal=signal,
+                        current_time_ms=ts, exchange_params=ep,
+                    )
+                    trend_exits_long = self.strategy_runner.filter_exits(
+                        trend_exits_long, ctx_trend_long,
+                    )
+                if trend_exits_short:
+                    ctx_trend_short = TradeContext(
+                        symbol=s, side=Side.SHORT, position=ss.trend_short,
+                        account=account, candle=candle, signal=signal,
+                        current_time_ms=ts, exchange_params=ep,
+                    )
+                    trend_exits_short = self.strategy_runner.filter_exits(
+                        trend_exits_short, ctx_trend_short,
+                    )
 
                 strategy_orders: list[Order] = []
 
                 # ── grid-bucket strategy callbacks ────────────────────
-                if ss.position_long.is_open:
-                    fx = self.strategy_runner.check_custom_exit(ctx_long)
+                # Round-16 P1: every strategy-emitted order — including
+                # the market closes from custom_exit/custom_stoploss —
+                # must pass through confirm_trade_exit (or
+                # confirm_trade_entry for adjust adds). Pre-fix these
+                # bypassed the final safety hook, leaving the strategy
+                # author unable to veto its own SL trigger.
+                for (ss_open, ctx_apply) in (
+                    (ss.position_long.is_open, ctx_long),
+                    (ss.position_short.is_open, ctx_short),
+                ):
+                    if not ss_open:
+                        continue
+                    fx = self.strategy_runner.check_custom_exit(ctx_apply)
                     if fx is not None:
-                        strategy_orders.append(fx)
-                    adj = self.strategy_runner.check_position_adjustment(ctx_long)
+                        strategy_orders.extend(
+                            self.strategy_runner.filter_exits([fx], ctx_apply)
+                        )
+                    adj = self.strategy_runner.check_position_adjustment(ctx_apply)
                     if adj is not None:
-                        strategy_orders.append(adj)
-                if ss.position_short.is_open:
-                    fx = self.strategy_runner.check_custom_exit(ctx_short)
-                    if fx is not None:
-                        strategy_orders.append(fx)
-                    adj = self.strategy_runner.check_position_adjustment(ctx_short)
-                    if adj is not None:
-                        strategy_orders.append(adj)
+                        if adj.reduce_only:
+                            strategy_orders.extend(
+                                self.strategy_runner.filter_exits([adj], ctx_apply)
+                            )
+                        else:
+                            strategy_orders.extend(
+                                self.strategy_runner.filter_entries([adj], ctx_apply)
+                            )
 
                 # ── trend-bucket strategy callbacks ───────────────────
                 # Trend positions were previously only managed by the
@@ -331,36 +367,37 @@ class Backtester:
                 # override with custom_stoploss / custom_exit / adjust
                 # on the trend bucket — the context's position is the
                 # trend bucket so the strategy sees the correct state.
+                trend_branches: list[tuple[bool, TradeContext]] = []
                 if ss.trend_long.is_open:
-                    ctx_trend_long = TradeContext(
+                    trend_branches.append((True, TradeContext(
                         symbol=s, side=Side.LONG, position=ss.trend_long,
                         account=account, candle=candle, signal=signal,
                         current_time_ms=ts, exchange_params=ep,
                         source=OrderSource.TREND,
-                    )
-                    fx = self.strategy_runner.check_custom_exit(ctx_trend_long)
-                    if fx is not None:
-                        strategy_orders.append(fx)
-                    adj = self.strategy_runner.check_position_adjustment(
-                        ctx_trend_long,
-                    )
-                    if adj is not None:
-                        strategy_orders.append(adj)
+                    )))
                 if ss.trend_short.is_open:
-                    ctx_trend_short = TradeContext(
+                    trend_branches.append((True, TradeContext(
                         symbol=s, side=Side.SHORT, position=ss.trend_short,
                         account=account, candle=candle, signal=signal,
                         current_time_ms=ts, exchange_params=ep,
                         source=OrderSource.TREND,
-                    )
-                    fx = self.strategy_runner.check_custom_exit(ctx_trend_short)
+                    )))
+                for _open, ctx_apply in trend_branches:
+                    fx = self.strategy_runner.check_custom_exit(ctx_apply)
                     if fx is not None:
-                        strategy_orders.append(fx)
-                    adj = self.strategy_runner.check_position_adjustment(
-                        ctx_trend_short,
-                    )
+                        strategy_orders.extend(
+                            self.strategy_runner.filter_exits([fx], ctx_apply)
+                        )
+                    adj = self.strategy_runner.check_position_adjustment(ctx_apply)
                     if adj is not None:
-                        strategy_orders.append(adj)
+                        if adj.reduce_only:
+                            strategy_orders.extend(
+                                self.strategy_runner.filter_exits([adj], ctx_apply)
+                            )
+                        else:
+                            strategy_orders.extend(
+                                self.strategy_runner.filter_entries([adj], ctx_apply)
+                            )
 
                 all_orders.extend(grid_long)
                 all_orders.extend(grid_short)

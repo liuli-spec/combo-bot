@@ -147,20 +147,33 @@ def build_strategy(cfg: dict[str, Any]) -> IStrategy | None:
 
     Accepted forms:
 
-    * ``"strategy": "ExampleTrendStrategy"``
-    * ``"strategy": "package.module:ClassName"``
-    * ``"strategy": {"class": "package.module:ClassName"}``
+    * ``"strategy": "ExampleTrendStrategy"`` — no-args.
+    * ``"strategy": "package.module:ClassName"`` — no-args.
+    * ``"strategy": {"class": "package.module:ClassName"}`` — no-args.
+    * ``"strategy": {"class": "...", "params": {"rsi_period": 21}}``
+      — kwargs from ``params`` are splatted into the constructor.
 
-    Strategies are instantiated with no arguments, matching freqtrade's
-    conventional class-based configuration style.
+    If ``params`` is supplied but the strategy's ``__init__`` doesn't
+    accept those kwargs, the resulting ``TypeError`` propagates so the
+    config error is loud rather than silently dropped.
     """
     block = cfg.get("strategy")
     if not block:
         return None
+    params: dict[str, Any] = {}
     if isinstance(block, dict):
         if not _block_enabled(block):
             return None
         spec = block.get("class") or block.get("path") or block.get("name")
+        raw_params = block.get("params") or {}
+        if isinstance(raw_params, dict):
+            params = {k: v for k, v in raw_params.items() if not k.startswith("_")}
+        else:
+            logger.warning(
+                "[fusion_config] strategy.params must be a dict, got %r — "
+                "ignoring parameters",
+                type(raw_params).__name__,
+            )
     else:
         spec = block
     if not isinstance(spec, str) or not spec.strip():
@@ -172,6 +185,8 @@ def build_strategy(cfg: dict[str, Any]) -> IStrategy | None:
         klass = _import_strategy_class(spec)
     if not issubclass(klass, IStrategy):
         raise TypeError(f"strategy {spec!r} is not an IStrategy subclass")
+    if params:
+        return klass(**params)
     return klass()
 
 

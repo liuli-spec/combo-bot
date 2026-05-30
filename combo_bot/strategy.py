@@ -283,7 +283,21 @@ class StrategyRunner:
     def filter_exits(
         self, orders: list[Order], context: TradeContext
     ) -> list[Order]:
-        """Apply exit-side strategy hooks to a list of orders."""
+        """Apply exit-side strategy hooks to a list of orders.
+
+        Order matches Freqtrade's lifecycle (freqtradebot.py:2106 area):
+        ``custom_exit_price`` and ``adjust_exit_price`` run FIRST so
+        the strategy sees the final exit rate, then ``confirm_trade_exit``
+        decides on that final rate.
+
+        Market orders SKIP the price-adjustment hooks — live ignores
+        the price (sends with ``price=None``) and backtest fills at
+        close ± slippage, so any value the strategy returns is purely
+        informational and would mislead ``confirm_trade_exit`` about
+        the real execution price. For market exits the confirm hook
+        sees the order's stated reference price (typically the current
+        close) — the value the bot will actually transact near.
+        """
         result: list[Order] = []
         for order in orders:
             if not order.reduce_only:
@@ -294,20 +308,42 @@ class StrategyRunner:
             ctx = self._ctx_for_order(context, order)
             exit_reason = self._exit_reason_for(order)
 
+            if order.is_market:
+                # No price-adjustment hooks for market exits. The
+                # ``confirm_trade_exit`` hook sees the CURRENT execution
+                # reference price (e.g. the last close), not whatever
+                # threshold the order's ``price`` field encodes. For a
+                # custom_stoploss-triggered market exit, ``order.price``
+                # is the SL threshold; live sends ``price=None`` and the
+                # exchange fills near current — surfacing the threshold
+                # to confirm would mislead the strategy.
+                final_price = (
+                    ctx.current_price if ctx.current_price > 0
+                    else order.price
+                )
+            else:
+                new_price = self.strategy.custom_exit_price(
+                    ctx, order.price, exit_reason
+                )
+                adjusted = self.strategy.adjust_exit_price(
+                    ctx, new_price, exit_reason
+                )
+                final_price = adjusted if adjusted is not None else new_price
+
             if not self.strategy.confirm_trade_exit(
-                ctx, order.qty, order.price, exit_reason
+                ctx, order.qty, final_price, exit_reason
             ):
                 continue
 
-            new_price = self.strategy.custom_exit_price(
-                ctx, order.price, exit_reason
-            )
-            adjusted = self.strategy.adjust_exit_price(
-                ctx, new_price, exit_reason
-            )
-            final_price = adjusted if adjusted is not None else new_price
-
-            result.append(replace(order, price=final_price))
+            # Preserve the order's stated price for market orders —
+            # downstream (live executor / backtest sim) ignores it
+            # anyway, but mutating it to the confirm-reference price
+            # would lose the SL threshold the order was originally
+            # built around (useful for logs/debug).
+            if order.is_market:
+                result.append(order)
+            else:
+                result.append(replace(order, price=final_price))
 
         return result
 

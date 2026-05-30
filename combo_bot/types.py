@@ -136,6 +136,18 @@ class Fill:
     realized_pnl: float
     source: OrderSource
     reduce_only: bool = False
+    # Identity of the originating order. ``exchange_order_id`` and
+    # ``client_order_id`` are best-effort and may be empty when the
+    # exchange (or test stub) doesn't echo them. Without these the
+    # intent journal can only match fills to journal entries by
+    # (source, symbol, side) — too coarse when several grid orders
+    # share those keys, leading to wrong cIDs being marked terminal
+    # and the wrong rows being compacted out. ``trade_id`` is the
+    # exchange's per-trade id — useful for downstream dedup beyond
+    # what FillEventManager already does internally.
+    exchange_order_id: str = ""
+    client_order_id: str = ""
+    trade_id: str = ""
 
 
 @dataclass

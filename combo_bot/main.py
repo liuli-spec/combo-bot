@@ -193,12 +193,20 @@ def cmd_live(args):
     if bar_min is None:
         bar_min = _TF_TO_MIN.get(timeframe, 1.0)
 
-    # Default state file is segregated by run profile (real vs
-    # testnet/dry) so the two never share pending/cID/trend bucket
-    # data. An explicit ``state_file`` in the config overrides this
-    # default — useful for multi-symbol fleets sharing config but
+    # Default state file is segregated by run profile so testnet,
+    # dry-run, and real trading never share pending / cID / bucket
+    # state. Three-way priority: testnet wins (you may be running
+    # ``--real --testnet`` to push live orders to the testnet
+    # exchange, which is still a TESTNET account), then real, then
+    # dryrun. An explicit ``state_file`` in the config still
+    # overrides — useful for multi-symbol fleets sharing config but
     # not state.
-    profile = "real" if args.real else "testnet"
+    if args.testnet:
+        profile = "testnet"
+    elif args.real:
+        profile = "real"
+    else:
+        profile = "dryrun"
     default_state = f"state.{profile}.json"
     state_file = cfg.get("state_file", default_state)
 
