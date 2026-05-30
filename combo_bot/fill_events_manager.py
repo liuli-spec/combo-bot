@@ -37,11 +37,10 @@ tick will skip the fetch.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from combo_bot.types import Fill, OrderSource, Side
-
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +87,14 @@ class FillEventManager:
         self._stuck_count: dict[str, int] = {}
         # How many consecutive stuck polls before we hard-stop.
         self._stuck_escalate_after: int = 3
+        # Per-symbol "last actual poll attempt failed" flag. Distinct
+        # from ``_stuck_symbols`` (which is the persistent operator-
+        # required block); this is the lighter signal "we couldn't
+        # confirm trades on this symbol just now, don't add risk on
+        # this tick". Live consults via :meth:`last_poll_failed`.
+        # Cleared at the START of each ACTUAL poll attempt (not just
+        # a throttled call); set by ``_record_fetch_failure``.
+        self._last_poll_failed_symbols: set[str] = set()
         # Per-symbol watermark: highest trade timestamp seen.
         self._last_ts_ms: dict[str, int] = {}
         # Per-symbol last poll wallclock — gates poll_interval_ms.
@@ -174,6 +181,8 @@ class FillEventManager:
         return {
             "last_ts_ms": dict(self._last_ts_ms),
             "seen_ids": {sym: list(ids) for sym, ids in self._seen_ids.items()},
+            "stuck_symbols": sorted(self._stuck_symbols),
+            "stuck_count": dict(self._stuck_count),
             "order_source": {
                 oid: source.value for oid, source in self.order_source.items()
             },
@@ -204,9 +213,7 @@ class FillEventManager:
         raw_last = data.get("last_ts_ms") or {}
         if isinstance(raw_last, dict):
             self._last_ts_ms = {
-                str(sym): int(ts)
-                for sym, ts in raw_last.items()
-                if self._can_int(ts)
+                str(sym): int(ts) for sym, ts in raw_last.items() if self._can_int(ts)
             }
 
         raw_seen = data.get("seen_ids") or {}
@@ -216,6 +223,18 @@ class FillEventManager:
                 str(sym): [str(x) for x in list(ids)[-cap:]]
                 for sym, ids in raw_seen.items()
                 if isinstance(ids, list)
+            }
+
+        raw_stuck = data.get("stuck_symbols") or []
+        if isinstance(raw_stuck, list):
+            self._stuck_symbols = {str(sym) for sym in raw_stuck if sym}
+
+        raw_stuck_count = data.get("stuck_count") or {}
+        if isinstance(raw_stuck_count, dict):
+            self._stuck_count = {
+                str(sym): int(count)
+                for sym, count in raw_stuck_count.items()
+                if self._can_int(count)
             }
 
         raw_sources = data.get("order_source") or {}
@@ -258,6 +277,48 @@ class FillEventManager:
     # Polling
     # ------------------------------------------------------------------
 
+    def last_poll_failed(self, symbol: str) -> bool:
+        """Did the most recent ACTUAL poll for this symbol fail?
+
+        Distinct from :meth:`is_stuck`: this is the single-tick
+        safety signal — fill ingestion couldn't be confirmed on the
+        latest attempt, so live should refuse to add risk on this
+        tick. Throttled polls don't reset the flag; it's only cleared
+        when a real poll attempt completes successfully.
+        """
+        return symbol in self._last_poll_failed_symbols
+
+    def _record_fetch_failure(self, symbol: str) -> None:
+        """Treat fetch_my_trades exceptions exactly like the same-ms
+        stuck-pagination escalation — once trade history can't be
+        confirmed for N consecutive polls, the fill ledger for that
+        symbol is unsafe and the symbol must be parked so live stops
+        adding new exposure. Also tags this symbol's last-poll-failed
+        flag so the CURRENT tick refuses to add risk even before the
+        escalation threshold is reached.
+        """
+        self._last_poll_failed_symbols.add(symbol)
+        self._stuck_count[symbol] = self._stuck_count.get(symbol, 0) + 1
+        cnt = self._stuck_count[symbol]
+        if cnt >= self._stuck_escalate_after:
+            self._stuck_symbols.add(symbol)
+            logger.error(
+                "[fill_events] %s STUCK after %d consecutive "
+                "fetch_my_trades failures — pausing fill ingestion. "
+                "Operator must investigate and call clear_stuck(%r).",
+                symbol,
+                cnt,
+                symbol,
+            )
+        else:
+            logger.warning(
+                "[fill_events] %s fetch_my_trades failed (attempt %d/%d)"
+                " — will retry next poll",
+                symbol,
+                cnt,
+                self._stuck_escalate_after,
+            )
+
     def clear_stuck(self, symbol: str) -> None:
         """Operator-callable reset for a symbol parked by the
         pagination-stuck detector. Call after manually verifying that
@@ -265,6 +326,10 @@ class FillEventManager:
         self._stuck_symbols.discard(symbol)
         self._stuck_count.pop(symbol, None)
         logger.warning("[fill_events] %s manually cleared from stuck set", symbol)
+
+    def is_stuck(self, symbol: str) -> bool:
+        """True when fill ingestion for ``symbol`` is parked and unsafe."""
+        return symbol in self._stuck_symbols
 
     async def poll(
         self,
@@ -286,7 +351,8 @@ class FillEventManager:
                 "[fill_events] %s in STUCK set — skipping poll. "
                 "Operator must investigate exchange pagination + call "
                 "FillEventManager.clear_stuck(%r)",
-                symbol, symbol,
+                symbol,
+                symbol,
             )
             return []
         # First poll for this symbol always goes through; afterwards
@@ -294,8 +360,14 @@ class FillEventManager:
         if symbol in self._last_poll_ms:
             last_poll = self._last_poll_ms[symbol]
             if now_ms - last_poll < self.config.poll_interval_ms:
+                # Throttled — DON'T touch _last_poll_failed_symbols.
+                # That flag must reflect the last ACTUAL poll attempt's
+                # outcome; a throttled tick neither helps nor hurts.
                 return []
         self._last_poll_ms[symbol] = now_ms
+        # We're about to make a real attempt; clear stale failure flag.
+        # If this attempt also fails, _record_fetch_failure re-adds it.
+        self._last_poll_failed_symbols.discard(symbol)
 
         since_ms = self._last_ts_ms.get(symbol)
         # Paginated drain: keep asking for trades until a page returns
@@ -317,6 +389,12 @@ class FillEventManager:
         max_pages = 16  # bounded to keep tick latency predictable
         cursor_stuck_at_ts: int | None = None
         last_seen_trade_id: str | None = None
+        # Set when ANY page in the pagination loop fails. We use this
+        # to refuse advancing ``_last_ts_ms`` past trades we couldn't
+        # confirm — otherwise a first-page-success / second-page-fail
+        # sequence would silently jump the watermark past same-ms
+        # siblings that never made it into ``trades``.
+        pagination_interrupted = False
         for _ in range(max_pages):
             try:
                 params = {}
@@ -324,7 +402,9 @@ class FillEventManager:
                     # Best-effort fromId hint — Binance USDM honors it.
                     params["fromId"] = last_seen_trade_id
                 page = await self.exchange.fetch_my_trades(
-                    symbol, since=cursor, limit=self.config.page_size,
+                    symbol,
+                    since=cursor,
+                    limit=self.config.page_size,
                     params=params if params else None,
                 )
             except TypeError:
@@ -332,18 +412,27 @@ class FillEventManager:
                 # the no-params form when the broker doesn't accept it.
                 try:
                     page = await self.exchange.fetch_my_trades(
-                        symbol, since=cursor, limit=self.config.page_size,
+                        symbol,
+                        since=cursor,
+                        limit=self.config.page_size,
                     )
                 except Exception:
                     logger.exception(
                         "fetch_my_trades failed for %s since=%s",
-                        symbol, cursor,
+                        symbol,
+                        cursor,
                     )
+                    self._record_fetch_failure(symbol)
+                    pagination_interrupted = True
                     break
             except Exception:
                 logger.exception(
-                    "fetch_my_trades failed for %s since=%s", symbol, cursor,
+                    "fetch_my_trades failed for %s since=%s",
+                    symbol,
+                    cursor,
                 )
+                self._record_fetch_failure(symbol)
+                pagination_interrupted = True
                 break
             if not page:
                 break
@@ -354,9 +443,7 @@ class FillEventManager:
                 # counter resets so a future blip doesn't escalate.
                 self._stuck_count.pop(symbol, None)
                 break
-            page_max = max(
-                int(p.get("timestamp") or 0) for p in page
-            )
+            page_max = max(int(p.get("timestamp") or 0) for p in page)
             page_max_id = page[-1].get("id")
             if cursor is not None and page_max <= cursor:
                 # Same-ms burst — record so the watermark advance below
@@ -370,9 +457,7 @@ class FillEventManager:
                 # Same-ms stuck AND fromId didn't help. Bump consecutive
                 # stuck counter; after N consecutive stuck polls we
                 # park the symbol and ERROR so the operator notices.
-                self._stuck_count[symbol] = (
-                    self._stuck_count.get(symbol, 0) + 1
-                )
+                self._stuck_count[symbol] = self._stuck_count.get(symbol, 0) + 1
                 cnt = self._stuck_count[symbol]
                 if cnt >= self._stuck_escalate_after:
                     self._stuck_symbols.add(symbol)
@@ -382,25 +467,37 @@ class FillEventManager:
                         "ingestion for this symbol. Operator must call "
                         "FillEventManager.clear_stuck(%r) once the "
                         "exchange paginates past this millisecond.",
-                        symbol, cnt, page_max, symbol,
+                        symbol,
+                        cnt,
+                        page_max,
+                        symbol,
                     )
                 else:
                     logger.warning(
                         "[fill_events] %s pagination stuck at ts=%s "
                         "(attempt %d/%d) — leaving watermark at this "
                         "ms; trade_id dedup will skip seen rows",
-                        symbol, page_max, cnt, self._stuck_escalate_after,
+                        symbol,
+                        page_max,
+                        cnt,
+                        self._stuck_escalate_after,
                     )
                 break
             cursor = page_max
-            last_seen_trade_id = (
-                str(page_max_id) if page_max_id is not None else None
-            )
+            last_seen_trade_id = str(page_max_id) if page_max_id is not None else None
         if not trades:
             return []
 
-        seen = self._seen_ids.setdefault(symbol, [])
-        seen_set = set(seen)
+        # IMPORTANT: stage seen/watermark mutations LOCALLY and only
+        # commit them after sink() succeeds. The pre-fix code wrote
+        # to ``self._seen_ids`` and advanced ``self._last_ts_ms``
+        # before sinking; a sink exception (Kelly raising, protections
+        # raising, anything in the live ledger path) would mean the
+        # trades are forever marked as seen and the watermark has
+        # jumped past them — those fills are lost.
+        existing_seen = self._seen_ids.setdefault(symbol, [])
+        seen_set = set(existing_seen)
+        staged_seen: list[str] = []          # new ids accepted this poll
         fresh: list[Fill] = []
         max_ts = since_ms or 0
         # The bot_start filter is ONLY safe for a true cold start:
@@ -429,7 +526,7 @@ class FillEventManager:
             # would leave bot_start_ms newer than the real fill).
             if cold_start_for_symbol and ts < self._bot_start_ms:
                 if not self._trade_belongs_to_us(t):
-                    seen.append(tid)
+                    staged_seen.append(tid)
                     seen_set.add(tid)
                     if ts > max_ts:
                         max_ts = ts
@@ -438,33 +535,50 @@ class FillEventManager:
             if fill is None:
                 continue
             fresh.append(fill)
-            seen.append(tid)
+            staged_seen.append(tid)
             seen_set.add(tid)
             if ts > max_ts:
                 max_ts = ts
 
-        # Trim dedup buffer to capacity (drop oldest).
-        cap = self.config.dedup_capacity
-        if len(seen) > cap:
-            drop = len(seen) - cap
-            del seen[:drop]
-
-        if cursor_stuck_at_ts is not None:
-            # Same-ms burst that couldn't be drained even with fromId.
-            # Hold the watermark AT (not past) that millisecond so the
-            # next poll re-fetches it; trade_id dedup will skip the
-            # rows we already saw and let the un-fetched siblings
-            # through. Better to re-fetch a known millisecond than to
-            # silently lose orders.
-            self._last_ts_ms[symbol] = cursor_stuck_at_ts
+        # Compute the watermark we'd commit if sink succeeds. Same
+        # priority order as before: interrupted > stuck > normal.
+        if pagination_interrupted:
+            staged_watermark = (
+                max_ts if max_ts > (since_ms or 0) else self._last_ts_ms.get(symbol)
+            )
+        elif cursor_stuck_at_ts is not None:
+            staged_watermark = cursor_stuck_at_ts
         elif max_ts > (since_ms or 0):
-            # Normal advance: +1ms past the latest so we don't re-fetch
-            # boundary trades next poll (Binance returns trades with
-            # ``timestamp >= since``, inclusive).
-            self._last_ts_ms[symbol] = max_ts + 1
+            staged_watermark = max_ts + 1
+        else:
+            staged_watermark = self._last_ts_ms.get(symbol)
 
         if fresh:
-            sink(fresh)
+            try:
+                sink(fresh)
+            except Exception:
+                logger.exception(
+                    "[fill_events] sink raised for %s — rolling back "
+                    "watermark/dedup and marking symbol fail-closed; "
+                    "the next poll will re-fetch the same trades",
+                    symbol,
+                )
+                # Record as a fetch-style failure so live blocks new
+                # entries this tick AND eventually escalates to STUCK
+                # if it keeps happening. Don't commit ANYTHING from
+                # this poll — staged_seen + staged_watermark are
+                # dropped so the next poll re-fetches.
+                self._record_fetch_failure(symbol)
+                return []
+
+        # Sink succeeded (or there was nothing to sink). NOW commit
+        # the staged mutations.
+        existing_seen.extend(staged_seen)
+        cap = self.config.dedup_capacity
+        if len(existing_seen) > cap:
+            del existing_seen[: len(existing_seen) - cap]
+        if staged_watermark is not None:
+            self._last_ts_ms[symbol] = staged_watermark
         return fresh
 
     # ------------------------------------------------------------------

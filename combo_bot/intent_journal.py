@@ -46,7 +46,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -68,6 +67,13 @@ class IntentJournal:
         # from the on-disk journal. Reading this is what callers use
         # to discover non-terminal cIDs at replay time.
         self.records: dict[str, dict[str, Any]] = {}
+        # Set by ``replay()`` when the on-disk journal exists but
+        # can't be read (IO error, parse blow-up beyond the tolerated
+        # last-line partial). Callers must treat this the same as
+        # state-file load failure — i.e. enter persistence-failed
+        # mode and block new exposure. A non-existent journal is NOT
+        # a failure (cold start).
+        self.last_replay_failed: bool = False
 
     # ------------------------------------------------------------------
     # Writers
@@ -135,7 +141,12 @@ class IntentJournal:
         self.records[cid] = merged
 
     def mark_terminal(
-        self, *, cid: str, kind: str, now_ms: int, reason: str = "",
+        self,
+        *,
+        cid: str,
+        kind: str,
+        now_ms: int,
+        reason: str = "",
     ) -> None:
         if not cid:
             return
@@ -161,44 +172,80 @@ class IntentJournal:
         Returns a copy of the rebuilt map — caller (LiveTrader) uses it
         to resurrect ``order_source`` / ``order_meta`` / pending
         overlay claims for non-terminal cIDs.
+
+        On IO / parse failure, ``self.last_replay_failed`` is set so
+        the caller can fail-closed; a non-existent file is treated as
+        a normal cold start (not a failure).
         """
         self.records.clear()
+        self.last_replay_failed = False
         if not self.path.exists():
             return {}
         try:
+            # Read once so we can know which line is "last" — a partial
+            # trailing line from an in-flight write at crash time is
+            # tolerable, but a malformed line *in the middle* of the
+            # file means data corruption and we must fail-closed.
             with self.path.open("r", encoding="utf-8") as fp:
-                for line in fp:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        # A partial trailing write from a crash. Tolerate.
+                raw_lines = fp.readlines()
+            # Pre-pass: find the last non-blank line index — that's the
+            # one allowed to be partial.
+            last_nonblank_idx = -1
+            for i, raw in enumerate(raw_lines):
+                if raw.strip():
+                    last_nonblank_idx = i
+            for i, raw in enumerate(raw_lines):
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                try:
+                    rec = json.loads(stripped)
+                except json.JSONDecodeError:
+                    is_last_line = i == last_nonblank_idx
+                    # Only the trailing line is allowed to be partial —
+                    # and only if it lacks the closing newline (a crash
+                    # mid-write signature). Any other corruption means
+                    # the journal isn't trustworthy.
+                    trailing_partial = is_last_line and not raw.endswith("\n")
+                    if trailing_partial:
                         logger.warning(
-                            "[intent_journal] malformed record skipped: %r",
-                            line[:120],
+                            "[intent_journal] tolerating trailing " "partial line: %r",
+                            stripped[:120],
                         )
                         continue
-                    cid = rec.get("cid")
-                    if not cid:
-                        continue
-                    # Last-write-wins per cid; preserve metadata fields
-                    # from earlier records so a journal compacted down
-                    # to just "open" still knows source/side.
-                    prior = self.records.get(cid) or {}
-                    merged = dict(prior)
-                    merged.update(rec)
-                    self.records[cid] = merged
+                    logger.error(
+                        "[intent_journal] malformed mid-stream record at "
+                        "line %d: %r — entering fail-closed mode",
+                        i,
+                        stripped[:120],
+                    )
+                    self.records.clear()
+                    self.last_replay_failed = True
+                    return {}
+                cid = rec.get("cid")
+                if not cid:
+                    continue
+                # Last-write-wins per cid; preserve metadata fields
+                # from earlier records so a journal compacted down
+                # to just "open" still knows source/side.
+                prior = self.records.get(cid) or {}
+                merged = dict(prior)
+                merged.update(rec)
+                self.records[cid] = merged
         except Exception:
-            logger.exception("[intent_journal] replay failed; starting clean")
+            logger.exception(
+                "[intent_journal] replay failed — flagging caller to "
+                "fail-closed; in-flight cIDs may have been lost"
+            )
             self.records.clear()
+            self.last_replay_failed = True
         return dict(self.records)
 
     def non_terminal(self) -> dict[str, dict[str, Any]]:
         """In-flight cIDs (state == submit or open)."""
         return {
-            cid: rec for cid, rec in self.records.items()
+            cid: rec
+            for cid, rec in self.records.items()
             if rec.get("kind") not in _TERMINAL
         }
 

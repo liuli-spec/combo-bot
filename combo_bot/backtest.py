@@ -463,12 +463,18 @@ class Backtester:
         final = out_ext if out_ext is not None else df
         if final is df:
             return
-        # Copy any signal columns the strategy added on a copy of the
-        # frame back into the cached frame so downstream reads see them.
-        for col in ("enter_long", "enter_short", "exit_long", "exit_short",
-                    "enter_tag", "exit_tag"):
-            if col in final.columns and col not in df.columns:
-                df[col] = final[col]
+        # Overwrite signal columns from the strategy's returned frame
+        # whether or not the cache already has the column. Pre-fix the
+        # ``col not in df.columns`` gate meant once a signal column
+        # existed, subsequent populate_* returns couldn't update it —
+        # the strategy's freshest decision was silently stuck on the
+        # first value. Freqtrade semantics: returned df wins.
+        for col in (
+            "enter_long", "enter_short", "exit_long", "exit_short",
+            "enter_tag", "exit_tag",
+        ):
+            if col in final.columns:
+                df[col] = final[col].reindex(df.index)
 
     def _update_prices(self, account: AccountState, candles: dict[str, Candle]):
         for s, c in candles.items():

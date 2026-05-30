@@ -123,17 +123,25 @@ def test_intent_journal_compact_evicts_terminal_rows():
         assert leftover["cid"] == "cb-2"
 
 
-def test_intent_journal_tolerates_partial_trailing_line():
+def test_intent_journal_tolerates_only_unterminated_trailing_line():
+    """A crash mid-write leaves a trailing line with NO closing
+    newline. Round-20 tightened this: a malformed line WITH a
+    trailing newline must be treated as mid-stream corruption and
+    trigger fail-closed (see test_round_20.py for the corruption
+    case). Only the unterminated-trailing-line case is tolerated."""
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "journal.jsonl"
+        # NOTE: no trailing newline on the malformed line — that's the
+        # SIGKILL-mid-write signature we tolerate.
         path.write_text(
             '{"ts":1,"kind":"submit","cid":"cb-1","symbol":"BTC",'
             '"side":"long","source":"grid","reduce_only":false,"is_market":false}\n'
-            'partial_crash_garbage_no_closing_brace\n'
+            'partial_crash_no_newline'
         )
         j = IntentJournal(path)
         records = j.replay()
         assert "cb-1" in records
+        assert j.last_replay_failed is False
 
 
 # ────────────────────────────────────────────────────────────────────

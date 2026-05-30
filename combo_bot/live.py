@@ -2,14 +2,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import deque
 import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from combo_bot.types import (
-    AccountState, Candle, ExchangeParams, Fill, Order, OrderSource,
-    Position, Side, SymbolState, TradingMode,
+    AccountState,
+    Candle,
+    ExchangeParams,
+    Fill,
+    Order,
+    OrderSource,
+    Position,
+    Side,
+    SymbolState,
 )
 from combo_bot.grid_engine import GridConfig, GridEngine, calc_wallet_exposure
 from combo_bot.trend_signal import TrendConfig, TrendEngine
@@ -23,7 +31,8 @@ from combo_bot.sizing import KellySizer
 from combo_bot.correlation import CorrelationGate
 from combo_bot.vol_target import VolTargetSizer
 from combo_bot.fill_events_manager import (
-    FillEventManager, FillEventManagerConfig,
+    FillEventManager,
+    FillEventManagerConfig,
 )
 from combo_bot.intent_journal import IntentJournal
 from combo_bot.types import RegimeView
@@ -176,9 +185,7 @@ class LiveTrader:
         # Durable intent journal — see combo_bot/intent_journal.py.
         # Path is derived from state_file so different deployments
         # (testnet vs real, dry vs live) stay isolated.
-        journal_path = (
-            Path(config.state_file).with_suffix(".intent_journal.jsonl")
-        )
+        journal_path = Path(config.state_file).with_suffix(".intent_journal.jsonl")
         self.intent_journal = IntentJournal(journal_path)
         # Five minutes is comfortably longer than poll_interval_ms
         # (30s) so a normal fill flow will always clear the pending
@@ -191,10 +198,14 @@ class LiveTrader:
         # new entries on that side one cycle. Side-scoped so a long fill
         # doesn't accidentally suppress fresh short entries.
         self._state_change_keys: set[tuple[str, Side]] = set()
+        # If durable state cannot be read/written, new exposure is blocked
+        # until persistence recovers. Reduce-only exits may still go out.
+        self._persistence_failed: bool = False
         # Max age for recent-order dedup (ms). Must exceed two loop
         # intervals or dedup never catches anything between ticks.
         self._recent_order_window_ms: int = max(
-            15_000, int(config.loop_interval_seconds * 1000 * 2),
+            15_000,
+            int(config.loop_interval_seconds * 1000 * 2),
         )
 
     async def start(self):
@@ -234,8 +245,12 @@ class LiveTrader:
             self.exchange_params[symbol] = ExchangeParams(
                 qty_step=float(market.get("precision", {}).get("amount", 0.001)),
                 price_step=float(market.get("precision", {}).get("price", 0.01)),
-                min_qty=float(market.get("limits", {}).get("amount", {}).get("min", 0.001)),
-                min_cost=float(market.get("limits", {}).get("cost", {}).get("min", 5.0)),
+                min_qty=float(
+                    market.get("limits", {}).get("amount", {}).get("min", 0.001)
+                ),
+                min_cost=float(
+                    market.get("limits", {}).get("cost", {}).get("min", 5.0)
+                ),
                 c_mult=float(market.get("contractSize", 1.0)),
                 maker_fee=float(market.get("maker", 0.0002)),
                 taker_fee=float(market.get("taker", 0.0005)),
@@ -258,7 +273,13 @@ class LiveTrader:
         # are updated before aggregate exchange positions are split into
         # grid-vs-trend in _refresh_account.
         await self._refresh_fills()
-        await self._refresh_account()
+        if not await self._refresh_account():
+            logger.error(
+                "[live] account refresh failed — skipping this tick before "
+                "order generation"
+            )
+            await self._save_state()
+            return
         await self._refresh_candles()
 
         self.account.update_equity()
@@ -290,26 +311,52 @@ class LiveTrader:
                 strategy_enter_short=strat_enter_short,
             )
 
-            we_long = calc_wallet_exposure(
-                self.account.balance, abs(ss.position_long.size),
-                ss.position_long.entry_price, ep.c_mult,
-            ) if ss.position_long.is_open else 0.0
+            we_long = (
+                calc_wallet_exposure(
+                    self.account.balance,
+                    abs(ss.position_long.size),
+                    ss.position_long.entry_price,
+                    ep.c_mult,
+                )
+                if ss.position_long.is_open
+                else 0.0
+            )
 
             grid_long = self.grid.compute_orders(
-                symbol, Side.LONG, ss.position_long, ss.ema, ss.volatility,
-                self.account.balance, we_long, ep, regime_view.long_mode,
+                symbol,
+                Side.LONG,
+                ss.position_long,
+                ss.ema,
+                ss.volatility,
+                self.account.balance,
+                we_long,
+                ep,
+                regime_view.long_mode,
                 mark_price=price,
                 close_markup_multiplier=regime_view.close_aggressiveness,
             )
 
-            we_short = calc_wallet_exposure(
-                self.account.balance, abs(ss.position_short.size),
-                ss.position_short.entry_price, ep.c_mult,
-            ) if ss.position_short.is_open else 0.0
+            we_short = (
+                calc_wallet_exposure(
+                    self.account.balance,
+                    abs(ss.position_short.size),
+                    ss.position_short.entry_price,
+                    ep.c_mult,
+                )
+                if ss.position_short.is_open
+                else 0.0
+            )
 
             grid_short = self.grid.compute_orders(
-                symbol, Side.SHORT, ss.position_short, ss.ema, ss.volatility,
-                self.account.balance, we_short, ep, regime_view.short_mode,
+                symbol,
+                Side.SHORT,
+                ss.position_short,
+                ss.ema,
+                ss.volatility,
+                self.account.balance,
+                we_short,
+                ep,
+                regime_view.short_mode,
                 mark_price=price,
                 close_markup_multiplier=regime_view.close_aggressiveness,
             )
@@ -319,36 +366,62 @@ class LiveTrader:
             now_ms = self._now_ms()
             last_candle = self._latest_candle(symbol, price, now_ms)
             ctx_long = TradeContext(
-                symbol=symbol, side=Side.LONG, position=ss.position_long,
-                account=self.account, candle=last_candle, signal=signal,
-                current_time_ms=now_ms, exchange_params=ep,
+                symbol=symbol,
+                side=Side.LONG,
+                position=ss.position_long,
+                account=self.account,
+                candle=last_candle,
+                signal=signal,
+                current_time_ms=now_ms,
+                exchange_params=ep,
             )
             ctx_short = TradeContext(
-                symbol=symbol, side=Side.SHORT, position=ss.position_short,
-                account=self.account, candle=last_candle, signal=signal,
-                current_time_ms=now_ms, exchange_params=ep,
+                symbol=symbol,
+                side=Side.SHORT,
+                position=ss.position_short,
+                account=self.account,
+                candle=last_candle,
+                signal=signal,
+                current_time_ms=now_ms,
+                exchange_params=ep,
             )
             grid_long = self.strategy_runner.filter_exits(
-                self.strategy_runner.filter_entries(grid_long, ctx_long), ctx_long,
+                self.strategy_runner.filter_entries(grid_long, ctx_long),
+                ctx_long,
             )
             grid_short = self.strategy_runner.filter_exits(
-                self.strategy_runner.filter_entries(grid_short, ctx_short), ctx_short,
+                self.strategy_runner.filter_entries(grid_short, ctx_short),
+                ctx_short,
             )
 
             # Stage 8 trailing re-entries (passivbot-style). No-op when
             # entry_trailing_threshold_pct / retracement_pct are 0.
             trailing_entries: list[Order] = []
             trail_long = self.grid.compute_trailing_entry(
-                symbol, Side.LONG, ss.position_long, ss.trailing_long,
-                self.account.balance, we_long, ep, price, regime_view.long_mode,
+                symbol,
+                Side.LONG,
+                ss.position_long,
+                ss.trailing_long,
+                self.account.balance,
+                we_long,
+                ep,
+                price,
+                regime_view.long_mode,
             )
             if trail_long is not None:
                 trailing_entries.extend(
                     self.strategy_runner.filter_entries([trail_long], ctx_long)
                 )
             trail_short = self.grid.compute_trailing_entry(
-                symbol, Side.SHORT, ss.position_short, ss.trailing_short,
-                self.account.balance, we_short, ep, price, regime_view.short_mode,
+                symbol,
+                Side.SHORT,
+                ss.position_short,
+                ss.trailing_short,
+                self.account.balance,
+                we_short,
+                ep,
+                price,
+                regime_view.short_mode,
             )
             if trail_short is not None:
                 trailing_entries.extend(
@@ -363,40 +436,61 @@ class LiveTrader:
             if trend_entries:
                 overlay_side = trend_entries[0].side
                 overlay_pos = (
-                    ss.trend_long if overlay_side == Side.LONG
-                    else ss.trend_short
+                    ss.trend_long if overlay_side == Side.LONG else ss.trend_short
                 )
                 ctx_overlay = TradeContext(
-                    symbol=symbol, side=overlay_side, position=overlay_pos,
-                    account=self.account, candle=last_candle, signal=signal,
-                    current_time_ms=now_ms, exchange_params=ep,
+                    symbol=symbol,
+                    side=overlay_side,
+                    position=overlay_pos,
+                    account=self.account,
+                    candle=last_candle,
+                    signal=signal,
+                    current_time_ms=now_ms,
+                    exchange_params=ep,
                     source=OrderSource.TREND,
                 )
                 trend_entries = self.strategy_runner.filter_entries(
-                    trend_entries, ctx_overlay,
+                    trend_entries,
+                    ctx_overlay,
                 )
-            trend_exits_l = self.merger.generate_trend_exit_orders(symbol, ss.trend_long, Side.LONG, price, ep)
-            trend_exits_s = self.merger.generate_trend_exit_orders(symbol, ss.trend_short, Side.SHORT, price, ep)
+            trend_exits_l = self.merger.generate_trend_exit_orders(
+                symbol, ss.trend_long, Side.LONG, price, ep
+            )
+            trend_exits_s = self.merger.generate_trend_exit_orders(
+                symbol, ss.trend_short, Side.SHORT, price, ep
+            )
             # Trend SL/TP exits also go through the strategy exit hook —
             # mirror of backtest.py change. Without this,
             # confirm_trade_exit=False can't veto a fixed trend exit.
             if trend_exits_l:
                 ctx_trend_l = TradeContext(
-                    symbol=symbol, side=Side.LONG, position=ss.trend_long,
-                    account=self.account, candle=last_candle, signal=signal,
-                    current_time_ms=now_ms, exchange_params=ep,
+                    symbol=symbol,
+                    side=Side.LONG,
+                    position=ss.trend_long,
+                    account=self.account,
+                    candle=last_candle,
+                    signal=signal,
+                    current_time_ms=now_ms,
+                    exchange_params=ep,
                 )
                 trend_exits_l = self.strategy_runner.filter_exits(
-                    trend_exits_l, ctx_trend_l,
+                    trend_exits_l,
+                    ctx_trend_l,
                 )
             if trend_exits_s:
                 ctx_trend_s = TradeContext(
-                    symbol=symbol, side=Side.SHORT, position=ss.trend_short,
-                    account=self.account, candle=last_candle, signal=signal,
-                    current_time_ms=now_ms, exchange_params=ep,
+                    symbol=symbol,
+                    side=Side.SHORT,
+                    position=ss.trend_short,
+                    account=self.account,
+                    candle=last_candle,
+                    signal=signal,
+                    current_time_ms=now_ms,
+                    exchange_params=ep,
                 )
                 trend_exits_s = self.strategy_runner.filter_exits(
-                    trend_exits_s, ctx_trend_s,
+                    trend_exits_s,
+                    ctx_trend_s,
                 )
 
             strategy_orders: list[Order] = []
@@ -405,14 +499,15 @@ class LiveTrader:
             # Round-16 P1: strategy-emitted exits + adjusts also pass
             # through filter_exits / filter_entries, so confirm hooks
             # apply to the bot's own SL / DCA decisions.
-            for ctx, pos in ((ctx_long, ss.position_long), (ctx_short, ss.position_short)):
+            for ctx, pos in (
+                (ctx_long, ss.position_long),
+                (ctx_short, ss.position_short),
+            ):
                 if not pos.is_open:
                     continue
                 fx = self.strategy_runner.check_custom_exit(ctx)
                 if fx is not None:
-                    strategy_orders.extend(
-                        self.strategy_runner.filter_exits([fx], ctx)
-                    )
+                    strategy_orders.extend(self.strategy_runner.filter_exits([fx], ctx))
                 adj = self.strategy_runner.check_position_adjustment(ctx)
                 if adj is not None:
                     if adj.reduce_only:
@@ -435,9 +530,14 @@ class LiveTrader:
                 if not trend_pos.is_open:
                     continue
                 ctx_trend = TradeContext(
-                    symbol=symbol, side=side, position=trend_pos,
-                    account=self.account, candle=last_candle, signal=signal,
-                    current_time_ms=now_ms, exchange_params=ep,
+                    symbol=symbol,
+                    side=side,
+                    position=trend_pos,
+                    account=self.account,
+                    candle=last_candle,
+                    signal=signal,
+                    current_time_ms=now_ms,
+                    exchange_params=ep,
                     source=OrderSource.TREND,
                 )
                 fx = self.strategy_runner.check_custom_exit(ctx_trend)
@@ -460,8 +560,13 @@ class LiveTrader:
             ss.mode_short = regime_view.short_mode
 
             all_desired_orders.extend(
-                grid_long + grid_short + trailing_entries + trend_entries
-                + trend_exits_l + trend_exits_s + strategy_orders
+                grid_long
+                + grid_short
+                + trailing_entries
+                + trend_entries
+                + trend_exits_l
+                + trend_exits_s
+                + strategy_orders
             )
 
         tick_ms = self._now_ms()
@@ -484,7 +589,8 @@ class LiveTrader:
         # Stage 10 correlation gate — runs after protections, before risk.
         if self.correlation_gate is not None:
             all_desired_orders = self.correlation_gate.filter_orders(
-                all_desired_orders, self.account,
+                all_desired_orders,
+                self.account,
             )
 
         # Stage 11 portfolio-level vol-targeting — same as Backtester.
@@ -502,7 +608,9 @@ class LiveTrader:
         all_desired_orders.extend(unstuck_orders)
 
         all_desired_orders = self.risk.filter_orders(
-            all_desired_orders, self.account, tick_ms,
+            all_desired_orders,
+            self.account,
+            tick_ms,
             exchange_params=self.exchange_params,
         )
 
@@ -515,11 +623,13 @@ class LiveTrader:
 
         logger.info(
             "tick | balance=%.2f equity=%.2f dd=%.4f orders=%d",
-            self.account.balance, self.account.equity,
-            self.account.drawdown, len(all_desired_orders),
+            self.account.balance,
+            self.account.equity,
+            self.account.drawdown,
+            len(all_desired_orders),
         )
 
-    async def _refresh_account(self):
+    async def _refresh_account(self) -> bool:
         try:
             balance = await self.exchange.fetch_balance({"type": "future"})
             self.account.balance = self._extract_wallet_balance(balance, "USDT")
@@ -563,14 +673,18 @@ class LiveTrader:
                 # update_best_price would re-anchor to entry_price).
                 if side == "long":
                     self._rebuild_bucket(
-                        symbol=symbol, side=Side.LONG,
-                        exchange_size=size, exchange_entry=entry,
+                        symbol=symbol,
+                        side=Side.LONG,
+                        exchange_size=size,
+                        exchange_entry=entry,
                         ss=ss,
                     )
                 elif side == "short":
                     self._rebuild_bucket(
-                        symbol=symbol, side=Side.SHORT,
-                        exchange_size=size, exchange_entry=entry,
+                        symbol=symbol,
+                        side=Side.SHORT,
+                        exchange_size=size,
+                        exchange_entry=entry,
                         ss=ss,
                     )
                 ss.last_price = float(p.get("markPrice", 0) or ss.last_price)
@@ -627,6 +741,7 @@ class LiveTrader:
                         self._state_change_keys.add((sym, Side.SHORT))
         except Exception:
             logger.exception("Failed to refresh account")
+            return False
 
         # Funding rates feed into the regime arbiter's overlay veto. Best-effort:
         # if the exchange doesn't support it or the call fails, keep zeros so
@@ -637,6 +752,7 @@ class LiveTrader:
                 self._funding_rates[symbol] = float(fr.get("fundingRate", 0) or 0)
             except Exception:
                 self._funding_rates.setdefault(symbol, 0.0)
+        return True
 
     def _rebuild_bucket(
         self,
@@ -686,7 +802,10 @@ class LiveTrader:
                 "[reconcile] %s %s: tracked trend %.6f exceeds exchange "
                 "total %.6f — clamping trend bucket; investigate missed "
                 "fill or manual close",
-                symbol, side.value, trend_size, exchange_size,
+                symbol,
+                side.value,
+                trend_size,
+                exchange_size,
             )
             trend_size = exchange_size
             trend_bucket.size = exchange_size
@@ -715,7 +834,9 @@ class LiveTrader:
 
         prev_best = grid_bucket.best_price
         new_grid = Position(
-            size=grid_size, entry_price=grid_entry, best_price=prev_best,
+            size=grid_size,
+            entry_price=grid_entry,
+            best_price=prev_best,
         )
         if side == Side.LONG:
             ss.position_long = new_grid
@@ -764,7 +885,9 @@ class LiveTrader:
         for symbol in self.config.symbols:
             try:
                 ohlcv = await self.exchange.fetch_ohlcv(
-                    symbol, self.config.candle_timeframe, limit=100,
+                    symbol,
+                    self.config.candle_timeframe,
+                    limit=100,
                 )
                 if not ohlcv:
                     continue
@@ -803,11 +926,13 @@ class LiveTrader:
                     else:
                         ss.ema.update(close_px)
                     import math
+
                     row_high = float(row[2])
                     row_low = float(row[3])
                     lr = (
                         math.log(max(row_high, row_low + 1e-12) / row_low)
-                        if row_low > 0 else 0.0
+                        if row_low > 0
+                        else 0.0
                     )
                     if not ss.volatility.initialized:
                         ss.volatility.init(
@@ -891,7 +1016,8 @@ class LiveTrader:
             # stuck incomplete marker manually via _resolved_via_fetch.
             rvf_cutoff = self._now_ms() - self._resolved_via_fetch_ttl_ms
             self._resolved_via_fetch = {
-                k: rec for k, rec in self._resolved_via_fetch.items()
+                k: rec
+                for k, rec in self._resolved_via_fetch.items()
                 if self._rvf_marker_alive(rec, rvf_cutoff)
             }
             sorted_fills = sorted(fills, key=lambda f: f.timestamp)
@@ -916,11 +1042,15 @@ class LiveTrader:
                 if journal_cid and journal_cid in self.intent_journal.records:
                     rec = self.intent_journal.records[journal_cid]
                     if rec.get("kind") not in (
-                        "filled", "rejected", "canceled", "resolved",
+                        "filled",
+                        "rejected",
+                        "canceled",
+                        "resolved",
                     ):
                         try:
                             self.intent_journal.mark_terminal(
-                                cid=journal_cid, kind="filled",
+                                cid=journal_cid,
+                                kind="filled",
                                 now_ms=self._now_ms(),
                             )
                         except Exception:
@@ -930,10 +1060,9 @@ class LiveTrader:
                 # so we MUST NOT apply it again — that would double
                 # the trend position. We still book fee / PnL ledger
                 # below; only the bucket write is suppressed.
-                rvf_marker = (
-                    self._resolved_via_fetch.get(e.client_order_id)
-                    or self._resolved_via_fetch.get(e.exchange_order_id)
-                )
+                rvf_marker = self._resolved_via_fetch.get(
+                    e.client_order_id
+                ) or self._resolved_via_fetch.get(e.exchange_order_id)
                 already_in_bucket = rvf_marker is not None
                 if e.source == OrderSource.TREND and not already_in_bucket:
                     self._apply_fill_to_trend_bucket(
@@ -967,12 +1096,10 @@ class LiveTrader:
                     # trade_id) — the pre-fix marker would have been
                     # popped on the first trade and the second would
                     # have doubled the bucket.
-                    rvf_marker["seen"] = float(
-                        rvf_marker.get("seen", 0.0)
-                    ) + float(e.qty)
-                    if rvf_marker["seen"] + 1e-9 >= float(
-                        rvf_marker.get("qty", 0.0)
-                    ):
+                    rvf_marker["seen"] = float(rvf_marker.get("seen", 0.0)) + float(
+                        e.qty
+                    )
+                    if rvf_marker["seen"] + 1e-9 >= float(rvf_marker.get("qty", 0.0)):
                         self._resolved_via_fetch.pop(e.client_order_id, None)
                         self._resolved_via_fetch.pop(e.exchange_order_id, None)
                 net = e.realized_pnl - e.fee
@@ -999,7 +1126,8 @@ class LiveTrader:
         strategy_type = type(self.strategy)
         if (
             strategy_type.populate_indicators is DefaultStrategy.populate_indicators
-            and strategy_type.populate_entry_trend is DefaultStrategy.populate_entry_trend
+            and strategy_type.populate_entry_trend
+            is DefaultStrategy.populate_entry_trend
             and strategy_type.populate_exit_trend is DefaultStrategy.populate_exit_trend
         ):
             return  # DefaultStrategy.populate_* are no-ops — skip the work.
@@ -1013,10 +1141,12 @@ class LiveTrader:
         try:
             out_ind = self.strategy.populate_indicators(df, meta)
             out_ent = self.strategy.populate_entry_trend(
-                out_ind if out_ind is not None else df, meta,
+                out_ind if out_ind is not None else df,
+                meta,
             )
             out_ext = self.strategy.populate_exit_trend(
-                out_ent if out_ent is not None else (out_ind or df), meta,
+                out_ent if out_ent is not None else (out_ind or df),
+                meta,
             )
         except Exception:
             logger.exception("Strategy populate_* raised for %s", symbol)
@@ -1024,10 +1154,19 @@ class LiveTrader:
         final = out_ext if out_ext is not None else df
         if final is df:
             return
-        for col in ("enter_long", "enter_short", "exit_long", "exit_short",
-                    "enter_tag", "exit_tag"):
-            if col in final.columns and col not in df.columns:
-                df[col] = final[col]
+        for col in (
+            "enter_long",
+            "enter_short",
+            "exit_long",
+            "exit_short",
+            "enter_tag",
+            "exit_tag",
+        ):
+            # Unconditional overwrite — Freqtrade semantics: the
+            # returned dataframe wins. See parallel comment in
+            # backtest.py.
+            if col in final.columns:
+                df[col] = final[col].reindex(df.index)
 
     def _quantize_order_for_send(self, order: Order) -> Order | None:
         """Return the order with qty floored to qty_step, or None if it
@@ -1039,6 +1178,7 @@ class LiveTrader:
         if ep is None or ep.qty_step <= 0:
             return order
         import math
+
         new_qty = math.floor(order.qty / ep.qty_step) * ep.qty_step
         if new_qty < ep.min_qty:
             return None
@@ -1047,6 +1187,7 @@ class LiveTrader:
         if new_qty == order.qty:
             return order
         from dataclasses import replace
+
         return replace(order, qty=new_qty)
 
     async def _reconcile_orders(self, desired: list[Order]):
@@ -1081,8 +1222,7 @@ class LiveTrader:
         # instead of being silently cancelled+recreated.
         cid_cutoff = now_ms - self._cid_cache_ttl_ms
         stale_keys = [
-            k for k, (_, ts) in self._cid_by_desired.items()
-            if ts < cid_cutoff
+            k for k, (_, ts) in self._cid_by_desired.items() if ts < cid_cutoff
         ]
         for k in stale_keys:
             self._cid_by_desired.pop(k, None)
@@ -1093,16 +1233,26 @@ class LiveTrader:
         # carries the same cOID, and the exchange's clientOrderId echo
         # exactly matches it.
         desired = [
-            replace(o, client_order_id=self._assign_cid(o, now_ms))
-            if not o.client_order_id else o
+            (
+                replace(o, client_order_id=self._assign_cid(o, now_ms))
+                if not o.client_order_id
+                else o
+            )
             for o in desired
         ]
 
+        open_order_refresh_failed: set[str] = set()
         for symbol in self.config.symbols:
             try:
                 existing = await self.exchange.fetch_open_orders(symbol)
             except Exception:
+                logger.exception(
+                    "[reconcile] fetch_open_orders failed for %s — "
+                    "blocking new entries for this symbol this cycle",
+                    symbol,
+                )
                 existing = []
+                open_order_refresh_failed.add(symbol)
             self._open_orders[symbol] = existing
 
         # Dedup keys are full desired-order identities so a LONG-close
@@ -1144,10 +1294,25 @@ class LiveTrader:
                     # just changed — stale exchange state could cause a
                     # double. Reduce-only exits are always safe to send.
                     if (
-                        (symbol, d.side) in self._state_change_keys
-                        and not d.reduce_only
-                    ):
+                        symbol,
+                        d.side,
+                    ) in self._state_change_keys and not d.reduce_only:
                         continue
+                    if not d.reduce_only and self._risk_increasing_blocked(symbol):
+                        continue
+                    if symbol in open_order_refresh_failed:
+                        # Without an authoritative open-orders snapshot,
+                        # a duplicate limit-close ladder would double-
+                        # hang TPs / unstuck orders at the same price.
+                        # The pre-fix gate let ALL reduce_only orders
+                        # through, including grid TP/SL ladders. Now
+                        # only MARKET reduce-only orders (panic close,
+                        # trend SL/TP exit, RISK source) get through —
+                        # those are forced-exit paths we never want to
+                        # block. Limit close ladders wait for the
+                        # next successful fetch_open_orders.
+                        if not (d.reduce_only and d.is_market):
+                            continue
                     # Skip if we recently created this exact entry
                     # (full identity, not just symbol/price/qty).
                     if self._desired_identity(d) in recent_create_keys:
@@ -1158,16 +1323,40 @@ class LiveTrader:
         # create orders again on those (symbol, side) pairs.
         self._state_change_keys.clear()
 
-        for e in to_cancel[:self.config.max_orders_per_batch]:
+        for e in to_cancel[: self.config.max_orders_per_batch]:
             await self._cancel_order(e)
 
-        for d in to_create[:self.config.max_orders_per_batch]:
+        for d in to_create[: self.config.max_orders_per_batch]:
             # cOID was stamped at the top of _reconcile_orders. Record
             # the FULL desired identity tuple BEFORE the API call so
             # the next tick sees this order as in-flight even if the
             # exchange hasn't yet confirmed.
             self._recent_creates.append((now_ms, self._desired_identity(d)))
             await self._create_order(d)
+
+    def _risk_increasing_blocked(self, symbol: str) -> bool:
+        """Return True when local safety state is too stale to add risk."""
+        if self._persistence_failed:
+            logger.error("[reconcile] persistence is unhealthy — blocking new entries")
+            return True
+        if self.fill_events.is_stuck(symbol):
+            logger.error(
+                "[reconcile] %s fill stream is STUCK — blocking new entries",
+                symbol,
+            )
+            return True
+        if self.fill_events.last_poll_failed(symbol):
+            # Single-tick fail-closed: the latest actual fetch_my_trades
+            # for this symbol errored. We may not have crossed the
+            # escalation threshold for STUCK yet, but the fill ledger
+            # for THIS tick is already unreliable — refuse new risk.
+            logger.warning(
+                "[reconcile] %s last fill poll failed — blocking new "
+                "entries for this tick",
+                symbol,
+            )
+            return True
+        return False
 
     def _orders_match(self, desired: Order, existing: dict) -> bool:
         # Prefer exact clientOrderId match — when both sides carry it,
@@ -1214,15 +1403,17 @@ class LiveTrader:
 
         # positionSide (hedge mode): when both echo it, require equality.
         e_pos_side = (
-            existing.get("positionSide")
-            or info.get("positionSide")
-            or ""
+            existing.get("positionSide") or info.get("positionSide") or ""
         ).lower()
         if e_pos_side and e_pos_side not in ("both", desired.side.value):
             return False
 
         e_price = float(existing.get("price", 0))
-        if e_price > 0 and abs(e_price - desired.price) / e_price > self.config.order_match_tolerance_pct:
+        if (
+            e_price > 0
+            and abs(e_price - desired.price) / e_price
+            > self.config.order_match_tolerance_pct
+        ):
             return False
 
         e_amount = float(existing.get("amount", 0))
@@ -1272,8 +1463,12 @@ class LiveTrader:
             return
 
         terminal_statuses = {
-            "closed", "filled", "canceled", "cancelled",
-            "rejected", "expired",
+            "closed",
+            "filled",
+            "canceled",
+            "cancelled",
+            "rejected",
+            "expired",
         }
 
         for (symbol, side), ts in list(self._unknown_overlay.items()):
@@ -1282,12 +1477,15 @@ class LiveTrader:
             except Exception:
                 logger.exception(
                     "[overlay] fetch_open_orders failed for %s — "
-                    "leaving %s in UNKNOWN", symbol, side.value,
+                    "leaving %s in UNKNOWN",
+                    symbol,
+                    side.value,
                 )
                 continue
             # Find OUR cIDs the journal still treats as non-terminal.
             ours = {
-                cid for cid, rec in self.intent_journal.non_terminal().items()
+                cid
+                for cid, rec in self.intent_journal.non_terminal().items()
                 if rec.get("symbol") == symbol
                 and rec.get("side") == side.value
                 and rec.get("source") == OrderSource.TREND.value
@@ -1307,7 +1505,9 @@ class LiveTrader:
             if still_open_cid is not None:
                 logger.info(
                     "[overlay] %s %s: cID %s still OPEN — back to pending",
-                    symbol, side.value, still_open_cid,
+                    symbol,
+                    side.value,
+                    still_open_cid,
                 )
                 self._pending_overlay[(symbol, side)] = self._now_ms()
                 self._unknown_overlay.pop((symbol, side), None)
@@ -1330,11 +1530,13 @@ class LiveTrader:
             #   real fill arrives.
             unresolved: set[str] = set(ours)
             for cid in ours:
-                exchange_id = (
-                    self.intent_journal.records.get(cid, {}).get("exchange_id", "")
+                exchange_id = self.intent_journal.records.get(cid, {}).get(
+                    "exchange_id", ""
                 )
                 fetched = await self._fetch_order_safely(
-                    symbol, cid=cid, exchange_id=exchange_id,
+                    symbol,
+                    cid=cid,
+                    exchange_id=exchange_id,
                 )
                 if fetched is None:
                     continue
@@ -1346,7 +1548,9 @@ class LiveTrader:
                     unresolved.discard(cid)
                     try:
                         self.intent_journal.mark_terminal(
-                            cid=cid, kind="canceled", now_ms=self._now_ms(),
+                            cid=cid,
+                            kind="canceled",
+                            now_ms=self._now_ms(),
                             reason=f"resolve_unknown:{status}",
                         )
                     except Exception:
@@ -1355,14 +1559,19 @@ class LiveTrader:
                 # status in ("closed", "filled"): exposure happened.
                 # We need filled qty + avg to update the bucket.
                 applied = self._apply_resolved_fill_to_bucket(
-                    fetched, symbol=symbol, side=side, source=OrderSource.TREND,
+                    fetched,
+                    symbol=symbol,
+                    side=side,
+                    source=OrderSource.TREND,
                     cid=cid,
                 )
                 if applied:
                     unresolved.discard(cid)
                     try:
                         self.intent_journal.mark_terminal(
-                            cid=cid, kind="filled", now_ms=self._now_ms(),
+                            cid=cid,
+                            kind="filled",
+                            now_ms=self._now_ms(),
                             reason=f"resolve_unknown:{status}",
                         )
                     except Exception:
@@ -1372,7 +1581,10 @@ class LiveTrader:
                         "[overlay] %s %s cID=%s reports %s but lacks "
                         "filled qty/avg — HOLDING UNKNOWN until the "
                         "FillEventManager surfaces the trade",
-                        symbol, side.value, cid, status,
+                        symbol,
+                        side.value,
+                        cid,
+                        status,
                     )
             # Only clear the side's UNKNOWN slot when EVERY journal
             # cID for that side is fully resolved. Pre-fix, the very
@@ -1388,15 +1600,20 @@ class LiveTrader:
                 # cIDs.
                 logger.info(
                     "[overlay] %s %s cleared — all %d cIDs resolved",
-                    symbol, side.value, len(ours),
+                    symbol,
+                    side.value,
+                    len(ours),
                 )
                 self._unknown_overlay.pop((symbol, side), None)
             elif ours and len(unresolved) < len(ours):
                 logger.warning(
                     "[overlay] %s %s partially resolved: %d/%d cIDs "
                     "still unresolved (%s) — HOLDING block",
-                    symbol, side.value,
-                    len(unresolved), len(ours), sorted(unresolved),
+                    symbol,
+                    side.value,
+                    len(unresolved),
+                    len(ours),
+                    sorted(unresolved),
                 )
             else:
                 # Nothing resolved. Hold + WARN — silently clearing
@@ -1405,7 +1622,9 @@ class LiveTrader:
                     "[overlay] %s %s STILL UNKNOWN: cID(s) %s not in open "
                     "orders and no resolvable fetch_order. Holding the "
                     "block; operator should verify exchange state.",
-                    symbol, side.value, sorted(ours) or "<none>",
+                    symbol,
+                    side.value,
+                    sorted(ours) or "<none>",
                 )
         # Round-15 P2: stale-UNKNOWN sweep. If a (sym, side) is in
         # _unknown_overlay but NO cID in the non-terminal journal
@@ -1428,14 +1647,13 @@ class LiveTrader:
             if ss is None:
                 self._unknown_overlay.pop((symbol, side), None)
                 continue
-            trend_bucket = (
-                ss.trend_long if side == Side.LONG else ss.trend_short
-            )
+            trend_bucket = ss.trend_long if side == Side.LONG else ss.trend_short
             if trend_bucket.is_open:
                 logger.info(
                     "[overlay] %s %s: no journal cIDs, trend bucket "
                     "already populated — clearing stale UNKNOWN",
-                    symbol, side.value,
+                    symbol,
+                    side.value,
                 )
                 self._unknown_overlay.pop((symbol, side), None)
                 continue
@@ -1446,9 +1664,7 @@ class LiveTrader:
             # the EXCHANGE'S aggregate position on this side is
             # confirmed flat. Otherwise hold + ERROR for operator
             # intervention.
-            grid_bucket = (
-                ss.position_long if side == Side.LONG else ss.position_short
-            )
+            grid_bucket = ss.position_long if side == Side.LONG else ss.position_short
             local_total = abs(trend_bucket.size) + abs(grid_bucket.size)
             if local_total > 1e-9:
                 logger.error(
@@ -1456,19 +1672,23 @@ class LiveTrader:
                     "cIDs; local position total %.6f is non-zero — "
                     "HOLDING block; operator must verify exchange "
                     "state and clear manually",
-                    symbol, side.value, local_total,
+                    symbol,
+                    side.value,
+                    local_total,
                 )
                 continue
             # Pull a fresh authoritative read from the exchange to
             # confirm true flatness, not just our cached belief.
             confirmed_flat = await self._exchange_side_is_flat(
-                symbol, side,
+                symbol,
+                side,
             )
             if confirmed_flat:
                 logger.warning(
                     "[overlay] %s %s: stale UNKNOWN with empty buckets "
                     "AND exchange-confirmed flat — clearing block",
-                    symbol, side.value,
+                    symbol,
+                    side.value,
                 )
                 self._unknown_overlay.pop((symbol, side), None)
             else:
@@ -1477,7 +1697,8 @@ class LiveTrader:
                     "buckets but exchange shows non-flat (or query "
                     "failed) — HOLDING block; operator intervention "
                     "required",
-                    symbol, side.value,
+                    symbol,
+                    side.value,
                 )
 
     async def _exchange_side_is_flat(self, symbol: str, side: Side) -> bool:
@@ -1506,8 +1727,13 @@ class LiveTrader:
         return True
 
     def _apply_resolved_fill_to_bucket(
-        self, fetched: dict, *, symbol: str, side: Side,
-        source: OrderSource, cid: str,
+        self,
+        fetched: dict,
+        *,
+        symbol: str,
+        side: Side,
+        source: OrderSource,
+        cid: str,
     ) -> bool:
         """Apply a fetch_order's filled qty/avg into the local trend
         bucket. Returns True when applied, False when the order's
@@ -1544,8 +1770,13 @@ class LiveTrader:
         # Apply the fill: synthesise a minimal Order surrogate that
         # _apply_fill_to_trend_bucket already knows how to consume.
         synthetic = Order(
-            symbol=symbol, side=side, price=avg, qty=filled,
-            source=source, reduce_only=False, is_market=True,
+            symbol=symbol,
+            side=side,
+            price=avg,
+            qty=filled,
+            source=source,
+            reduce_only=False,
+            is_market=True,
             client_order_id=cid,
         )
         try:
@@ -1573,7 +1804,11 @@ class LiveTrader:
             logger.info(
                 "[overlay] %s %s: applied resolved fill qty=%.6f avg=%.4f "
                 "to trend bucket from fetch_order(cid=%s)",
-                symbol, side.value, filled, avg, cid,
+                symbol,
+                side.value,
+                filled,
+                avg,
+                cid,
             )
             return True
         except Exception:
@@ -1581,7 +1816,11 @@ class LiveTrader:
             return False
 
     async def _fetch_order_safely(
-        self, symbol: str, *, cid: str = "", exchange_id: str = "",
+        self,
+        symbol: str,
+        *,
+        cid: str = "",
+        exchange_id: str = "",
     ) -> dict | None:
         """Best-effort wrapper around ccxt.fetch_order. Tries the
         exchange id first (universally supported), falls back to cID
@@ -1593,12 +1832,15 @@ class LiveTrader:
                 return await self.exchange.fetch_order(exchange_id, symbol)
             if cid:
                 return await self.exchange.fetch_order(
-                    None, symbol, params={"clientOrderId": cid},
+                    None,
+                    symbol,
+                    params={"clientOrderId": cid},
                 )
         except Exception:
             logger.exception(
                 "[overlay] fetch_order failed for cid=%s exchange_id=%s",
-                cid, exchange_id,
+                cid,
+                exchange_id,
             )
         return None
 
@@ -1629,7 +1871,6 @@ class LiveTrader:
         """Yield (keys_list, qty, seen, ts) rows for state file —
         groups keys that share the same marker dict so loading can
         restore the shared-object invariant."""
-        seen_ids: set[int] = set()
         groups: dict[int, tuple[list[str], dict]] = {}
         for key, rec in self._resolved_via_fetch.items():
             rid = id(rec)
@@ -1648,11 +1889,31 @@ class LiveTrader:
     def _replay_intent_journal(self) -> None:
         """Resurrect attribution + pending overlay from the durable
         journal after a crash/restart. Idempotent; safe to call after
-        a clean shutdown too (journal will be ~empty in that case)."""
+        a clean shutdown too (journal will be ~empty in that case).
+
+        Replay failures fail-closed: a journal that exists on disk but
+        can't be parsed may have lost in-flight TREND attributions,
+        and silently continuing would allow duplicate overlay entries.
+        Mirror the state-file load failure path by setting
+        ``_persistence_failed`` so ``_risk_increasing_blocked`` returns
+        True for every symbol until the operator resolves it.
+        """
         try:
-            records = self.intent_journal.replay()
+            self.intent_journal.replay()
         except Exception:
-            logger.exception("[live] intent journal replay failed")
+            logger.exception(
+                "[live] intent journal replay raised — entering "
+                "persistence-failed mode"
+            )
+            self._persistence_failed = True
+            return
+        if self.intent_journal.last_replay_failed:
+            logger.error(
+                "[live] intent journal replay flagged failure — "
+                "entering persistence-failed mode; new entries will "
+                "be blocked until the operator resolves the journal"
+            )
+            self._persistence_failed = True
             return
         non_terminal = self.intent_journal.non_terminal()
         if not non_terminal:
@@ -1672,7 +1933,10 @@ class LiveTrader:
             ex_id = rec.get("exchange_id", "")
             # Restore attribution under both keys.
             self.fill_events.register_outgoing(
-                str(ex_id or ""), source, side, reduce_only,
+                str(ex_id or ""),
+                source,
+                side,
+                reduce_only,
                 client_order_id=cid,
             )
             # Restore pending overlay claim for non-reduce TREND.
@@ -1738,7 +2002,8 @@ class LiveTrader:
         if order.client_order_id:
             # An explicit cOID (e.g. set by a strategy hook) wins.
             self._cid_by_desired[self._desired_identity(order)] = (
-                order.client_order_id, now_ms,
+                order.client_order_id,
+                now_ms,
             )
             return order.client_order_id
         key = self._desired_identity(order)
@@ -1761,6 +2026,9 @@ class LiveTrader:
         if not order.client_order_id:
             order = replace(order, client_order_id=self._make_client_order_id())
 
+        if not order.reduce_only and self._risk_increasing_blocked(order.symbol):
+            return
+
         params = {"clientOrderId": order.client_order_id}
         if order.reduce_only:
             params["reduceOnly"] = True
@@ -1774,11 +2042,15 @@ class LiveTrader:
         send_qty = order.qty
         if ep is not None and ep.qty_step > 0:
             import math
+
             send_qty = math.floor(order.qty / ep.qty_step) * ep.qty_step
             if send_qty < ep.min_qty:
                 logger.warning(
                     "Skipping %s %s — quantized qty %.10f below min_qty %.10f",
-                    side, order.symbol, send_qty, ep.min_qty,
+                    side,
+                    order.symbol,
+                    send_qty,
+                    ep.min_qty,
                 )
                 return
             # min_cost must be revalidated against the QUANTIZED qty.
@@ -1789,15 +2061,24 @@ class LiveTrader:
             if cost < ep.min_cost:
                 logger.warning(
                     "Skipping %s %s — cost %.4f below min_cost %.4f at qty %.10f",
-                    side, order.symbol, cost, ep.min_cost, send_qty,
+                    side,
+                    order.symbol,
+                    cost,
+                    ep.min_cost,
+                    send_qty,
                 )
                 return
 
         if self.config.dry_run:
             logger.info(
                 "[DRY] %s %s %s %.4f @ %.2f (%s%s)",
-                order_type, side, order.symbol, send_qty, order.price,
-                order.source.value, " reduce" if order.reduce_only else "",
+                order_type,
+                side,
+                order.symbol,
+                send_qty,
+                order.price,
+                order.source.value,
+                " reduce" if order.reduce_only else "",
             )
             # Trend bucket bookkeeping: even in dry-run the local state
             # must stay consistent so the next tick's overlay decision
@@ -1827,9 +2108,7 @@ class LiveTrader:
             order.source == OrderSource.TREND and not order.reduce_only
         )
         if pre_reserved_pending:
-            self._pending_overlay[(order.symbol, order.side)] = (
-                self._now_ms()
-            )
+            self._pending_overlay[(order.symbol, order.side)] = self._now_ms()
         # Durable intent journal — written and fsync'd BEFORE the
         # network call so a SIGKILL in the create_order ack window
         # still lets us replay attribution + pending on restart.
@@ -1852,9 +2131,7 @@ class LiveTrader:
                 )
                 # Roll back the in-memory reservations and abort.
                 if pre_reserved_pending:
-                    self._pending_overlay.pop(
-                        (order.symbol, order.side), None
-                    )
+                    self._pending_overlay.pop((order.symbol, order.side), None)
                 return
 
         try:
@@ -1871,9 +2148,13 @@ class LiveTrader:
             if status in ("expired", "rejected", "canceled", "cancelled"):
                 logger.warning(
                     "Order %s %s %s %.4f @ %s → %s (status=%s)",
-                    order_type, side, order.symbol, order.qty,
+                    order_type,
+                    side,
+                    order.symbol,
+                    order.qty,
                     f"{order.price:.2f}" if not order.is_market else "MKT",
-                    oid, status,
+                    oid,
+                    status,
                 )
                 # Remove from recent_creates so the next tick can
                 # retry. Match on the FULL identity tuple to avoid
@@ -1888,23 +2169,15 @@ class LiveTrader:
                 # Rejected/cancelled TREND entries must free the
                 # pending-overlay slot — otherwise a transient reject
                 # would block the next try until the 5-min TTL.
-                if (
-                    order.source == OrderSource.TREND
-                    and not order.reduce_only
-                ):
-                    self._pending_overlay.pop(
-                        (order.symbol, order.side), None
-                    )
+                if order.source == OrderSource.TREND and not order.reduce_only:
+                    self._pending_overlay.pop((order.symbol, order.side), None)
                 # Mark terminal in journal so replay doesn't try to
                 # restore this cID as in-flight.
                 if order.client_order_id:
                     try:
                         self.intent_journal.mark_terminal(
                             cid=order.client_order_id,
-                            kind=(
-                                "rejected" if status == "rejected"
-                                else "canceled"
-                            ),
+                            kind=("rejected" if status == "rejected" else "canceled"),
                             now_ms=self._now_ms(),
                         )
                     except Exception:
@@ -1912,7 +2185,10 @@ class LiveTrader:
             else:
                 logger.info(
                     "Created %s %s %s %.4f @ %s → %s",
-                    order_type, side, order.symbol, order.qty,
+                    order_type,
+                    side,
+                    order.symbol,
+                    order.qty,
                     f"{order.price:.2f}" if not order.is_market else "MKT",
                     oid,
                 )
@@ -1921,15 +2197,15 @@ class LiveTrader:
                 # (not clientOrderId) are still attributable.
                 if str(oid) and oid != "?":
                     self.fill_events.register_outgoing(
-                        str(oid), order.source, order.side,
+                        str(oid),
+                        order.source,
+                        order.side,
                         order.reduce_only,
                         client_order_id=order.client_order_id,
                     )
                 # Refresh pending timestamp on confirmed acceptance.
                 if pre_reserved_pending:
-                    self._pending_overlay[(order.symbol, order.side)] = (
-                        self._now_ms()
-                    )
+                    self._pending_overlay[(order.symbol, order.side)] = self._now_ms()
                 # Journal: transition from submit → open with the
                 # exchange-assigned id alongside.
                 if order.client_order_id:
@@ -1954,7 +2230,10 @@ class LiveTrader:
                 "[live] create_order EXCEPTION — treating as UNKNOWN state "
                 "(may have been accepted by exchange). Order: %s %s %s "
                 "%.4f @ %s cID=%s",
-                order_type, side, order.symbol, order.qty,
+                order_type,
+                side,
+                order.symbol,
+                order.qty,
                 f"{order.price:.2f}" if not order.is_market else "MKT",
                 order.client_order_id or "<none>",
                 exc_info=True,
@@ -1985,14 +2264,14 @@ class LiveTrader:
                 logger.warning(
                     "[overlay] %s %s pending past TTL — moving to "
                     "UNKNOWN; reconcile will attempt to resolve",
-                    k[0], k[1].value,
+                    k[0],
+                    k[1].value,
                 )
         self._pending_overlay = new_pending
         ss = self.account.symbols.get(symbol)
         if ss is not None:
             existing = (
-                ss.trend_long if regime.trend_overlay == Side.LONG
-                else ss.trend_short
+                ss.trend_long if regime.trend_overlay == Side.LONG else ss.trend_short
             )
             if existing.is_open:
                 return []
@@ -2024,14 +2303,16 @@ class LiveTrader:
             return []
         # Trend overlay entries cross the book immediately — see the
         # parallel comment in Backtester._emit_trend_overlay.
-        return [Order(
-            symbol=symbol,
-            side=regime.trend_overlay,
-            price=price,
-            qty=qty,
-            source=OrderSource.TREND,
-            is_market=True,
-        )]
+        return [
+            Order(
+                symbol=symbol,
+                side=regime.trend_overlay,
+                price=price,
+                qty=qty,
+                source=OrderSource.TREND,
+                is_market=True,
+            )
+        ]
 
     def _enrich_fill_pnl(self, fill: Fill) -> Fill:
         """Fallback realized-PnL computation for reduce-only fills.
@@ -2066,6 +2347,7 @@ class LiveTrader:
         else:
             pnl = fill.qty * (bucket.entry_price - fill.price) * c_mult
         from dataclasses import replace as _replace
+
         return _replace(fill, realized_pnl=pnl)
 
     def _apply_fill_to_trend_bucket(self, order: Order, filled_qty: float) -> None:
@@ -2120,11 +2402,15 @@ class LiveTrader:
                 volume=float(row["volume"]),
             )
         return Candle(
-            timestamp=now_ms, open=price, high=price, low=price,
-            close=price, volume=0.0,
+            timestamp=now_ms,
+            open=price,
+            high=price,
+            low=price,
+            close=price,
+            volume=0.0,
         )
 
-    async def _save_state(self):
+    async def _save_state(self) -> bool:
         # Persist trend-bucket size + entry price so a restart can
         # subtract the right trend share from the exchange's aggregate
         # position and rebuild grid_size correctly. Without this, the
@@ -2199,8 +2485,17 @@ class LiveTrader:
             # [symbol, side, source, reduce_only, is_market, price, qty,
             #  cid, ts]
             "cid_cache": [
-                [k[0], k[1], k[2], bool(k[3]), bool(k[4]),
-                 float(k[5]), float(k[6]), cid, float(ts)]
+                [
+                    k[0],
+                    k[1],
+                    k[2],
+                    bool(k[3]),
+                    bool(k[4]),
+                    float(k[5]),
+                    float(k[6]),
+                    cid,
+                    float(ts),
+                ]
                 for k, (cid, ts) in self._cid_by_desired.items()
             ],
             # Persist pending TREND overlay claims so a process restart
@@ -2226,8 +2521,16 @@ class LiveTrader:
             # dedup info → the trade re-applies → double position.
             "resolved_via_fetch": list(self._serialize_rvf_markers()),
         }
+        path = Path(self.config.state_file)
+        tmp = path.with_suffix(path.suffix + ".tmp")
         try:
-            Path(self.config.state_file).write_text(json.dumps(state, indent=2))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tmp.open("w", encoding="utf-8") as fp:
+                fp.write(json.dumps(state, indent=2))
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(tmp, path)
+            self._persistence_failed = False
             # Compact the intent journal AFTER a successful state save:
             # any cIDs that are now terminal (their fills/rejects are
             # captured in state above) can be evicted from the journal.
@@ -2235,12 +2538,23 @@ class LiveTrader:
                 self.intent_journal.compact()
             except Exception:
                 logger.exception("intent journal compact failed")
+            return True
         except Exception:
-            pass
+            logger.exception("[live] failed to save state to %s", path)
+            self._persistence_failed = True
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                logger.exception("[live] failed to remove temp state file %s", tmp)
+            return False
 
-    async def _load_state(self):
+    async def _load_state(self) -> bool:
+        path = Path(self.config.state_file)
+        if not path.exists():
+            return True
         try:
-            data = json.loads(Path(self.config.state_file).read_text())
+            data = json.loads(path.read_text())
             self.account.equity_peak = data.get("equity_peak", 0)
             # Restore risk state so a restart doesn't forget RED.
             # Convert the persisted tier string back into the enum so
@@ -2251,7 +2565,9 @@ class LiveTrader:
                 try:
                     self.risk.tier = RiskTier(raw_tier)
                 except ValueError:
-                    logger.warning("[risk] unknown tier %r in state file; ignoring", raw_tier)
+                    logger.warning(
+                        "[risk] unknown tier %r in state file; ignoring", raw_tier
+                    )
             self.risk.red_latched = data.get("risk_red_latched", False)
             self.risk.red_cooldown_until = data.get("risk_red_cooldown_until", 0)
             self.risk.dd_ema = data.get("risk_dd_ema", 0.0)
@@ -2260,13 +2576,16 @@ class LiveTrader:
             # short-circuit through the seeding branch that overwrites
             # dd_ema with raw drawdown.
             self.risk._dd_initialized = data.get(
-                "risk_dd_initialized", self.risk._dd_initialized,
+                "risk_dd_initialized",
+                self.risk._dd_initialized,
             )
             self.risk.last_assess_minute = data.get(
-                "risk_last_assess_minute", self.risk.last_assess_minute,
+                "risk_last_assess_minute",
+                self.risk.last_assess_minute,
             )
             self.risk.red_latched_at_ms = data.get(
-                "risk_red_latched_at_ms", self.risk.red_latched_at_ms,
+                "risk_red_latched_at_ms",
+                self.risk.red_latched_at_ms,
             )
             self.fill_events.load_snapshot(data.get("fill_events", {}))
             # Restore per-source realized P&L ledger so HSL / unstuck /
@@ -2374,11 +2693,11 @@ class LiveTrader:
                         if ts < cache_cutoff_ms:
                             continue
                         key = (
-                            str(row[0]),       # symbol
-                            str(row[1]),       # side.value
-                            str(row[2]),       # source.value
-                            bool(row[3]),      # reduce_only
-                            bool(row[4]),      # is_market
+                            str(row[0]),  # symbol
+                            str(row[1]),  # side.value
+                            str(row[2]),  # source.value
+                            bool(row[3]),  # reduce_only
+                            bool(row[4]),  # is_market
                             round(float(row[5]), 6),
                             round(float(row[6]), 8),
                         )
@@ -2418,8 +2737,15 @@ class LiveTrader:
                 if entry:
                     logger.info(
                         "[restore] %s trend bucket: long=%.6f@%.2f short=%.6f@%.2f",
-                        sym, ss.trend_long.size, ss.trend_long.entry_price,
-                        ss.trend_short.size, ss.trend_short.entry_price,
+                        sym,
+                        ss.trend_long.size,
+                        ss.trend_long.entry_price,
+                        ss.trend_short.size,
+                        ss.trend_short.entry_price,
                     )
+            self._persistence_failed = False
+            return True
         except Exception:
-            pass
+            logger.exception("[live] failed to load state from %s", path)
+            self._persistence_failed = True
+            return False

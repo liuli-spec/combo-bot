@@ -259,22 +259,56 @@ class StrategyRunner:
                 continue
 
             ctx = self._ctx_for_order(context, order)
-            new_price = self.strategy.custom_entry_price(ctx, order.price)
-            adjusted = self.strategy.adjust_entry_price(ctx, new_price)
-            final_price = adjusted if adjusted is not None else new_price
+            c_mult = (
+                ctx.exchange_params.c_mult
+                if ctx.exchange_params is not None
+                else 1.0
+            )
 
-            proposed_stake = order.qty * final_price
-            min_stake = context.exchange_params.min_cost
-            max_stake = max(context.account.balance, proposed_stake)
+            if order.is_market:
+                # Market entries SKIP price hooks. Live sends
+                # ``price=None`` and backtest fills at close ± slip,
+                # so any value ``custom_entry_price`` returns would be
+                # a lie when fed to ``custom_stake_amount`` /
+                # ``confirm_trade_entry``. Use the current execution
+                # reference price (or the order's stated price as
+                # fallback) so confirm sees the number it actually
+                # transacts near.
+                final_price = (
+                    ctx.current_price
+                    if ctx.current_price > 0
+                    else order.price
+                )
+            else:
+                new_price = self.strategy.custom_entry_price(ctx, order.price)
+                adjusted = self.strategy.adjust_entry_price(ctx, new_price)
+                final_price = adjusted if adjusted is not None else new_price
+
+            # Notional INCLUDES contract multiplier. For c_mult != 1
+            # (index-multiplied / coin-margined), qty * price is just
+            # the dimensionless count × index — the real USD-equivalent
+            # stake is qty * price * c_mult. Pre-fix used the wrong
+            # denominator and ``custom_stake_amount`` returned a stake
+            # that, when divided back by final_price, produced a qty
+            # off by c_mult.
+            proposed_stake = order.qty * final_price * c_mult
+            min_stake = ctx.exchange_params.min_cost
+            max_stake = max(ctx.account.balance, proposed_stake)
             new_stake = self.strategy.custom_stake_amount(
                 ctx, proposed_stake, min_stake, max_stake
             )
-            new_qty = new_stake / final_price if final_price > 0 else order.qty
+            denom = final_price * c_mult
+            new_qty = new_stake / denom if denom > 0 else order.qty
 
             if not self.strategy.confirm_trade_entry(ctx, new_qty, final_price):
                 continue
 
-            result.append(replace(order, price=final_price, qty=new_qty))
+            if order.is_market:
+                # Don't overwrite the order's stated price for market
+                # entries — see parallel comment in filter_exits.
+                result.append(replace(order, qty=new_qty))
+            else:
+                result.append(replace(order, price=final_price, qty=new_qty))
 
         return result
 
