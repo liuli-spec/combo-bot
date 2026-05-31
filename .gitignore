@@ -69,3 +69,4 @@ optuna-journal*.log
 .codegraph/
 .codewhale/
 .deepseek/
+*.fills.jsonl

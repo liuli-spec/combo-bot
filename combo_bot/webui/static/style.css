@@ -1,6 +1,6 @@
 /* combo_bot operator UI — dark luxury + bento layout.
  *
- * Design notes (per the user's frontend rules):
+ * Design notes:
  *   - Genuine hierarchy via scale contrast (kpi numbers BIG,
  *     labels small caps with letter-spacing).
  *   - Semantic colour: emerald for healthy/profit, rose for
@@ -10,6 +10,9 @@
  *   - Mono font for numeric data; sans for labels/buttons.
  *   - Animation only on state changes (button press, modal),
  *     never decorative.
+ *
+ * v2 adds: PnL split, regime grid, fills table, symbol chips,
+ * exchange-aware badge colours (inspired by FreqUI / PrimeVue).
  */
 
 :root {
@@ -31,6 +34,10 @@
   --amber-soft: rgba(245, 158, 11, 0.12);
   --indigo: #818cf8;
   --indigo-soft: rgba(129, 140, 248, 0.10);
+  --sky: #38bdf8;
+  --sky-soft: rgba(56, 189, 248, 0.10);
+  --orange: #fb923c;
+  --orange-soft: rgba(251, 146, 60, 0.10);
   --radius: 16px;
   --shadow: 0 24px 48px -16px rgba(0, 0, 0, 0.45);
   --font-sans: 'Inter', 'Noto Sans SC', system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', sans-serif;
@@ -57,6 +64,7 @@ html, body {
 }
 
 .mono { font-family: var(--font-mono); }
+.dim  { color: var(--text-muted); }
 
 /* ─── topbar ─────────────────────────────────────────────────── */
 
@@ -217,7 +225,7 @@ html, body {
   font-size: 32px;
   font-weight: 700;
   letter-spacing: -0.01em;
-  margin: 12px 0 6px;
+  margin: 8px 0 4px;
   line-height: 1.1;
 }
 .kpi-sub {
@@ -228,11 +236,130 @@ html, body {
 }
 .tier-display.tier-green   { color: var(--emerald); }
 .tier-display.tier-yellow  { color: var(--amber); }
-.tier-display.tier-orange  { color: #fb923c; }
+.tier-display.tier-orange  { color: var(--orange); }
 .tier-display.tier-red     { color: var(--rose); text-shadow: 0 0 16px rgba(244, 63, 94, 0.45); }
 
 .kpi-equity .kpi-value.up   { color: var(--emerald); }
 .kpi-equity .kpi-value.down { color: var(--rose); }
+
+/* ─── PnL split row (inside equity KPI) ──────────────────────── */
+
+.kpi-split-row {
+  display: flex;
+  gap: 16px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.kpi-split-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+}
+.split-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+}
+.grid-dot  { background: var(--indigo); }
+.trend-dot { background: var(--sky); }
+.split-label {
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  font-size: 10px;
+}
+.split-val {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+}
+.split-val.up   { color: var(--emerald); }
+.split-val.down { color: var(--rose); }
+
+/* ─── regime mini (inside risk KPI) ──────────────────────────── */
+
+.regime-mini {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.regime-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  padding: 3px 10px;
+  border-radius: 6px;
+}
+.regime-strength {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.regime-strong-bull  { background: rgba(16, 185, 129, 0.18); color: var(--emerald); }
+.regime-bull         { background: rgba(16, 185, 129, 0.10); color: var(--emerald); }
+.regime-neutral      { background: rgba(255, 255, 255, 0.06); color: var(--text-dim); }
+.regime-bear         { background: var(--rose-soft); color: var(--rose); }
+.regime-strong-bear  { background: rgba(244, 63, 94, 0.18); color: var(--rose); }
+
+/* ─── regime grid card ───────────────────────────────────────── */
+
+.regime-card { min-height: 280px; }
+.regime-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.regime-grid::-webkit-scrollbar { width: 6px; }
+.regime-grid::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 3px; }
+.regime-grid .empty {
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 8px 0;
+  grid-column: 1 / -1;
+}
+
+.regime-symbol-card {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.regime-sym-name {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text);
+}
+.regime-sym-modes {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.mode-badge {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 2px 8px;
+  border-radius: 5px;
+}
+.mode-normal        { background: rgba(255,255,255,0.06); color: var(--text-dim); }
+.mode-aggressive    { background: var(--emerald-soft); color: var(--emerald); }
+.mode-tp-only       { background: var(--amber-soft); color: var(--amber); }
+.mode-graceful-stop { background: var(--orange-soft); color: var(--orange); }
+.mode-panic         { background: var(--rose-soft); color: var(--rose); }
 
 /* ─── card headers ──────────────────────────────────────────── */
 
@@ -262,9 +389,80 @@ html, body {
 .chart-card { min-height: 280px; }
 .chart-wrap { height: 220px; position: relative; }
 
+/* ─── symbol chips ──────────────────────────────────────────── */
+
+.symbol-chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.chip {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border-hi);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  letter-spacing: 0.04em;
+  transition: background 100ms, border-color 100ms, color 100ms;
+}
+.chip:hover { background: var(--surface-hi); color: var(--text); }
+.chip.active { background: var(--indigo-soft); border-color: var(--indigo); color: var(--indigo); }
+
+/* ─── fills table ───────────────────────────────────────────── */
+
+.fills-card { min-height: 0; }
+.fills-table-wrap {
+  max-height: 360px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.fills-table-wrap::-webkit-scrollbar { width: 6px; }
+.fills-table-wrap::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 3px; }
+
+.fills-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.fills-table thead { position: sticky; top: 0; z-index: 1; }
+.fills-table th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 8px 10px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border-hi);
+}
+.fills-table td {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.fills-table tbody tr:hover { background: rgba(255,255,255,0.03); }
+.fills-table .empty {
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 16px;
+  text-align: center;
+}
+
+/* ─── source indicators ─────────────────────────────────────── */
+
+.source-grid  { color: var(--indigo); }
+.source-trend { color: var(--sky); }
+
 /* ─── list cards ────────────────────────────────────────────── */
 
-.list-card { min-height: 280px; }
+.list-card { min-height: 260px; }
 .list-body {
   font-size: 12px;
   max-height: 240px;
@@ -280,10 +478,11 @@ html, body {
 }
 .order-row, .position-row {
   display: grid;
-  grid-template-columns: 56px 80px 1fr auto;
-  gap: 10px;
-  padding: 8px 0;
+  grid-template-columns: 60px 28px 80px 1fr auto;
+  gap: 8px;
+  padding: 7px 0;
   border-bottom: 1px solid var(--border);
+  align-items: center;
 }
 .order-row:last-child, .position-row:last-child { border-bottom: none; }
 .side-buy  { color: var(--emerald); font-weight: 700; }

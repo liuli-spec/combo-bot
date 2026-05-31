@@ -97,6 +97,102 @@ def test_static_assets_served():
         assert "fmtUsd" in js.text
 
 
+def test_status_includes_pnl_regime_and_symbol_detail(monkeypatch):
+    """Round-30b: /api/status surfaces pnl split, aggregated regime,
+    and per-symbol detail derived from the state file."""
+    _ensure_fastapi()
+    from fastapi.testclient import TestClient
+
+    from combo_bot.webui.server import create_app
+
+    monkeypatch.setattr(
+        "combo_bot.data.create_exchange",
+        lambda testnet=False: (_ for _ in ()).throw(RuntimeError("no net")),
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpd = Path(tmp)
+        cfg_path = tmpd / "config.json"
+        state_path = tmpd / "state.json"
+        cfg_path.write_text(
+            json.dumps({"symbols": ["BTC/USDT:USDT"], "state_file": str(state_path)})
+        )
+        state_path.write_text(
+            json.dumps(
+                {
+                    "equity": 5000,
+                    "balance": 5000,
+                    "equity_peak": 5000,
+                    "risk_tier": "green",
+                    "grid_realized_pnl": 12.5,
+                    "trend_realized_pnl": -3.0,
+                    "symbols_detail": {
+                        "BTC/USDT:USDT": {
+                            "last_price": 73000,
+                            "mode_long": "tp_only",
+                            "mode_short": "normal",
+                            "signal_direction": -0.4,
+                            "signal_strength": 0.6,
+                            "signal_regime": "bear",
+                        }
+                    },
+                }
+            )
+        )
+        client = TestClient(create_app(config_path=cfg_path, testnet=True, real=False))
+        data = client.get("/api/status").json()
+        assert data["pnl"]["grid_equity"] == 12.5
+        assert data["pnl"]["trend_equity"] == -3.0
+        # |−0.4| * 0.6 = 0.24 conviction, regime bear.
+        assert data["regime"]["primary"] == "bear"
+        assert abs(data["regime"]["conviction"] - 0.24) < 1e-9
+        assert data["symbols_detail"]["BTC/USDT:USDT"]["mode_long"] == "tp_only"
+
+
+def test_fills_endpoint_tails_sidecar(monkeypatch):
+    """Round-30b: /api/fills reads the JSONL sidecar beside the
+    state file, newest entries within the limit window."""
+    _ensure_fastapi()
+    from fastapi.testclient import TestClient
+
+    from combo_bot.webui.server import create_app
+
+    monkeypatch.setattr(
+        "combo_bot.data.create_exchange",
+        lambda testnet=False: (_ for _ in ()).throw(RuntimeError("no net")),
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpd = Path(tmp)
+        cfg_path = tmpd / "config.json"
+        state_path = tmpd / "state.json"
+        cfg_path.write_text(
+            json.dumps({"symbols": ["BTC/USDT:USDT"], "state_file": str(state_path)})
+        )
+        fills_path = state_path.with_suffix(".fills.jsonl")
+        rows = [
+            {
+                "timestamp": i,
+                "symbol": "BTC/USDT:USDT",
+                "side": "sell",
+                "source": "grid",
+                "qty": 0.001,
+                "price": 73000 + i,
+                "fee": 0.05,
+                "realized_pnl": 1.0,
+            }
+            for i in range(5)
+        ]
+        fills_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        client = TestClient(create_app(config_path=cfg_path, testnet=True, real=False))
+        # limit=3 → last 3 entries (timestamps 2,3,4).
+        data = client.get("/api/fills?limit=3").json()
+        assert len(data["fills"]) == 3
+        assert [f["timestamp"] for f in data["fills"]] == [2, 3, 4]
+        # No sidecar → empty list, not an error.
+        fills_path.unlink()
+        data2 = client.get("/api/fills").json()
+        assert data2["fills"] == []
+
+
 def test_status_endpoint_returns_envelope(monkeypatch):
     """/api/status must succeed even when the state file is absent
     and the exchange creation raises (no network in tests). The

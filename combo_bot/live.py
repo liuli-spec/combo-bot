@@ -1398,6 +1398,10 @@ class LiveTrader:
                 )
 
             self.strategy_runner.fire_order_filled(enriched, _resolve_fill_ctx)
+            # Round-30b: append fills to a JSONL sidecar so the web UI
+            # can render a queryable trade history. Best-effort — a
+            # write failure logs but never blocks the fill pipeline.
+            self._append_fills_log(enriched)
 
         for symbol in self.config.symbols:
             try:
@@ -2920,6 +2924,40 @@ class LiveTrader:
             volume=0.0,
         )
 
+    @property
+    def _fills_log_path(self) -> Path:
+        """Sidecar JSONL of executed fills, beside the state file.
+        Read by the web UI's /api/fills endpoint."""
+        return Path(self.config.state_file).with_suffix(".fills.jsonl")
+
+    def _append_fills_log(self, fills: list[Fill]) -> None:
+        """Append fills to the JSONL sidecar (best-effort)."""
+        if not fills:
+            return
+        try:
+            path = self._fills_log_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fp:
+                for f in fills:
+                    fp.write(
+                        json.dumps(
+                            {
+                                "timestamp": int(f.timestamp),
+                                "symbol": f.symbol,
+                                "side": f.side.value,
+                                "source": f.source.value,
+                                "qty": float(f.qty),
+                                "price": float(f.price),
+                                "fee": float(f.fee),
+                                "realized_pnl": float(f.realized_pnl),
+                            },
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    )
+        except Exception:
+            logger.exception("[live] failed to append fills log")
+
     async def _save_state(self) -> bool:
         # Persist trend-bucket size + entry price so a restart can
         # subtract the right trend share from the exchange's aggregate
@@ -2940,6 +2978,27 @@ class LiveTrader:
                 entry["short_entry_price"] = ss.trend_short.entry_price
             if entry:
                 trend_buckets[sym] = entry
+
+        # Round-30b: per-symbol detail for the web UI (modes + signal +
+        # last price). Cheap to serialize, lets the operator console
+        # render per-symbol regime/mode cards without inferring from
+        # the log stream. Persisted alongside trend_buckets so a UI
+        # poll between trader restarts still shows the last-known view.
+        symbols_detail: dict[str, dict] = {}
+        for sym, ss in self.account.symbols.items():
+            sig = self.trend.compute(sym)
+            symbols_detail[sym] = {
+                "last_price": ss.last_price,
+                "mode_long": ss.mode_long.value if ss.mode_long else "normal",
+                "mode_short": ss.mode_short.value if ss.mode_short else "normal",
+                "signal_direction": float(getattr(sig, "direction", 0.0) or 0.0),
+                "signal_strength": float(getattr(sig, "strength", 0.0) or 0.0),
+                "signal_regime": (
+                    getattr(sig, "regime", None).value
+                    if getattr(sig, "regime", None) is not None
+                    else "neutral"
+                ),
+            }
 
         state = {
             "balance": self.account.balance,

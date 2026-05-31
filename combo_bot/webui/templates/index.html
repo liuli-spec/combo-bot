@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Combo 量化机器人 · 操作台</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%2310b981'/></svg>">
   <link rel="stylesheet" href="/static/style.css" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -33,11 +34,23 @@
 
   <main class="grid">
 
-    <!-- KPI 行 -->
+    <!-- Row 1: KPI 行（4 列，每个含子项） -->
     <section class="card kpi" id="kpi-equity">
       <div class="kpi-label">账户权益</div>
       <div class="kpi-value" id="m-equity">—</div>
       <div class="kpi-sub" id="m-equity-sub">暂无数据</div>
+      <div class="kpi-split-row" id="pnl-split" hidden>
+        <div class="kpi-split-item">
+          <span class="split-dot grid-dot"></span>
+          <span class="split-label">Grid</span>
+          <span class="split-val" id="pnl-grid">—</span>
+        </div>
+        <div class="kpi-split-item">
+          <span class="split-dot trend-dot"></span>
+          <span class="split-label">Trend</span>
+          <span class="split-val" id="pnl-trend">—</span>
+        </div>
+      </div>
     </section>
 
     <section class="card kpi" id="kpi-balance">
@@ -56,9 +69,13 @@
       <div class="kpi-label">风险等级</div>
       <div class="kpi-value tier-display" id="m-tier">—</div>
       <div class="kpi-sub" id="m-tier-sub">锁定 / 冷却</div>
+      <div class="regime-mini" id="regime-mini" hidden>
+        <span class="regime-badge" id="regime-badge">—</span>
+        <span class="regime-strength" id="regime-strength"></span>
+      </div>
     </section>
 
-    <!-- 权益曲线 (宽) -->
+    <!-- Row 2: 权益曲线 (span-2) + 行情信号 (span-2) -->
     <section class="card chart-card span-2">
       <div class="card-header">
         <div class="card-title">权益曲线</div>
@@ -67,7 +84,48 @@
       <div class="chart-wrap"><canvas id="equity-chart"></canvas></div>
     </section>
 
-    <!-- 挂单 -->
+    <section class="card regime-card span-2">
+      <div class="card-header">
+        <div class="card-title">行情信号 / 模式</div>
+        <div class="card-meta" id="regime-updated">—</div>
+      </div>
+      <div class="regime-grid" id="regime-grid">
+        <div class="empty">等待状态数据…</div>
+      </div>
+    </section>
+
+    <!-- Row 3: 品种过滤 + 成交历史 (span-4) -->
+    <section class="card fills-card span-full">
+      <div class="card-header">
+        <div class="card-title">成交记录</div>
+        <div class="card-meta">
+          <span id="fills-count">0 条</span>
+          <button class="ghost-btn" id="fills-export" title="导出 CSV">导出</button>
+        </div>
+      </div>
+      <div class="symbol-chips" id="symbol-chips"></div>
+      <div class="fills-table-wrap">
+        <table class="fills-table mono" id="fills-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>品种</th>
+              <th>方向</th>
+              <th>来源</th>
+              <th>数量</th>
+              <th>价格</th>
+              <th>手续费</th>
+              <th>已实现盈亏</th>
+            </tr>
+          </thead>
+          <tbody id="fills-body">
+            <tr><td colspan="8" class="empty">暂无成交记录</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Row 4: 挂单 + 持仓 -->
     <section class="card list-card">
       <div class="card-header">
         <div class="card-title">当前挂单</div>
@@ -78,7 +136,6 @@
       </div>
     </section>
 
-    <!-- 持仓 -->
     <section class="card list-card">
       <div class="card-header">
         <div class="card-title">当前持仓</div>
@@ -89,13 +146,13 @@
       </div>
     </section>
 
-    <!-- 警告 -->
-    <section class="card warn-card" id="warn-card" hidden>
+    <!-- Row 5: 警告（按需出现） -->
+    <section class="card warn-card span-full" id="warn-card" hidden>
       <div class="card-header"><div class="card-title">⚠ 警告</div></div>
       <div id="warn-list" class="warn-list"></div>
     </section>
 
-    <!-- 日志 (整行) -->
+    <!-- Row 6: 实时日志 (span-full) -->
     <section class="card log-card span-full">
       <div class="card-header">
         <div class="card-title">实时日志</div>
@@ -110,7 +167,7 @@
       <pre class="log-body mono" id="log-body">等待连接…</pre>
     </section>
 
-    <!-- 控制栏 (整行) -->
+    <!-- Row 7: 控制栏 (span-full) -->
     <section class="card control-card span-full">
       <div class="control-row">
         <button class="btn btn-start" id="btn-start">

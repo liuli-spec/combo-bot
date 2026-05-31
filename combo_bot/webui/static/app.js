@@ -1,8 +1,9 @@
 // combo_bot operator UI — client-side glue.
 //
 // Polls /api/status every 2s, streams /api/logs/stream via SSE,
-// renders KPIs / orders / positions, drives the start/stop/kill
-// control buttons. Zero framework — vanilla DOM + fetch + EventSource.
+// renders KPIs / orders / positions / fills / regime, drives the
+// start/stop/kill control buttons. Zero framework — vanilla DOM +
+// fetch + EventSource.
 
 const POLL_MS = 2000;
 const $ = (id) => document.getElementById(id);
@@ -10,6 +11,7 @@ const $ = (id) => document.getElementById(id);
 let chart = null;
 let lastEquityLen = 0;
 let logAutoScroll = true;
+let activeSymbol = '__all__'; // fills table filter
 
 const traderStatusMap = {
   stopped:  { dot: 'dot-stopped',  label: '已停止' },
@@ -18,6 +20,22 @@ const traderStatusMap = {
   stopping: { dot: 'dot-stopping', label: '停止中…' },
   exited:   { dot: 'dot-exited',   label: '已退出' },
   crashed:  { dot: 'dot-crashed',  label: '已崩溃' },
+};
+
+const regimeBadgeMap = {
+  strong_bull:  { cls: 'regime-strong-bull',  label: '强牛' },
+  bull:         { cls: 'regime-bull',          label: '牛' },
+  neutral:      { cls: 'regime-neutral',       label: '中性' },
+  bear:         { cls: 'regime-bear',          label: '熊' },
+  strong_bear:  { cls: 'regime-strong-bear',   label: '强熊' },
+};
+
+const modeBadgeMap = {
+  normal:        { cls: 'mode-normal',        label: '正常' },
+  aggressive:    { cls: 'mode-aggressive',    label: '激进' },
+  tp_only:       { cls: 'mode-tp-only',       label: '仅平仓' },
+  graceful_stop: { cls: 'mode-graceful-stop', label: '优雅退出' },
+  panic:         { cls: 'mode-panic',         label: '熔断' },
 };
 
 // ─── status polling ──────────────────────────────────────────────
@@ -57,11 +75,7 @@ function renderStatus(d) {
   $('btn-stop').disabled = !d.trader.is_running;
   $('btn-kill').disabled = false;
   const clearBtn = $('btn-clear-sentinel');
-  if (d.sentinel_present) {
-    clearBtn.hidden = false;
-  } else {
-    clearBtn.hidden = true;
-  }
+  clearBtn.hidden = !d.sentinel_present;
 
   // KPIs
   const state = d.state || {};
@@ -71,9 +85,6 @@ function renderStatus(d) {
   const dd = peak > 0 ? (peak - equity) / peak : 0;
   $('m-equity').textContent = fmtUsd(equity);
   $('m-equity-sub').textContent = peak > 0 ? `峰值 ${fmtUsd(peak)}` : '暂无峰值';
-  const equityCard = $('kpi-equity');
-  equityCard.classList.remove('kpi-equity');
-  equityCard.classList.add('kpi-equity');
   $('m-equity').classList.toggle('up', equity >= balance);
   $('m-equity').classList.toggle('down', equity < balance);
   $('m-balance').textContent = fmtUsd(balance);
@@ -86,10 +97,8 @@ function renderStatus(d) {
 
   const tier = (state.risk_tier || 'green').toString().toLowerCase();
   const tierLabels = {
-    green: '绿色 · 安全',
-    yellow: '黄色 · 减仓',
-    orange: '橙色 · 仅平仓',
-    red: '红色 · 熔断',
+    green: '绿色 · 安全', yellow: '黄色 · 减仓',
+    orange: '橙色 · 仅平仓', red: '红色 · 熔断',
   };
   const tEl = $('m-tier');
   tEl.textContent = tierLabels[tier] || tier.toUpperCase();
@@ -103,23 +112,207 @@ function renderStatus(d) {
   }
   $('m-tier-sub').textContent = subBits.length ? subBits.join(' · ') : '一切正常';
 
+  // ── new: PnL split (Grid / Trend) ──────────────────────────────
+  renderPnlSplit(d);
+  // ── new: regime mini + grid ─────────────────────────────────────
+  renderRegime(d);
+  // ── new: fills table ─────────────────────────────────────────────
+  renderFills(d);
   // Orders
   renderOrders(d);
-
   // Positions
   renderPositions(d);
-
   // Warnings
   renderWarnings(d);
 
-  // Equity chart (separate endpoint to keep status payload small,
-  // but we already have the equity value in state — push it into
-  // the chart history client-side too so the first sample shows up
-  // without waiting for /api/equity).
+  // Equity chart
   if (equity > 0) {
     pushChartPoint(d.now_ms, equity);
   }
 }
+
+// ─── PnL split ──────────────────────────────────────────────────
+
+function renderPnlSplit(d) {
+  const pnl = d.pnl || {};
+  const gridEq = num(pnl.grid_equity);
+  const trendEq = num(pnl.trend_equity);
+  const splitEl = $('pnl-split');
+  if (gridEq === 0 && trendEq === 0) {
+    splitEl.hidden = true;
+    return;
+  }
+  splitEl.hidden = false;
+  $('pnl-grid').textContent = fmtUsd(gridEq);
+  $('pnl-trend').textContent = fmtUsd(trendEq);
+  $('pnl-grid').classList.toggle('up', gridEq >= 0);
+  $('pnl-grid').classList.toggle('down', gridEq < 0);
+  $('pnl-trend').classList.toggle('up', trendEq >= 0);
+  $('pnl-trend').classList.toggle('down', trendEq < 0);
+}
+
+// ─── regime display ──────────────────────────────────────────────
+
+function renderRegime(d) {
+  // Mini indicator in risk KPI
+  const regime = d.regime || {};
+  const primary = (regime.primary || 'neutral').toString().toLowerCase();
+  const conviction = num(regime.conviction);
+  const miniEl = $('regime-mini');
+  if (primary === 'neutral' && conviction < 0.1) {
+    miniEl.hidden = true;
+    return;
+  }
+  miniEl.hidden = false;
+  const bad = regimeBadgeMap[primary] || { cls: 'regime-neutral', label: primary };
+  const badgeEl = $('regime-badge');
+  badgeEl.textContent = bad.label;
+  badgeEl.className = 'regime-badge ' + bad.cls;
+  $('regime-strength').textContent = `conv ${(conviction * 100).toFixed(0)}%`;
+
+  // Regime grid: per-symbol mode cards
+  const detail = d.symbols_detail || {};
+  const symbols = Object.keys(detail);
+  if (!symbols.length) {
+    $('regime-grid').innerHTML = '<div class="empty">等待状态数据…</div>';
+    return;
+  }
+  $('regime-updated').textContent = fmtTime(d.now_ms);
+  let html = '';
+  for (const sym of symbols) {
+    const sd = detail[sym] || {};
+    const longMode = (sd.mode_long || 'normal').toString().toLowerCase();
+    const shortMode = (sd.mode_short || 'normal').toString().toLowerCase();
+    const lm = modeBadgeMap[longMode] || { cls: 'mode-normal', label: longMode };
+    const sm = modeBadgeMap[shortMode] || { cls: 'mode-normal', label: shortMode };
+    const symShort = sym.split(':')[0].replace('/USDT', '');
+    html += `<div class="regime-symbol-card">
+      <div class="regime-sym-name">${symShort}</div>
+      <div class="regime-sym-modes">
+        <span class="mode-badge ${lm.cls}">L ${lm.label}</span>
+        <span class="mode-badge ${sm.cls}">S ${sm.label}</span>
+      </div>
+    </div>`;
+  }
+  $('regime-grid').innerHTML = html;
+}
+
+// ─── fills table ─────────────────────────────────────────────────
+
+let _fillsAll = [];
+
+async function loadFills() {
+  try {
+    const res = await fetch('/api/fills?limit=200', { cache: 'no-store' });
+    if (!res.ok) return;
+    const data = await res.json();
+    _fillsAll = data.fills || [];
+    renderFillsTable();
+  } catch (e) {
+    console.warn('fills fetch failed', e);
+  }
+}
+
+function mergeFills(fills) {
+  if (!fills || !fills.length) return;
+  const seen = new Set(_fillsAll.map(f => f.trade_id || f.timestamp + '_' + f.price));
+  for (const f of fills) {
+    const key = f.trade_id || (f.timestamp || '') + '_' + (f.price || '');
+    if (!seen.has(key)) {
+      _fillsAll.unshift(f);
+      seen.add(key);
+    }
+  }
+  if (_fillsAll.length > 500) _fillsAll.length = 500;
+}
+
+function renderFills(d) {
+  // Merge fills from status response (they come via state.fill_events.recent_fills)
+  const state = d.state || {};
+  const fe = state.fill_events || {};
+  const recent = fe.recent_fills || [];
+  mergeFills(recent);
+  renderFillsTable();
+  renderSymbolChips();
+}
+
+function renderSymbolChips() {
+  const syms = new Set();
+  for (const f of _fillsAll) {
+    const s = (f.symbol || '').split(':')[0];
+    if (s) syms.add(s);
+  }
+  const chips = ['__all__', ...Array.from(syms).sort()];
+  let html = '';
+  for (const s of chips) {
+    const label = s === '__all__' ? '全部' : s;
+    const active = s === activeSymbol ? ' active' : '';
+    html += `<button class="chip${active}" data-sym="${s}">${label}</button>`;
+  }
+  $('symbol-chips').innerHTML = html;
+  // Attach listeners
+  $('symbol-chips').querySelectorAll('.chip').forEach(btn => {
+    btn.addEventListener('click', () => {
+      activeSymbol = btn.dataset.sym;
+      renderSymbolChips();
+      renderFillsTable();
+    });
+  });
+}
+
+function renderFillsTable() {
+  let fills = _fillsAll;
+  if (activeSymbol !== '__all__') {
+    fills = fills.filter(f => {
+      const fsym = (f.symbol || '').split(':')[0];
+      return fsym === activeSymbol || (f.symbol || '') === activeSymbol;
+    });
+  }
+  $('fills-count').textContent = `${fills.length} 条`;
+  const body = $('fills-body');
+  if (!fills.length) {
+    body.innerHTML = '<tr><td colspan="8" class="empty">暂无成交记录</td></tr>';
+    return;
+  }
+  body.innerHTML = fills.slice(0, 200).map(f => {
+    const side = (f.side || '').toLowerCase();
+    const sideCls = side === 'long' ? 'side-long' : (side === 'short' ? 'side-short' : 'side-buy');
+    const srcCls = f.source === 'trend' ? 'source-trend' : 'source-grid';
+    const srcLabel = f.source === 'trend' ? 'Trend' : 'Grid';
+    const pnl = f.realized_pnl;
+    const pnlCls = pnl >= 0 ? 'side-long' : 'side-short';
+    const symShort = (f.symbol || '').split(':')[0];
+    return `<tr>
+      <td class="dim">${fmtTime(f.timestamp)}</td>
+      <td>${symShort || f.symbol || '—'}</td>
+      <td><span class="${sideCls}">${side}</span></td>
+      <td><span class="${srcCls}">${srcLabel}</span></td>
+      <td>${fmtQty(f.qty)}</td>
+      <td>${fmtPrice(f.price)}</td>
+      <td class="dim">${fmtUsd(f.fee)}</td>
+      <td class="${pnlCls}">${fmtUsd(pnl)}</td>
+    </tr>`;
+  }).join('');
+}
+
+// CSV export
+function exportFillsCSV() {
+  if (!_fillsAll.length) return;
+  const header = 'timestamp,symbol,side,source,qty,price,fee,realized_pnl';
+  const rows = _fillsAll.map(f =>
+    [f.timestamp, f.symbol, f.side, f.source, f.qty, f.price, f.fee, f.realized_pnl].join(',')
+  );
+  const csv = header + '\n' + rows.join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `fills_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ─── orders ──────────────────────────────────────────────────────
 
 function renderOrders(d) {
   const symbolMap = (d.exchange && d.exchange.open_orders_by_symbol) || {};
@@ -128,7 +321,8 @@ function renderOrders(d) {
   for (const [sym, entries] of Object.entries(symbolMap)) {
     if (Array.isArray(entries)) {
       for (const o of entries) {
-        rows.push(orderRow(sym, o));
+        const symShort = sym.split(':')[0];
+        rows.push(orderRow(symShort, o));
         count++;
       }
     }
@@ -141,15 +335,19 @@ function renderOrders(d) {
 
 function orderRow(sym, o) {
   const side = (o.side || '').toLowerCase();
-  const sideLabel = side === 'buy' ? '买入' : (side === 'sell' ? '卖出' : side);
-  const reduceTag = o.reduceOnly ? '<span class="reduce-tag">只减仓</span>' : '';
+  const sideLabel = side === 'buy' ? 'B' : (side === 'sell' ? 'S' : side);
+  const sideCls = side === 'buy' ? 'side-buy' : (side === 'sell' ? 'side-sell' : '');
+  const reduceTag = o.reduceOnly ? '<span class="reduce-tag">只减</span>' : '';
   return `<div class="order-row">
-    <span class="side-${side}">${sideLabel}</span>
+    <span class="dim">${sym}</span>
+    <span class="${sideCls}">${sideLabel}</span>
     <span>${fmtQty(o.amount)}</span>
-    <span>@ ${fmtPrice(o.price)}</span>
+    <span>${fmtPrice(o.price)}</span>
     <span>${reduceTag}</span>
   </div>`;
 }
+
+// ─── positions ───────────────────────────────────────────────────
 
 function renderPositions(d) {
   const symbolMap = (d.exchange && d.exchange.positions_by_symbol) || {};
@@ -158,7 +356,8 @@ function renderPositions(d) {
   for (const [sym, entries] of Object.entries(symbolMap)) {
     if (Array.isArray(entries)) {
       for (const p of entries) {
-        rows.push(positionRow(sym, p));
+        const symShort = sym.split(':')[0];
+        rows.push(positionRow(symShort, p));
         count++;
       }
     }
@@ -171,16 +370,19 @@ function renderPositions(d) {
 
 function positionRow(sym, p) {
   const side = (p.side || '').toLowerCase();
-  const sideLabel = side === 'long' ? '多头' : (side === 'short' ? '空头' : side);
+  const sideLabel = side === 'long' ? 'L' : (side === 'short' ? 'S' : side);
   const upnl = p.unrealizedPnl || 0;
-  const upnlCls = upnl >= 0 ? 'side-buy' : 'side-sell';
+  const upnlCls = upnl >= 0 ? 'side-long' : 'side-short';
   return `<div class="position-row">
+    <span class="dim">${sym}</span>
     <span class="side-${side}">${sideLabel}</span>
     <span>${fmtQty(p.contracts)}</span>
-    <span>@ ${fmtPrice(p.entryPrice)} → ${fmtPrice(p.markPrice)}</span>
+    <span>${fmtPrice(p.entryPrice)} → ${fmtPrice(p.markPrice)}</span>
     <span class="${upnlCls}">${fmtUsd(upnl)}</span>
   </div>`;
 }
+
+// ─── warnings ────────────────────────────────────────────────────
 
 function renderWarnings(d) {
   const warnings = [];
@@ -249,7 +451,7 @@ function pushChartPoint(ts, equity) {
   const labels = chart.data.labels;
   const series = chart.data.datasets[0].data;
   const lastTs = labels.length ? labels[labels.length - 1] : 0;
-  if (ts - lastTs < 1500) return;  // throttle: at most one point per ~1.5s
+  if (ts - lastTs < 1500) return;
   labels.push(ts);
   series.push(equity);
   if (labels.length > 720) { labels.shift(); series.shift(); }
@@ -261,12 +463,24 @@ function pushChartPoint(ts, equity) {
   }
 }
 
-function fmtSpan(ms) {
-  const s = ms / 1000;
-  if (s < 60) return `${Math.round(s)}s`;
-  if (s < 3600) return `${Math.round(s / 60)}m`;
-  if (s < 86400) return `${(s / 3600).toFixed(1)}h`;
-  return `${(s / 86400).toFixed(1)}d`;
+// ─── equity history (load on startup) ─────────────────────────────
+
+async function loadEquityHistory() {
+  try {
+    const res = await fetch('/api/equity', { cache: 'no-store' });
+    if (!res.ok) return;
+    const data = await res.json();
+    const samples = data.samples || [];
+    let lastTs = 0;
+    for (const s of samples) {
+      if (s.ts > lastTs) {
+        pushChartPoint(s.ts, s.equity);
+        lastTs = s.ts;
+      }
+    }
+  } catch (e) {
+    console.warn('equity history load failed', e);
+  }
 }
 
 // ─── log SSE ──────────────────────────────────────────────────────
@@ -292,7 +506,6 @@ function appendLogLine(line) {
   if (cls) span.className = cls;
   span.textContent = line + '\n';
   body.appendChild(span);
-  // Trim if oversize.
   while (body.childNodes.length > 800) {
     body.removeChild(body.firstChild);
   }
@@ -338,6 +551,7 @@ function attachControls() {
   $('log-clear').addEventListener('click', () => {
     $('log-body').textContent = '';
   });
+  $('fills-export').addEventListener('click', exportFillsCSV);
 
   // Kill confirmation modal.
   const modal = $('kill-modal');
@@ -381,7 +595,19 @@ function fmtPrice(n) {
 }
 function fmtQty(n) {
   if (!n) return '0';
-  return n.toFixed(6);
+  return Number(n).toFixed(6);
+}
+function fmtTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(Number(ts));
+  return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+function fmtSpan(ms) {
+  const s = ms / 1000;
+  if (s < 60) return `${Math.round(s)}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  if (s < 86400) return `${(s / 3600).toFixed(1)}h`;
+  return `${(s / 86400).toFixed(1)}d`;
 }
 
 // ─── boot ─────────────────────────────────────────────────────────
@@ -389,6 +615,8 @@ function fmtQty(n) {
 window.addEventListener('DOMContentLoaded', () => {
   initChart();
   attachControls();
+  loadEquityHistory();
+  loadFills();
   pollStatus();
   startLogStream();
 });
