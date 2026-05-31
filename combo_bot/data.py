@@ -93,7 +93,33 @@ def create_exchange(testnet: bool = False) -> Any:
     }
     exchange = ccxt_mod.binanceusdm(config)
     if testnet:
-        exchange.set_sandbox_mode(True)
+        # Round-29 fix: ccxt deprecated set_sandbox_mode for binance
+        # futures (raises NotSupported: "consider using demo trading
+        # instead"). The testnet server at testnet.binancefuture.com
+        # is still operational — we just have to point the client at
+        # it manually. We rewrite each "fapi.binance.com" host in the
+        # URL table to the testnet hostname; the rest of the URL
+        # structure (path, version) stays intact across ccxt
+        # versions, so this is more robust than a wholesale URL dict
+        # override.
+        api_urls = exchange.urls.get("api") if hasattr(exchange, "urls") else None
+        if isinstance(api_urls, dict):
+            for key, value in list(api_urls.items()):
+                if isinstance(value, str) and "fapi.binance.com" in value:
+                    api_urls[key] = value.replace(
+                        "fapi.binance.com", "testnet.binancefuture.com"
+                    )
+                elif isinstance(value, str) and "dapi.binance.com" in value:
+                    # COIN-M futures testnet too, in case caller flips
+                    # ``defaultType`` later.
+                    api_urls[key] = value.replace(
+                        "dapi.binance.com", "testnet.binancefuture.com"
+                    )
+        # Also flip the hostname property if ccxt reads from it.
+        if hasattr(exchange, "hostname"):
+            current = getattr(exchange, "hostname", "")
+            if isinstance(current, str) and "binance.com" in current:
+                exchange.hostname = "testnet.binancefuture.com"
     return exchange
 
 
