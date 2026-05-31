@@ -1,0 +1,122 @@
+{
+  "_README": [
+    "Conservative testnet config for the first multi-day continuous run.",
+    "All sizing caps are intentionally tiny — this run is about EXECUTION",
+    "correctness (reconcile, fills, buckets, cOID, ledger) not P&L.",
+    "Promote any of these knobs only AFTER 48-72h with zero divergence",
+    "between local bucket state and exchange-reported positions, AND zero",
+    "duplicate-market-overlay events. See README / docs for upgrade path."
+  ],
+
+  "symbols": ["BTC/USDT:USDT"],
+  "timeframe": "1m",
+  "bar_interval_minutes": 1.0,
+  "starting_balance": 1000.0,
+  "leverage": 3,
+  "loop_interval_seconds": 60,
+  "dry_run": false,
+  "data_dir": "data",
+
+  "_operational": [
+    "Round-29 additions:",
+    " - unfilledtimeout_entry_seconds: kill any pending entry > 10 min old.",
+    " - unfilledtimeout_exit_seconds: kill any pending exit > 30 min old.",
+    " - max_orders_per_batch: 5 = throttle reconcile bursts vs rate limits."
+  ],
+  "unfilledtimeout_entry_seconds": 600,
+  "unfilledtimeout_exit_seconds": 1800,
+  "max_orders_per_batch": 5,
+
+  "grid": {
+    "_comment": "Tiny WE: a stuck grid eats <= 10% of balance.",
+    "n_positions": 1,
+    "wallet_exposure_limit": 0.10,
+    "total_wallet_exposure_limit": 0.20,
+    "entry_initial_ema_dist": 0.008,
+    "entry_grid_spacing_pct": 0.025,
+    "entry_grid_double_down_factor": 1.3,
+    "max_grid_levels": 6,
+    "close_grid_markup_start": 0.005,
+    "close_grid_markup_end": 0.015,
+    "close_grid_qty_pct": 0.5
+  },
+
+  "trend": {
+    "_comment": "Slightly loose strong threshold so signals fire on testnet.",
+    "strong_threshold": 0.55,
+    "weak_threshold": 0.25
+  },
+
+  "merger": {
+    "_comment": "Trend overlay budget kept small: 0.5% notional per entry.",
+    "trend_position_max_pct": 0.05,
+    "trend_entry_qty_pct": 0.10,
+    "trend_stop_loss_pct": 0.03,
+    "trend_take_profit_pct": 0.06
+  },
+
+  "regime": {
+    "_comment": "Continuous overlay scaling, not the legacy hard gate.",
+    "overlay_min_conviction": 0.30,
+    "overlay_conviction_curve": 1.5,
+    "overlay_sizing_scale": 1.0,
+    "aggressive_strength": 0.4
+  },
+
+  "risk": {
+    "_comment": "Tight HSL thresholds and realized-loss gate for first run.",
+    "yellow_threshold": 0.03,
+    "orange_threshold": 0.06,
+    "red_threshold": 0.10,
+    "pause_trend_dd_pct": 0.05,
+    "pause_grid_dd_pct": 0.10,
+    "max_realized_loss_pct": 0.005,
+    "max_total_wallet_exposure": 0.20,
+    "max_single_exposure": 0.10,
+    "dd_ema_span_minutes": 30.0,
+    "red_latch_enabled": true,
+    "cooldown_after_red_minutes": 60,
+    "unstuck_threshold": 0.85,
+    "unstuck_close_pct": 0.005,
+    "daily_loss_allowance_pct": 0.002
+  },
+
+  "protections": [
+    {
+      "type": "stoploss_guard",
+      "lookback_period_ms": 3600000,
+      "trade_limit": 3,
+      "stop_duration_ms": 1800000,
+      "only_per_pair": true
+    },
+    {
+      "type": "cooldown_period",
+      "stop_duration_ms": 600000,
+      "only_per_pair": true,
+      "only_per_side": true,
+      "only_per_source": true
+    }
+  ],
+
+  "kelly_sizer": {
+    "enabled": true,
+    "window": 100,
+    "min_samples": 20,
+    "fractional_kelly": 0.25,
+    "max_fraction": 1.0
+  },
+
+  "correlation_gate": {
+    "_comment": "Single-symbol config — gate is effectively idle for now.",
+    "enabled": false
+  },
+
+  "vol_target_sizer": {
+    "enabled": true,
+    "target_annual_vol": 0.25,
+    "window": 1440,
+    "min_samples": 60,
+    "scale_min": 0.25,
+    "scale_max": 1.5
+  }
+}

@@ -327,6 +327,23 @@ def main():
     )
     p_live.add_argument("--testnet", action="store_true", help="Use testnet")
 
+    p_status = sub.add_parser(
+        "status", help="Print one-shot live trader snapshot (state + exchange)"
+    )
+    p_status.add_argument("-c", "--config", default="config.json")
+    p_status.add_argument("--testnet", action="store_true")
+
+    p_kill = sub.add_parser(
+        "kill",
+        help=(
+            "Emergency stop: cancel all open orders + flat-close positions + "
+            "write STOPPED sentinel."
+        ),
+    )
+    p_kill.add_argument("-c", "--config", default="config.json")
+    p_kill.add_argument("--testnet", action="store_true")
+    p_kill.add_argument("--reason", default="manual")
+
     args = parser.parse_args()
     if args.command == "backtest":
         cmd_backtest(args)
@@ -336,6 +353,31 @@ def main():
         cmd_optimize(args)
     elif args.command == "live":
         cmd_live(args)
+    elif args.command == "status":
+        from combo_bot.monitor import _monitor_loop
+
+        sys.exit(
+            asyncio.run(
+                _monitor_loop(
+                    config_path=Path(args.config),
+                    testnet=args.testnet,
+                    interval_seconds=1.0,
+                    once=True,
+                )
+            )
+        )
+    elif args.command == "kill":
+        from combo_bot.kill_switch import kill_switch
+
+        sys.exit(
+            asyncio.run(
+                kill_switch(
+                    config_path=Path(args.config),
+                    testnet=args.testnet,
+                    sentinel_reason=args.reason,
+                )
+            )
+        )
     else:
         parser.print_help()
 

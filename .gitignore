@@ -53,10 +53,12 @@ data/
 *.parquet
 *.json
 !config.example.json
+!config.testnet.json
 
 # Live state
 live_state.json
 *.intent_journal.jsonl
+*.STOPPED
 *.intent_journal.jsonl.compacting
 
 # Optuna

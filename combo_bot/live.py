@@ -244,8 +244,33 @@ class LiveTrader:
             int(config.loop_interval_seconds * 1000 * 2),
         )
 
+    @property
+    def _stopped_flag_path(self) -> Path:
+        """Path of the kill-switch sentinel.
+
+        Operations: ``python -m combo_bot.kill_switch --config <c>``
+        writes this file after canceling all orders and flat-closing
+        all positions. The trader refuses to start while it exists —
+        operator must explicitly ``rm`` the file to resume. Sits
+        next to the state file so testnet/real profiles each have
+        their own kill switch.
+        """
+        return Path(self.config.state_file).with_suffix(".STOPPED")
+
     async def start(self):
         logger.info("Starting live trader (dry_run=%s)", self.config.dry_run)
+        # Round-29 operational safety: refuse to start if the kill
+        # switch sentinel exists. Prevents accidental restart after
+        # an emergency stop until the operator has reviewed what
+        # caused the stop and explicitly removed the file.
+        if self._stopped_flag_path.exists():
+            logger.error(
+                "Kill switch sentinel present at %s — refusing to start. "
+                "Remove the file manually after reviewing the cause of "
+                "the stop.",
+                self._stopped_flag_path,
+            )
+            return
         await self._init_exchange()
         await self._load_state()
         # Replay the durable intent journal — this is what closes the
