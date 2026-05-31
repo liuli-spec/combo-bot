@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>combo_bot · operator console</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo-dot"></span>
+      <span class="brand-text">COMBO · BOT</span>
+      <span class="brand-sub">operator console</span>
+    </div>
+    <div class="profile-pill profile-{{ profile }}">
+      <span class="pill-dot"></span>
+      <span>{{ profile }}</span>
+      {% if real %}<span class="pill-tag pill-real">REAL ORDERS</span>{% endif %}
+      {% if testnet %}<span class="pill-tag pill-testnet">TESTNET</span>{% endif %}
+    </div>
+    <div class="trader-status" id="trader-status">
+      <span class="status-dot dot-stopped"></span>
+      <span id="trader-status-text">loading…</span>
+    </div>
+  </header>
+
+  <main class="grid">
+
+    <!-- KPI ROW -->
+    <section class="card kpi" id="kpi-equity">
+      <div class="kpi-label">EQUITY</div>
+      <div class="kpi-value" id="m-equity">—</div>
+      <div class="kpi-sub" id="m-equity-sub">no data</div>
+    </section>
+
+    <section class="card kpi" id="kpi-balance">
+      <div class="kpi-label">BALANCE</div>
+      <div class="kpi-value" id="m-balance">—</div>
+      <div class="kpi-sub" id="m-balance-sub">spot wallet</div>
+    </section>
+
+    <section class="card kpi" id="kpi-dd">
+      <div class="kpi-label">DRAWDOWN</div>
+      <div class="kpi-value" id="m-dd">—</div>
+      <div class="kpi-sub" id="m-dd-sub">from peak</div>
+    </section>
+
+    <section class="card kpi kpi-risk" id="kpi-risk">
+      <div class="kpi-label">RISK TIER</div>
+      <div class="kpi-value tier-display" id="m-tier">—</div>
+      <div class="kpi-sub" id="m-tier-sub">latch / cooldown</div>
+    </section>
+
+    <!-- EQUITY CHART (wide) -->
+    <section class="card chart-card span-2">
+      <div class="card-header">
+        <div class="card-title">EQUITY CURVE</div>
+        <div class="card-meta" id="chart-range">last —</div>
+      </div>
+      <div class="chart-wrap"><canvas id="equity-chart"></canvas></div>
+    </section>
+
+    <!-- ORDERS -->
+    <section class="card list-card">
+      <div class="card-header">
+        <div class="card-title">OPEN ORDERS</div>
+        <div class="card-meta" id="orders-count">0</div>
+      </div>
+      <div class="list-body mono" id="orders-list">
+        <div class="empty">no exchange data yet</div>
+      </div>
+    </section>
+
+    <!-- POSITIONS -->
+    <section class="card list-card">
+      <div class="card-header">
+        <div class="card-title">POSITIONS</div>
+        <div class="card-meta" id="positions-count">0</div>
+      </div>
+      <div class="list-body mono" id="positions-list">
+        <div class="empty">no open positions</div>
+      </div>
+    </section>
+
+    <!-- WARNINGS -->
+    <section class="card warn-card" id="warn-card" hidden>
+      <div class="card-header"><div class="card-title">⚠ WARNINGS</div></div>
+      <div id="warn-list" class="warn-list"></div>
+    </section>
+
+    <!-- LOG (full width) -->
+    <section class="card log-card span-full">
+      <div class="card-header">
+        <div class="card-title">LIVE LOG</div>
+        <div class="card-meta">
+          <label class="switch">
+            <input type="checkbox" id="log-autoscroll" checked />
+            <span>auto-scroll</span>
+          </label>
+          <button class="ghost-btn" id="log-clear">clear</button>
+        </div>
+      </div>
+      <pre class="log-body mono" id="log-body">waiting for connection…</pre>
+    </section>
+
+    <!-- CONTROL BAR (full width, sticky bottom feel) -->
+    <section class="card control-card span-full">
+      <div class="control-row">
+        <button class="btn btn-start" id="btn-start">
+          <span class="btn-icon">▶</span>
+          <span>START TRADER</span>
+        </button>
+        <button class="btn btn-stop" id="btn-stop">
+          <span class="btn-icon">■</span>
+          <span>STOP (graceful)</span>
+        </button>
+        <button class="btn btn-kill" id="btn-kill">
+          <span class="btn-icon">⚠</span>
+          <span>KILL SWITCH</span>
+        </button>
+        <button class="btn btn-ghost" id="btn-clear-sentinel" hidden>
+          <span>CLEAR STOPPED SENTINEL</span>
+        </button>
+      </div>
+      <div class="control-meta" id="control-meta">
+        config: {{ config_path }} · symbols: {{ symbols|join(", ") }}
+      </div>
+    </section>
+  </main>
+
+  <!-- KILL confirmation modal -->
+  <div class="modal-backdrop" id="kill-modal" hidden>
+    <div class="modal">
+      <div class="modal-title">⚠ KILL SWITCH</div>
+      <p class="modal-body">
+        This will <strong>cancel every open order</strong> and
+        <strong>market-flat all positions</strong> on
+        <code>{{ profile }}</code>, then write a <code>STOPPED</code>
+        sentinel that blocks the trader from restarting until you
+        explicitly clear it.
+      </p>
+      <p class="modal-body">
+        Type <code>KILL</code> below to confirm.
+      </p>
+      <input class="modal-input mono" id="kill-confirm-input" type="text" autocomplete="off" />
+      <div class="modal-row">
+        <button class="btn btn-ghost" id="kill-cancel">cancel</button>
+        <button class="btn btn-kill" id="kill-confirm" disabled>confirm kill</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

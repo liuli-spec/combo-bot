@@ -356,6 +356,23 @@ def main():
     p_kill.add_argument("--testnet", action="store_true")
     p_kill.add_argument("--reason", default="manual")
 
+    p_ui = sub.add_parser(
+        "ui",
+        help=(
+            "Launch the local operator web UI (FastAPI). Open the "
+            "printed URL in a browser to control the trader."
+        ),
+    )
+    p_ui.add_argument("-c", "--config", default="config.json")
+    p_ui.add_argument("--testnet", action="store_true")
+    p_ui.add_argument(
+        "--real",
+        action="store_true",
+        help="Pass --real when the UI's Start button launches the trader.",
+    )
+    p_ui.add_argument("--host", default="127.0.0.1")
+    p_ui.add_argument("--port", type=int, default=8765)
+
     args = parser.parse_args()
     if args.command == "backtest":
         cmd_backtest(args)
@@ -389,6 +406,28 @@ def main():
                     sentinel_reason=args.reason,
                 )
             )
+        )
+    elif args.command == "ui":
+        try:
+            from combo_bot.webui.server import run as run_ui
+        except ImportError as exc:
+            logger.error(
+                "Web UI dependencies missing: %s. Install with "
+                "`pip install fastapi uvicorn jinja2 python-multipart`.",
+                exc,
+            )
+            sys.exit(2)
+        url = f"http://{args.host}:{args.port}"
+        logger.info("=" * 60)
+        logger.info("  combo_bot operator UI listening on %s", url)
+        logger.info("  open that URL in a browser to control the trader")
+        logger.info("=" * 60)
+        run_ui(
+            config_path=Path(args.config),
+            testnet=args.testnet,
+            real=args.real,
+            host=args.host,
+            port=args.port,
         )
     else:
         parser.print_help()
