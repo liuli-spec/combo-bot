@@ -44,16 +44,54 @@ def _get_ccxt_async():
 
 
 def create_exchange(testnet: bool = False) -> Any:
+    """Construct an authenticated binanceusdm ccxt client.
+
+    Reads credentials from environment variables:
+
+    * ``BINANCE_API_KEY`` / ``BINANCE_API_SECRET`` — testnet OR
+      mainnet (Binance issues separate key pairs for each; the
+      ``testnet`` flag only flips the sandbox endpoint).
+
+    Loads a ``.env`` file from the current working directory if
+    present (and python-dotenv is installed) so operators can keep
+    credentials out of shell history. If credentials are missing
+    after .env load, the client is still returned but the FIRST
+    authenticated API call will raise ``AuthenticationError`` with
+    a cryptic ccxt message — we log a loud warning here so the root
+    cause is obvious in the startup log.
+    """
+    import logging
+    import os
+
+    # .env fallback so operators don't have to export in shell.
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        pass
+
+    api_key = os.environ.get("BINANCE_API_KEY", "").strip()
+    api_secret = os.environ.get("BINANCE_API_SECRET", "").strip()
+
+    if not api_key or not api_secret:
+        logging.getLogger("combo_bot.data").warning(
+            "BINANCE_API_KEY / BINANCE_API_SECRET not set — exchange "
+            "client will fail on the first authenticated call. Export "
+            "both env vars OR put them in a .env file in the cwd."
+        )
+
     ccxt_mod = _get_ccxt_async()
-    exchange = ccxt_mod.binanceusdm(
-        {
-            "enableRateLimit": True,
-            "options": {
-                "defaultType": "future",
-                "sandboxMode": testnet,
-            },
-        }
-    )
+    config: dict[str, Any] = {
+        "apiKey": api_key,
+        "secret": api_secret,
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "future",
+            "sandboxMode": testnet,
+        },
+    }
+    exchange = ccxt_mod.binanceusdm(config)
     if testnet:
         exchange.set_sandbox_mode(True)
     return exchange
