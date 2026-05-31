@@ -89,6 +89,14 @@ def create_exchange(testnet: bool = False) -> Any:
         "options": {
             "defaultType": "future",
             "sandboxMode": testnet,
+            # Round-29 fix: ccxt's load_markets() also calls
+            # fetch_currencies() which hits the SPOT sapi endpoint
+            # (sapi.binance.com/sapi/v1/capital/config/getall). The
+            # testnet hostname rewrite below only touches fapi/dapi,
+            # so the spot call lands on REAL mainnet with a testnet
+            # key → "Invalid Api-Key ID". Disable currency fetch on
+            # testnet — futures-only trading doesn't need it.
+            "fetchCurrencies": not testnet,
         },
     }
     exchange = ccxt_mod.binanceusdm(config)
