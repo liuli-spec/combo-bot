@@ -336,6 +336,21 @@ class LiveTrader:
             )
             ep = self.exchange_params[symbol]
             self.account.symbols[symbol] = SymbolState(symbol=symbol, c_mult=ep.c_mult)
+            # Round-29 diagnostic — dump exchange constraints so the
+            # operator sees what min_cost / qty_step are. Critical for
+            # diagnosing silent "orders=0": Binance futures often has
+            # min_cost=100 USDT which rejects sub-100-notional grid
+            # entries silently.
+            logger.info(
+                "  %s ExchangeParams | qty_step=%s price_step=%s "
+                "min_qty=%s min_cost=%s c_mult=%s",
+                symbol,
+                ep.qty_step,
+                ep.price_step,
+                ep.min_qty,
+                ep.min_cost,
+                ep.c_mult,
+            )
 
             if not self.config.dry_run:
                 # Seed the leverage cache once. The per-entry hook in
