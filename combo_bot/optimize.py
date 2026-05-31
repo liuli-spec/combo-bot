@@ -49,6 +49,17 @@ class OptimizeConfig:
     train_ratio: float = 0.7
     study_name: str = "combo_bot"
     storage: str | None = None
+    # Round-29: sampler choice.
+    #   "tpe"    — Tree-structured Parzen Estimator (Bayesian). Default.
+    #              Best sample efficiency on a small trial budget.
+    #   "cmaes"  — CMA-ES (Covariance-Matrix-Adaptation Evolution Strategy).
+    #              Continuous-parameter evolutionary algorithm; very strong
+    #              when most params are floats (grid spacing, WEL, etc).
+    #   "nsga2"  — NSGA-II genetic algorithm. Multi-objective oriented;
+    #              works as a pure GA when given one objective. Higher
+    #              trial budget recommended (1000+).
+    #   "random" — Random search baseline. Useful sanity check.
+    sampler: str = "tpe"
 
 
 # ---------------------------------------------------------------------------
@@ -120,13 +131,37 @@ class Optimizer:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    def _build_sampler(self):
+        """Construct the Optuna sampler from the configured name.
+
+        Falls back to TPE on unknown values with a warning, so a typo
+        in the config doesn't silently degrade to random search.
+        """
+        name = (self._config.sampler or "tpe").lower()
+        if name == "tpe":
+            return optuna.samplers.TPESampler()
+        if name == "cmaes":
+            return optuna.samplers.CmaEsSampler()
+        if name == "nsga2":
+            return optuna.samplers.NSGAIISampler()
+        if name == "random":
+            return optuna.samplers.RandomSampler()
+        logger.warning(
+            "Unknown sampler %r — falling back to TPESampler. Valid: "
+            "tpe / cmaes / nsga2 / random.",
+            name,
+        )
+        return optuna.samplers.TPESampler()
+
     def run(self) -> dict:
         """Run the full optimization and return the best parameter set."""
+        sampler = self._build_sampler()
         study = optuna.create_study(
             study_name=self._config.study_name,
             storage=self._config.storage,
             direction="maximize",
             load_if_exists=True,
+            sampler=sampler,
         )
         study.optimize(
             self._objective,

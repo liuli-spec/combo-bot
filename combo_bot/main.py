@@ -170,6 +170,7 @@ def cmd_optimize(args):
     opt_cfg = OptimizeConfig(
         n_trials=args.trials,
         n_jobs=args.jobs,
+        sampler=args.sampler,
     )
 
     optimizer = Optimizer(opt_cfg, candle_data)
@@ -318,6 +319,17 @@ def main():
     p_opt.add_argument("-c", "--config", default="config.json")
     p_opt.add_argument("--trials", type=int, default=500)
     p_opt.add_argument("--jobs", type=int, default=4)
+    p_opt.add_argument(
+        "--sampler",
+        choices=["tpe", "cmaes", "nsga2", "random"],
+        default="tpe",
+        help=(
+            "Optuna sampler. tpe=Bayesian (default, best sample efficiency), "
+            "cmaes=CMA-ES evolution strategy (great for continuous params), "
+            "nsga2=NSGA-II genetic algorithm (needs higher trial budget), "
+            "random=random baseline."
+        ),
+    )
     p_opt.add_argument("-o", "--output", help="Save best params")
 
     p_live = sub.add_parser("live", help="Live trading")
