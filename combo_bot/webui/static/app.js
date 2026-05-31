@@ -12,12 +12,12 @@ let lastEquityLen = 0;
 let logAutoScroll = true;
 
 const traderStatusMap = {
-  stopped:  { dot: 'dot-stopped',  label: 'STOPPED' },
-  starting: { dot: 'dot-starting', label: 'STARTING…' },
-  running:  { dot: 'dot-running',  label: 'RUNNING' },
-  stopping: { dot: 'dot-stopping', label: 'STOPPING…' },
-  exited:   { dot: 'dot-exited',   label: 'EXITED' },
-  crashed:  { dot: 'dot-crashed',  label: 'CRASHED' },
+  stopped:  { dot: 'dot-stopped',  label: '已停止' },
+  starting: { dot: 'dot-starting', label: '启动中…' },
+  running:  { dot: 'dot-running',  label: '运行中' },
+  stopping: { dot: 'dot-stopping', label: '停止中…' },
+  exited:   { dot: 'dot-exited',   label: '已退出' },
+  crashed:  { dot: 'dot-crashed',  label: '已崩溃' },
 };
 
 // ─── status polling ──────────────────────────────────────────────
@@ -47,7 +47,7 @@ function renderStatus(d) {
   if (txtEl) {
     let label = meta.label;
     if (d.trader.exit_code !== null && (ts === 'exited' || ts === 'crashed')) {
-      label += ` (code ${d.trader.exit_code})`;
+      label += ` (退出码 ${d.trader.exit_code})`;
     }
     txtEl.textContent = label;
   }
@@ -70,7 +70,7 @@ function renderStatus(d) {
   const peak = num(state.equity_peak);
   const dd = peak > 0 ? (peak - equity) / peak : 0;
   $('m-equity').textContent = fmtUsd(equity);
-  $('m-equity-sub').textContent = peak > 0 ? `peak ${fmtUsd(peak)}` : 'no peak yet';
+  $('m-equity-sub').textContent = peak > 0 ? `峰值 ${fmtUsd(peak)}` : '暂无峰值';
   const equityCard = $('kpi-equity');
   equityCard.classList.remove('kpi-equity');
   equityCard.classList.add('kpi-equity');
@@ -78,24 +78,30 @@ function renderStatus(d) {
   $('m-equity').classList.toggle('down', equity < balance);
   $('m-balance').textContent = fmtUsd(balance);
   $('m-balance-sub').textContent = d.exchange && d.exchange.balance != null
-    ? `exchange ${fmtUsd(d.exchange.balance)}`
-    : 'exchange n/a';
+    ? `交易所 ${fmtUsd(d.exchange.balance)}`
+    : '交易所数据不可用';
   $('m-dd').textContent = `${(dd * 100).toFixed(2)}%`;
   $('m-dd').className = 'kpi-value' + (dd >= 0.10 ? ' down' : '');
-  $('m-dd-sub').textContent = peak > 0 ? `from ${fmtUsd(peak)}` : '—';
+  $('m-dd-sub').textContent = peak > 0 ? `距峰值 ${fmtUsd(peak)}` : '—';
 
   const tier = (state.risk_tier || 'green').toString().toLowerCase();
+  const tierLabels = {
+    green: '绿色 · 安全',
+    yellow: '黄色 · 减仓',
+    orange: '橙色 · 仅平仓',
+    red: '红色 · 熔断',
+  };
   const tEl = $('m-tier');
-  tEl.textContent = tier.toUpperCase();
+  tEl.textContent = tierLabels[tier] || tier.toUpperCase();
   tEl.classList.remove('tier-green', 'tier-yellow', 'tier-orange', 'tier-red');
   tEl.classList.add('tier-' + tier);
   const subBits = [];
-  if (state.risk_red_latched) subBits.push('LATCHED');
+  if (state.risk_red_latched) subBits.push('已锁定');
   if (state.risk_red_cooldown_until && state.risk_red_cooldown_until > d.now_ms) {
     const secs = Math.round((state.risk_red_cooldown_until - d.now_ms) / 1000);
-    subBits.push(`cooldown ${secs}s`);
+    subBits.push(`冷却 ${secs}秒`);
   }
-  $('m-tier-sub').textContent = subBits.length ? subBits.join(' · ') : 'all clear';
+  $('m-tier-sub').textContent = subBits.length ? subBits.join(' · ') : '一切正常';
 
   // Orders
   renderOrders(d);
@@ -130,14 +136,15 @@ function renderOrders(d) {
   $('orders-count').textContent = count.toString();
   $('orders-list').innerHTML = rows.length
     ? rows.join('')
-    : `<div class="empty">no open orders</div>`;
+    : `<div class="empty">暂无挂单</div>`;
 }
 
 function orderRow(sym, o) {
   const side = (o.side || '').toLowerCase();
-  const reduceTag = o.reduceOnly ? '<span class="reduce-tag">REDUCE</span>' : '';
+  const sideLabel = side === 'buy' ? '买入' : (side === 'sell' ? '卖出' : side);
+  const reduceTag = o.reduceOnly ? '<span class="reduce-tag">只减仓</span>' : '';
   return `<div class="order-row">
-    <span class="side-${side}">${side.toUpperCase()}</span>
+    <span class="side-${side}">${sideLabel}</span>
     <span>${fmtQty(o.amount)}</span>
     <span>@ ${fmtPrice(o.price)}</span>
     <span>${reduceTag}</span>
@@ -159,15 +166,16 @@ function renderPositions(d) {
   $('positions-count').textContent = count.toString();
   $('positions-list').innerHTML = rows.length
     ? rows.join('')
-    : `<div class="empty">no open positions</div>`;
+    : `<div class="empty">暂无持仓</div>`;
 }
 
 function positionRow(sym, p) {
   const side = (p.side || '').toLowerCase();
+  const sideLabel = side === 'long' ? '多头' : (side === 'short' ? '空头' : side);
   const upnl = p.unrealizedPnl || 0;
   const upnlCls = upnl >= 0 ? 'side-buy' : 'side-sell';
   return `<div class="position-row">
-    <span class="side-${side}">${side.toUpperCase()}</span>
+    <span class="side-${side}">${sideLabel}</span>
     <span>${fmtQty(p.contracts)}</span>
     <span>@ ${fmtPrice(p.entryPrice)} → ${fmtPrice(p.markPrice)}</span>
     <span class="${upnlCls}">${fmtUsd(upnl)}</span>
@@ -177,19 +185,19 @@ function positionRow(sym, p) {
 function renderWarnings(d) {
   const warnings = [];
   if (d.sentinel_present) {
-    warnings.push(`STOPPED sentinel at <code>${d.sentinel_path}</code> — trader is halted until you clear it.`);
+    warnings.push(`检测到停止锁文件 <code>${d.sentinel_path}</code> —— 机器人已被锁定，需手动解除后才能启动。`);
   }
   const state = d.state || {};
   const stuck = ((state.fill_events || {}).stuck_symbols) || [];
   if (stuck.length) {
-    warnings.push(`stuck symbols (fill-event polling failing): <code>${stuck.join(', ')}</code>`);
+    warnings.push(`成交回报轮询卡住的交易对：<code>${stuck.join('、')}</code>（需人工排查交易所接口）`);
   }
   const unknown = state.unknown_overlay || [];
   if (Array.isArray(unknown) && unknown.length) {
-    warnings.push(`unknown overlay claims: <code>${JSON.stringify(unknown)}</code>`);
+    warnings.push(`存在状态未知的挂单认领：<code>${JSON.stringify(unknown)}</code>`);
   }
   if (d.trader.state === 'crashed') {
-    warnings.push(`trader process CRASHED (exit ${d.trader.exit_code}). Check the live log.`);
+    warnings.push(`机器人进程已崩溃（退出码 ${d.trader.exit_code}），请查看实时日志。`);
   }
   const card = $('warn-card');
   if (warnings.length) {
@@ -249,7 +257,7 @@ function pushChartPoint(ts, equity) {
   const rangeEl = $('chart-range');
   if (rangeEl && labels.length >= 2) {
     const spanMs = labels[labels.length - 1] - labels[0];
-    rangeEl.textContent = `last ${fmtSpan(spanMs)}`;
+    rangeEl.textContent = `最近 ${fmtSpan(spanMs)}`;
   }
 }
 
@@ -271,7 +279,7 @@ function startLogStream() {
     appendLogLine(ev.data);
   };
   es.onerror = () => {
-    appendLogLine('[ui] log stream disconnected, retrying…');
+    appendLogLine('[界面] 日志连接已断开，正在重连…');
     es.close();
     setTimeout(startLogStream, 2000);
   };
@@ -341,7 +349,7 @@ function attachControls() {
   });
   confirmBtn.addEventListener('click', async () => {
     confirmBtn.disabled = true;
-    confirmBtn.textContent = 'killing…';
+    confirmBtn.textContent = '清仓中…';
     await postControl('/api/control/kill');
     closeKillModal();
   });
@@ -349,7 +357,7 @@ function attachControls() {
   function openKillModal() {
     input.value = '';
     confirmBtn.disabled = true;
-    confirmBtn.textContent = 'confirm kill';
+    confirmBtn.textContent = '确认清仓';
     modal.hidden = false;
     setTimeout(() => input.focus(), 50);
   }

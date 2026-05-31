@@ -3,154 +3,156 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>combo_bot · operator console</title>
+  <title>Combo 量化机器人 · 操作台</title>
   <link rel="stylesheet" href="/static/style.css" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <span class="logo-dot"></span>
-      <span class="brand-text">COMBO · BOT</span>
-      <span class="brand-sub">operator console</span>
+      <span class="brand-text">COMBO 机器人</span>
+      <span class="brand-sub">操作台</span>
     </div>
     <div class="profile-pill profile-{{ profile }}">
       <span class="pill-dot"></span>
-      <span>{{ profile }}</span>
-      {% if real %}<span class="pill-tag pill-real">REAL ORDERS</span>{% endif %}
-      {% if testnet %}<span class="pill-tag pill-testnet">TESTNET</span>{% endif %}
+      <span>
+        {% if profile == "testnet" %}测试网{% elif profile == "real" %}实盘{% else %}模拟{% endif %}
+      </span>
+      {% if real %}<span class="pill-tag pill-real">真实下单</span>{% endif %}
+      {% if testnet %}<span class="pill-tag pill-testnet">测试网</span>{% endif %}
     </div>
     <div class="trader-status" id="trader-status">
       <span class="status-dot dot-stopped"></span>
-      <span id="trader-status-text">loading…</span>
+      <span id="trader-status-text">加载中…</span>
     </div>
   </header>
 
   <main class="grid">
 
-    <!-- KPI ROW -->
+    <!-- KPI 行 -->
     <section class="card kpi" id="kpi-equity">
-      <div class="kpi-label">EQUITY</div>
+      <div class="kpi-label">账户权益</div>
       <div class="kpi-value" id="m-equity">—</div>
-      <div class="kpi-sub" id="m-equity-sub">no data</div>
+      <div class="kpi-sub" id="m-equity-sub">暂无数据</div>
     </section>
 
     <section class="card kpi" id="kpi-balance">
-      <div class="kpi-label">BALANCE</div>
+      <div class="kpi-label">可用余额</div>
       <div class="kpi-value" id="m-balance">—</div>
-      <div class="kpi-sub" id="m-balance-sub">spot wallet</div>
+      <div class="kpi-sub" id="m-balance-sub">钱包余额</div>
     </section>
 
     <section class="card kpi" id="kpi-dd">
-      <div class="kpi-label">DRAWDOWN</div>
+      <div class="kpi-label">回撤</div>
       <div class="kpi-value" id="m-dd">—</div>
-      <div class="kpi-sub" id="m-dd-sub">from peak</div>
+      <div class="kpi-sub" id="m-dd-sub">距峰值</div>
     </section>
 
     <section class="card kpi kpi-risk" id="kpi-risk">
-      <div class="kpi-label">RISK TIER</div>
+      <div class="kpi-label">风险等级</div>
       <div class="kpi-value tier-display" id="m-tier">—</div>
-      <div class="kpi-sub" id="m-tier-sub">latch / cooldown</div>
+      <div class="kpi-sub" id="m-tier-sub">锁定 / 冷却</div>
     </section>
 
-    <!-- EQUITY CHART (wide) -->
+    <!-- 权益曲线 (宽) -->
     <section class="card chart-card span-2">
       <div class="card-header">
-        <div class="card-title">EQUITY CURVE</div>
-        <div class="card-meta" id="chart-range">last —</div>
+        <div class="card-title">权益曲线</div>
+        <div class="card-meta" id="chart-range">最近 —</div>
       </div>
       <div class="chart-wrap"><canvas id="equity-chart"></canvas></div>
     </section>
 
-    <!-- ORDERS -->
+    <!-- 挂单 -->
     <section class="card list-card">
       <div class="card-header">
-        <div class="card-title">OPEN ORDERS</div>
+        <div class="card-title">当前挂单</div>
         <div class="card-meta" id="orders-count">0</div>
       </div>
       <div class="list-body mono" id="orders-list">
-        <div class="empty">no exchange data yet</div>
+        <div class="empty">暂无交易所数据</div>
       </div>
     </section>
 
-    <!-- POSITIONS -->
+    <!-- 持仓 -->
     <section class="card list-card">
       <div class="card-header">
-        <div class="card-title">POSITIONS</div>
+        <div class="card-title">当前持仓</div>
         <div class="card-meta" id="positions-count">0</div>
       </div>
       <div class="list-body mono" id="positions-list">
-        <div class="empty">no open positions</div>
+        <div class="empty">暂无持仓</div>
       </div>
     </section>
 
-    <!-- WARNINGS -->
+    <!-- 警告 -->
     <section class="card warn-card" id="warn-card" hidden>
-      <div class="card-header"><div class="card-title">⚠ WARNINGS</div></div>
+      <div class="card-header"><div class="card-title">⚠ 警告</div></div>
       <div id="warn-list" class="warn-list"></div>
     </section>
 
-    <!-- LOG (full width) -->
+    <!-- 日志 (整行) -->
     <section class="card log-card span-full">
       <div class="card-header">
-        <div class="card-title">LIVE LOG</div>
+        <div class="card-title">实时日志</div>
         <div class="card-meta">
           <label class="switch">
             <input type="checkbox" id="log-autoscroll" checked />
-            <span>auto-scroll</span>
+            <span>自动滚动</span>
           </label>
-          <button class="ghost-btn" id="log-clear">clear</button>
+          <button class="ghost-btn" id="log-clear">清空</button>
         </div>
       </div>
-      <pre class="log-body mono" id="log-body">waiting for connection…</pre>
+      <pre class="log-body mono" id="log-body">等待连接…</pre>
     </section>
 
-    <!-- CONTROL BAR (full width, sticky bottom feel) -->
+    <!-- 控制栏 (整行) -->
     <section class="card control-card span-full">
       <div class="control-row">
         <button class="btn btn-start" id="btn-start">
           <span class="btn-icon">▶</span>
-          <span>START TRADER</span>
+          <span>启动机器人</span>
         </button>
         <button class="btn btn-stop" id="btn-stop">
           <span class="btn-icon">■</span>
-          <span>STOP (graceful)</span>
+          <span>停止（安全退出）</span>
         </button>
         <button class="btn btn-kill" id="btn-kill">
           <span class="btn-icon">⚠</span>
-          <span>KILL SWITCH</span>
+          <span>紧急停止（清仓）</span>
         </button>
         <button class="btn btn-ghost" id="btn-clear-sentinel" hidden>
-          <span>CLEAR STOPPED SENTINEL</span>
+          <span>解除停止锁</span>
         </button>
       </div>
       <div class="control-meta" id="control-meta">
-        config: {{ config_path }} · symbols: {{ symbols|join(", ") }}
+        配置文件：{{ config_path }} · 交易对：{{ symbols|join("、") }}
       </div>
     </section>
   </main>
 
-  <!-- KILL confirmation modal -->
+  <!-- 紧急停止确认弹窗 -->
   <div class="modal-backdrop" id="kill-modal" hidden>
     <div class="modal">
-      <div class="modal-title">⚠ KILL SWITCH</div>
+      <div class="modal-title">⚠ 紧急停止（清仓）</div>
       <p class="modal-body">
-        This will <strong>cancel every open order</strong> and
-        <strong>market-flat all positions</strong> on
-        <code>{{ profile }}</code>, then write a <code>STOPPED</code>
-        sentinel that blocks the trader from restarting until you
-        explicitly clear it.
+        此操作会在
+        <code>{% if profile == "testnet" %}测试网{% elif profile == "real" %}实盘{% else %}模拟{% endif %}</code>
+        账户上<strong>撤销所有挂单</strong>并<strong>市价平掉所有持仓</strong>，
+        然后写入一个<code>停止锁</code>文件 —— 在你手动解除之前，
+        机器人无法再次启动。
       </p>
       <p class="modal-body">
-        Type <code>KILL</code> below to confirm.
+        请在下方输入 <code>KILL</code> 以确认。
       </p>
-      <input class="modal-input mono" id="kill-confirm-input" type="text" autocomplete="off" />
+      <input class="modal-input mono" id="kill-confirm-input" type="text" autocomplete="off" placeholder="输入 KILL" />
       <div class="modal-row">
-        <button class="btn btn-ghost" id="kill-cancel">cancel</button>
-        <button class="btn btn-kill" id="kill-confirm" disabled>confirm kill</button>
+        <button class="btn btn-ghost" id="kill-cancel">取消</button>
+        <button class="btn btn-kill" id="kill-confirm" disabled>确认清仓</button>
       </div>
     </div>
   </div>

@@ -33,7 +33,7 @@
   --indigo-soft: rgba(129, 140, 248, 0.10);
   --radius: 16px;
   --shadow: 0 24px 48px -16px rgba(0, 0, 0, 0.45);
-  --font-sans: 'Inter', system-ui, -apple-system, 'Helvetica Neue', sans-serif;
+  --font-sans: 'Inter', 'Noto Sans SC', system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
 }
 
@@ -90,7 +90,7 @@ html, body {
 .brand-text {
   font-size: 18px;
   font-weight: 700;
-  letter-spacing: 0.18em;
+  letter-spacing: 0.08em;
 }
 .brand-sub {
   font-size: 11px;
@@ -207,9 +207,8 @@ html, body {
 
 .kpi { min-height: 130px; display: flex; flex-direction: column; justify-content: space-between; }
 .kpi-label {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.20em;
+  font-size: 12px;
+  letter-spacing: 0.06em;
   color: var(--text-muted);
   font-weight: 600;
 }
@@ -244,9 +243,8 @@ html, body {
   margin-bottom: 14px;
 }
 .card-title {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.18em;
+  font-size: 13px;
+  letter-spacing: 0.04em;
   color: var(--text-dim);
   font-weight: 600;
 }
@@ -362,8 +360,7 @@ html, body {
   display: inline-flex;
   align-items: center;
   gap: 10px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  letter-spacing: 0.04em;
   transition: transform 80ms ease, box-shadow 120ms ease, filter 120ms ease;
 }
 .btn:active { transform: translateY(1px); }

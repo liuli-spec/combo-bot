@@ -64,11 +64,14 @@ def test_index_renders_with_profile_info():
         resp = client.get("/")
         assert resp.status_code == 200
         body = resp.text
-        # Brand + profile pill must render.
+        # Brand + profile pill must render (round-30b: Chinese UI).
         assert "COMBO" in body
-        assert "testnet" in body
-        # Real flag should surface a tag.
-        assert "REAL ORDERS" in body
+        # The profile class name keeps the english slug for CSS.
+        assert "profile-testnet" in body
+        # Real flag should surface the Chinese tag.
+        assert "真实下单" in body
+        # Testnet tag also present.
+        assert "测试网" in body
         # Symbols appear in the control meta.
         assert "BTC/USDT:USDT" in body
         assert "ETH/USDT:USDT" in body
