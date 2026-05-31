@@ -2360,27 +2360,45 @@ class LiveTrader:
     def _desired_identity(order: Order) -> tuple:
         """Stable identity for a desired order across ticks.
 
-        Quantization upstream means consecutive ticks emitting the
-        "same" entry produce the same (price, qty), so this tuple is
-        the right key for "is this desired the same logical order I
-        sent last tick?".
+        Round-29 fix: ``price`` is log-bucketed at ~0.2% resolution
+        instead of raw-rounded. Without this, EMA drift of 1-2 USDT
+        between ticks (~0.002%) flipped identity, minted a new cID,
+        broke the cID-based reconcile match, and the trader
+        cancel+recreate'd the same logical grid level every tick.
+        Live observation on testnet 5/31: 4 short limits cancelled
+        and re-issued every 60s with no price/qty change a human
+        would call meaningful.
+
+        Grid levels sit 2-3% apart in price, so 0.2% buckets still
+        distinguish them cleanly. ``qty`` is also bucketed (3 sig
+        figs) since DDF-scaled qty drifts slightly when balance or
+        wallet_exposure shift between ticks.
 
         ``is_market`` is part of the identity: a limit and a market
-        entry at the same price/qty are different exchange orders
-        (different order_type, different fee tier). Without including
-        it, switching a logical desired from limit to market (e.g. a
-        regime change promoting a previously-limit overlay to market)
-        would reuse the limit's cOID — and that cOID is already bound
-        to a now-cancelled limit on the exchange.
+        entry at the same price/qty are different exchange orders.
         """
+        import math
+
+        if order.price > 0:
+            # log * 500 gives ~0.2% resolution per integer bucket.
+            price_bucket = int(round(math.log(order.price) * 500))
+        else:
+            price_bucket = 0
+        if order.qty > 0:
+            # log * 100 gives ~1% qty resolution — survives DDF
+            # rebalancing without confusing distinct grid levels
+            # (consecutive levels differ by ddf=1.3, ~30%).
+            qty_bucket = int(round(math.log(order.qty) * 100))
+        else:
+            qty_bucket = 0
         return (
             order.symbol,
             order.side.value,
             order.source.value,
             bool(order.reduce_only),
             bool(order.is_market),
-            round(order.price, 6),
-            round(order.qty, 8),
+            price_bucket,
+            qty_bucket,
         )
 
     def _assign_cid(self, order: Order, now_ms: int) -> str:
