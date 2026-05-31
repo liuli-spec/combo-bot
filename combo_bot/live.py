@@ -350,7 +350,9 @@ class LiveTrader:
                         await self.exchange.set_margin_mode("isolated", symbol)
                     self._leverage_cache[symbol] = initial_lev
                 except Exception:
-                    logger.warning("Could not set leverage/margin for %s", symbol)
+                    logger.warning(
+                        "Could not set leverage/margin for %s", symbol, exc_info=True
+                    )
 
     async def _tick(self):
         # Pull fills first so source-isolated buckets (especially TREND)

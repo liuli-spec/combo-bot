@@ -74,7 +74,7 @@ async def _exchange_snapshot(exchange, symbols: list[str]) -> dict[str, Any]:
             logger.exception("[monitor] fetch_open_orders(%s) failed", symbol)
             snap["open_orders_by_symbol"][symbol] = "ERR"
         try:
-            positions = await exchange.fetch_positions(symbol)
+            positions = await exchange.fetch_positions([symbol])
             pos_info = []
             for p in positions or []:
                 if p.get("symbol") != symbol:
@@ -114,43 +114,54 @@ def _print_snapshot(
     if state is None:
         print("  (no state file yet — trader may not have run / saved)")
     else:
-        acc = state.get("account", {}) or {}
-        balance_local = float(acc.get("balance", 0) or 0)
-        equity_local = float(acc.get("equity", 0) or 0)
-        peak = float(acc.get("equity_peak", 0) or 0)
+        # The state file uses a FLAT top-level shape (see live.py
+        # _save_state) — balance/equity/peak/risk_* sit at the root.
+        balance_local = float(state.get("balance", 0) or 0)
+        equity_local = float(state.get("equity", 0) or 0)
+        peak = float(state.get("equity_peak", 0) or 0)
         dd = (peak - equity_local) / peak if peak > 0 else 0.0
-        risk = state.get("risk", {}) or {}
         print(
             f"  state.balance={balance_local:.2f}  equity={equity_local:.2f}  ", end=""
         )
         print(f"peak={peak:.2f}  dd={dd:.2%}")
         print(
-            f"  risk.tier={risk.get('tier', '?')}  red_latched="
-            f"{risk.get('red_latched', '?')}  cooldown_until="
-            f"{risk.get('red_cooldown_until', '?')}"
+            f"  risk.tier={state.get('risk_tier', '?')}  red_latched="
+            f"{state.get('risk_red_latched', '?')}  cooldown_until="
+            f"{state.get('risk_red_cooldown_until', '?')}"
         )
-        persistence_failed = state.get("persistence_failed", False)
-        stuck = state.get("stuck_symbols", []) or []
-        unknown = state.get("unknown_overlay", {}) or {}
-        if persistence_failed:
-            print("\033[1;31m  !! persistence_failed=True !!\033[0m")
+        fe = state.get("fill_events", {}) or {}
+        stuck = fe.get("stuck_symbols", []) or []
+        unknown = state.get("unknown_overlay", []) or []
+        pending = state.get("pending_overlay", []) or []
         if stuck:
             print(f"\033[1;33m  !! stuck_symbols={stuck} !!\033[0m")
         if unknown:
-            print(f"\033[1;33m  !! unknown_overlay={list(unknown)} !!\033[0m")
-
-        symbols = (state.get("account", {}) or {}).get("symbols", {}) or {}
-        for sym, ss in symbols.items():
-            pl = ss.get("position_long", {}) or {}
-            ps = ss.get("position_short", {}) or {}
-            tl = ss.get("trend_long", {}) or {}
-            tts = ss.get("trend_short", {}) or {}
-            last = float(ss.get("last_price", 0) or 0)
-            print(
-                f"  {sym}  last={last:.4f}  "
-                f"grid_long={_fmt_pos(pl)}  grid_short={_fmt_pos(ps)}  "
-                f"trend_long={_fmt_pos(tl)}  trend_short={_fmt_pos(tts)}"
-            )
+            print(f"\033[1;33m  !! unknown_overlay={unknown} !!\033[0m")
+        if pending:
+            print(f"  pending_overlay={pending}")
+        # Trend bucket persistence: per-symbol dict with optional
+        # long_size/long_entry_price and short_size/short_entry_price.
+        # Grid positions are NOT in the state file — they're re-derived
+        # from fetch_positions every tick, so check the exchange poll
+        # section below for current grid exposure.
+        trend_buckets = state.get("trend_buckets", {}) or {}
+        if trend_buckets:
+            for sym, bucket in trend_buckets.items():
+                long_repr = (
+                    f"{bucket.get('long_size', 0):.6f}@"
+                    f"{bucket.get('long_entry_price', 0):.4f}"
+                    if "long_size" in bucket
+                    else "flat"
+                )
+                short_repr = (
+                    f"{bucket.get('short_size', 0):.6f}@"
+                    f"{bucket.get('short_entry_price', 0):.4f}"
+                    if "short_size" in bucket
+                    else "flat"
+                )
+                print(f"  {sym}  trend_long={long_repr}  trend_short={short_repr}")
+        else:
+            print("  trend_buckets: (no open trend positions)")
 
     print("  --- exchange poll ---")
     bal = exchange_snap.get("balance")

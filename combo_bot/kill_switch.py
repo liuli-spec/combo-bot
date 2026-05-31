@@ -67,7 +67,7 @@ async def _flatten_symbol(exchange, symbol: str) -> dict:
     # file because the operator may be running kill_switch precisely
     # BECAUSE local state diverged.
     try:
-        positions = await exchange.fetch_positions(symbol)
+        positions = await exchange.fetch_positions([symbol])
     except Exception:
         logger.exception("[kill_switch] fetch_positions(%s) failed", symbol)
         positions = []
