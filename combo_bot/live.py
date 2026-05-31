@@ -143,7 +143,7 @@ class LiveTrader:
         # per-entry ``leverage(...)`` hook. We only re-call
         # exchange.set_leverage when the desired value actually
         # changes, so a no-op hook costs zero API calls.
-        self._leverage_cache: dict[str, float] = {}
+        self._leverage_cache: dict[str, int] = {}
         # Round-27: per-(pair, timeframe) watermarks for informative
         # streams so each candle is appended exactly once across ticks.
         self._informative_last_ts: dict[tuple[str, str], int] = {}
@@ -2375,13 +2375,21 @@ class LiveTrader:
 
     async def _compute_strategy_leverage(
         self, symbol: str, ctx: TradeContext | None
-    ) -> float:
+    ) -> int:
         """Resolve the strategy's desired leverage for ``symbol``.
 
         Clamped to ``[1, config.leverage]`` — the operator ceiling is
         absolute; strategies can only derate, never inflate. A crashing
         hook falls back to the configured leverage so an order isn't
         blocked by a buggy callback.
+
+        Round-29 fix: returned as INT, not float. Binance's
+        set_leverage API rejects a float-stringified value
+        ("3.0" → ``{code: -1102, msg: 'Mandatory parameter
+        \\'leverage\\' was not sent, was empty/null, or malformed.'}``).
+        Floor + int cast keeps the operator ceiling intact (a
+        strategy returning 3.7 with config.leverage=5 still gets 3
+        applied, never 4).
         """
         try:
             desired = float(
@@ -2397,7 +2405,8 @@ class LiveTrader:
                 symbol,
             )
             desired = float(self.config.leverage)
-        return max(1.0, min(desired, float(self.config.leverage)))
+        clamped = max(1.0, min(desired, float(self.config.leverage)))
+        return max(1, int(clamped))
 
     async def _ensure_leverage_for_entry(self, order: Order) -> bool:
         """Refresh exchange-side leverage to the strategy's per-entry
@@ -2441,7 +2450,9 @@ class LiveTrader:
         )
         desired = await self._compute_strategy_leverage(symbol, ctx)
         current = self._leverage_cache.get(symbol)
-        if current is not None and abs(desired - current) < 1e-9:
+        # Both desired and cached are ints now (round-29 fix); plain
+        # equality is the right comparison.
+        if current is not None and current == desired:
             return True  # no-op — cached value already matches
         try:
             await self.exchange.set_leverage(desired, symbol)
