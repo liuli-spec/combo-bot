@@ -803,6 +803,29 @@ class LiveTrader:
             self.account.drawdown,
             len(all_desired_orders),
         )
+        # Round-29 diagnostic: per-symbol state so the operator can
+        # see WHY orders=0 (EMA not init / mode TP_ONLY / no signal /
+        # active gate dropped this symbol). Temporary — remove once
+        # the bring-up phase is done.
+        for sym in self.config.symbols:
+            ss = self.account.symbols.get(sym)
+            if ss is None:
+                continue
+            ema_init = bool(ss.ema.initialized)
+            ema_lo = ss.ema.lower if ema_init else 0.0
+            ema_hi = ss.ema.upper if ema_init else 0.0
+            logger.info(
+                "  %s | last=%.4f ema_init=%s ema_lo=%.4f ema_hi=%.4f "
+                "mode_long=%s mode_short=%s vol=%.6f",
+                sym,
+                ss.last_price,
+                ema_init,
+                ema_lo,
+                ema_hi,
+                ss.mode_long.value if ss.mode_long else "?",
+                ss.mode_short.value if ss.mode_short else "?",
+                ss.volatility.value,
+            )
 
     async def _refresh_account(self) -> bool:
         try:
