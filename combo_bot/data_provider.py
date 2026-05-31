@@ -25,6 +25,21 @@ class DataProvider:
         self._buffers: dict[str, list[Candle]] = {}
         self._cached_df: dict[str, "DataFrame"] = {}
         self._cache_len: dict[str, int] = {}
+        # Round-27: informative-timeframe buffers, keyed by
+        # ``(pair, timeframe)``. Strategies register what they want via
+        # IStrategy.informative_pairs(); LiveTrader / Backtester
+        # populate these buffers; strategies read via
+        # ``get_informative(pair, timeframe)``. Independent of the
+        # main per-symbol buffer so the populate-* hooks against the
+        # primary timeframe don't see informative-frame columns
+        # mixed in.
+        self._informative_buffers: dict[tuple[str, str], list[Candle]] = {}
+        self._informative_cached_df: dict[tuple[str, str], "DataFrame"] = {}
+        self._informative_cache_len: dict[tuple[str, str], int] = {}
+        # Registered (pair, timeframe) requests from
+        # strategy.informative_pairs(). Operators / live loops can
+        # query this to know what to fetch from the exchange.
+        self._informative_registry: set[tuple[str, str]] = set()
 
     def append(self, symbol: str, candle: Candle) -> None:
         buf = self._buffers.setdefault(symbol, [])
@@ -75,6 +90,68 @@ class DataProvider:
             self._buffers.pop(symbol, None)
             self._cached_df.pop(symbol, None)
             self._cache_len.pop(symbol, None)
+
+    # ── Informative-timeframe API (Round-27) ────────────────────
+
+    def register_informative(self, pair: str, timeframe: str) -> None:
+        """Mark ``(pair, timeframe)`` as a stream the strategy wants.
+
+        Idempotent — re-registering does nothing. LiveTrader.start()
+        seeds the registry from ``strategy.informative_pairs()``;
+        Backtester.run() does the same from cached data. Operators
+        can also pre-register pairs manually before running.
+        """
+        self._informative_registry.add((pair, timeframe))
+
+    def informative_pairs(self) -> set[tuple[str, str]]:
+        """Return the registered informative streams."""
+        return set(self._informative_registry)
+
+    def append_informative(self, pair: str, timeframe: str, candle: Candle) -> None:
+        """Append a candle to the ``(pair, timeframe)`` informative
+        buffer. Auto-registers the pair if not already known so
+        callers can append without an explicit register call."""
+        key = (pair, timeframe)
+        self._informative_registry.add(key)
+        buf = self._informative_buffers.setdefault(key, [])
+        buf.append(candle)
+        if len(buf) > self._max_rows:
+            del buf[: len(buf) - self._max_rows]
+        self._informative_cached_df.pop(key, None)
+        self._informative_cache_len.pop(key, None)
+
+    def get_informative(self, pair: str, timeframe: str) -> "DataFrame":
+        """Return the cached DataFrame for ``(pair, timeframe)``.
+
+        Returns an empty frame (same columns as primary) when the
+        stream is unregistered or empty — callers should test
+        ``len(df)`` before reading the last row.
+        """
+        import pandas as pd
+
+        key = (pair, timeframe)
+        buf = self._informative_buffers.get(key, [])
+        if not buf:
+            return pd.DataFrame(
+                columns=["timestamp", "open", "high", "low", "close", "volume"],
+            )
+        if self._informative_cache_len.get(key) == len(buf):
+            return self._informative_cached_df[key]
+
+        df = pd.DataFrame(
+            {
+                "timestamp": [c.timestamp for c in buf],
+                "open": [c.open for c in buf],
+                "high": [c.high for c in buf],
+                "low": [c.low for c in buf],
+                "close": [c.close for c in buf],
+                "volume": [c.volume for c in buf],
+            }
+        )
+        df.index = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        self._informative_cached_df[key] = df
+        self._informative_cache_len[key] = len(buf)
+        return df
 
 
 __all__ = ["DataProvider"]

@@ -448,9 +448,31 @@ class GridEngine:
         return max(quantize_qty(raw_qty, ep.qty_step), ep.min_qty)
 
     def _grid_spacing(self, volatility: float, wallet_exposure: float) -> float:
+        """Compute the next-level spacing.
+
+        Round-28: ``we_component`` now matches Passivbot's
+        ``(WE / WEL) * weight`` — the spacing widens with the
+        RATIO of current exposure to the cap, not the raw WE value.
+        At low caps (e.g. trend bucket WEL=0.35) the legacy raw form
+        barely widened spacing even when the bucket was at cap, which
+        let new entries pile in at near-original prices — the OPPOSITE
+        of the "protect capital under heavy load" semantic Passivbot
+        encodes. Reference: passivbot-rust src/entries.rs:141.
+
+        Reads ``wallet_exposure_limit`` directly off the GridConfig.
+        Callers using a different per-bucket cap (e.g. trend WEL)
+        will get spacing scaled against that grid cap; that's the
+        same fidelity loss the round-27 hybrid Rust path notes — the
+        grid engine sees one WEL field, and we use it.
+        """
         cfg = self._cfg
         vol_component = volatility * cfg.entry_grid_spacing_volatility_weight
-        we_component = wallet_exposure * cfg.entry_grid_spacing_we_weight
+        wel = cfg.wallet_exposure_limit
+        if wel > 0:
+            we_ratio = wallet_exposure / wel
+        else:
+            we_ratio = 0.0
+        we_component = we_ratio * cfg.entry_grid_spacing_we_weight
         return cfg.entry_grid_spacing_pct * (1.0 + vol_component + we_component)
 
     def _next_entry_price(

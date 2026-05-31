@@ -59,6 +59,15 @@ class BacktestConfig:
     regime: RegimeArbiterConfig = field(default_factory=RegimeArbiterConfig)
     forager_weights: ForagerWeights = field(default_factory=ForagerWeights)
     symbols: list[str] = field(default_factory=list)
+    # Round-27: route grid math through the Rust core for speed while
+    # keeping regime / trend overlay / strategy callbacks in Python.
+    # Falls back to pure-Python automatically when the Rust extension
+    # isn't installed. The legacy ``rust_backtest.run_rust_backtest``
+    # all-in-one entry point is GRID-ONLY (see its docstring) and
+    # ignores regime / trend / strategy; this flag is the supported
+    # way to get Rust acceleration without losing the Python
+    # decision stack.
+    use_rust_grid: bool = False
 
 
 class Backtester:
@@ -74,6 +83,28 @@ class Backtester:
     ):
         self.config = config
         self.grid = GridEngine(config.grid)
+        # Round-27: log once at construction whether the Rust grid
+        # path is active. ``use_rust_grid=True`` with no extension
+        # installed silently falls back to Python — log the fallback
+        # so operators don't think Rust is accelerating when it isn't.
+        self._rust_grid_active = False
+        if config.use_rust_grid:
+            try:
+                from combo_bot.rust_adapter import RUST_AVAILABLE
+
+                if RUST_AVAILABLE:
+                    self._rust_grid_active = True
+                else:
+                    import logging
+
+                    logging.getLogger("combo_bot.backtest").warning(
+                        "use_rust_grid=True but combo_futures_core wheel "
+                        "is not installed; falling back to Python grid. "
+                        "Run `cd rust && maturin build --release && "
+                        "pip install target/wheels/*.whl` to enable."
+                    )
+            except ImportError:
+                pass
         self.trend = TrendEngine(config.trend)
         # Round-22: pass the canonical trend WEL so overlay sizing and
         # risk unstuck stay in lockstep — no more drift between merger
@@ -158,6 +189,25 @@ class Backtester:
             logging.getLogger("combo_bot.backtest").exception(
                 "[strategy] bot_start raised — continuing"
             )
+        # Round-27: register the strategy's informative streams.
+        # Backtester does NOT auto-load the informative bar data —
+        # operators must pre-populate via
+        # ``bt.data_provider.append_informative(pair, tf, candle)``
+        # before run() OR pass the informative bars through
+        # ``run(candle_data=..., informative_data=...)`` (next round).
+        # Registration here means strategies can call
+        # ``data_provider.get_informative(...)`` without crashing
+        # on an unregistered key.
+        try:
+            extras = self.strategy.informative_pairs()
+            for pair, timeframe in extras or ():
+                self.data_provider.register_informative(pair, timeframe)
+        except Exception:
+            import logging
+
+            logging.getLogger("combo_bot.backtest").exception(
+                "[strategy] informative_pairs raised — ignored"
+            )
 
         for step in range(n_steps):
             candles = {s: candle_data[s][step] for s in symbols}
@@ -196,6 +246,39 @@ class Backtester:
             self.protections.update(step_fills, account, ts)
             if self.kelly_sizer is not None:
                 self.kelly_sizer.record_fills(step_fills)
+            # Round-28: dispatch order_filled AFTER bucket / balance
+            # updates so the strategy sees the post-fill state. Each
+            # fill carries a (symbol, side, source) we use to resolve
+            # a TradeContext lazily — strategies that don't override
+            # the hook pay zero per-fill cost (default is a no-op).
+            if step_fills:
+
+                def _resolve_fill_ctx(fill: Fill) -> TradeContext:
+                    ss = account.symbols[fill.symbol]
+                    ep = exchange_params[fill.symbol]
+                    if fill.source == OrderSource.TREND:
+                        pos = (
+                            ss.trend_long if fill.side == Side.LONG else ss.trend_short
+                        )
+                    else:
+                        pos = (
+                            ss.position_long
+                            if fill.side == Side.LONG
+                            else ss.position_short
+                        )
+                    return TradeContext(
+                        symbol=fill.symbol,
+                        side=fill.side,
+                        position=pos,
+                        account=account,
+                        candle=candles[fill.symbol],
+                        signal=None,
+                        current_time_ms=ts,
+                        exchange_params=ep,
+                        source=fill.source,
+                    )
+
+                self.strategy_runner.fire_order_filled(step_fills, _resolve_fill_ctx)
 
             # ── funding ───────────────────────────────────────────
             # Wall-clock hours, not bars-since-start. Without scaling by
@@ -220,7 +303,9 @@ class Backtester:
             if self.vol_target_sizer is not None:
                 self.vol_target_sizer.record_equity(account.equity)
 
-            if self.risk.check_liquidation(account):
+            if self.risk.check_liquidation(
+                account, starting_balance=self.config.starting_balance
+            ):
                 break
 
             # Round-25 P1 #1: bot_loop_start fires AFTER data append +
@@ -315,7 +400,7 @@ class Backtester:
                     if ss.position_long.is_open
                     else 0.0
                 )
-                grid_long = self.grid.compute_orders(
+                grid_long = self._compute_grid_orders(
                     symbol=s,
                     side=Side.LONG,
                     position=ss.position_long,
@@ -326,6 +411,7 @@ class Backtester:
                     exchange_params=ep,
                     mode=regime_view.long_mode,
                     mark_price=price,
+                    trailing_state=ss.trailing_long,
                     close_markup_multiplier=regime_view.close_aggressiveness,
                 )
                 we_short = (
@@ -338,7 +424,7 @@ class Backtester:
                     if ss.position_short.is_open
                     else 0.0
                 )
-                grid_short = self.grid.compute_orders(
+                grid_short = self._compute_grid_orders(
                     symbol=s,
                     side=Side.SHORT,
                     position=ss.position_short,
@@ -350,6 +436,7 @@ class Backtester:
                     mode=regime_view.short_mode,
                     mark_price=price,
                     close_markup_multiplier=regime_view.close_aggressiveness,
+                    trailing_state=ss.trailing_short,
                 )
                 ctx_long = TradeContext(
                     symbol=s,
@@ -781,6 +868,65 @@ class Backtester:
             else:
                 ss.volatility.update(log_range)
 
+    def _compute_grid_orders(
+        self,
+        *,
+        symbol: str,
+        side: Side,
+        position: Position,
+        ema_state,
+        volatility,
+        balance: float,
+        wallet_exposure: float,
+        exchange_params: ExchangeParams,
+        mode,
+        mark_price: float,
+        close_markup_multiplier: float,
+        trailing_state=None,
+    ) -> list[Order]:
+        """Hybrid grid-order computation.
+
+        Routes through the Rust core when ``use_rust_grid=True`` AND
+        the extension is installed AND ``close_markup_multiplier`` is
+        the default (1.0). The Rust adapter doesn't yet thread the
+        close-aggressiveness multiplier through ``bot_params``, so when
+        the regime arbiter has bumped close aggressiveness we fall
+        back to Python for full fidelity. Functionally equivalent
+        to the legacy ``self.grid.compute_orders`` direct call when
+        Rust isn't active.
+        """
+        if self._rust_grid_active and abs(close_markup_multiplier - 1.0) < 1e-9:
+            from combo_bot.rust_adapter import compute_grid_orders_rust
+
+            return compute_grid_orders_rust(
+                symbol=symbol,
+                side=side,
+                position=position,
+                ema_state=ema_state,
+                volatility=volatility,
+                balance=balance,
+                bid=mark_price,
+                ask=mark_price,
+                exchange_params=exchange_params,
+                grid_config=self.config.grid,
+                mode=mode,
+                max_levels=self.config.grid.max_grid_levels,
+                trailing=trailing_state,
+            )
+        return self.grid.compute_orders(
+            symbol=symbol,
+            side=side,
+            position=position,
+            ema_state=ema_state,
+            volatility=volatility,
+            balance=balance,
+            wallet_exposure=wallet_exposure,
+            exchange_params=exchange_params,
+            mode=mode,
+            mark_price=mark_price,
+            close_markup_multiplier=close_markup_multiplier,
+        )
+
     def _funding_rate_for(
         self,
         funding_rates: dict[str, list[float]] | None,
@@ -999,12 +1145,21 @@ class Backtester:
             pos.size = new_size
 
     def _reduce_position(self, pos: Position, close_qty: float):
-        if abs(pos.size) <= close_qty + 1e-12:
+        # Round-28: Position.size is documented as always non-negative
+        # (types.py:56). Assert the invariant so any caller smuggling a
+        # negative size in via the Rust-adapter sign-flip path crashes
+        # loudly instead of silently producing wrong PnL. close_qty is
+        # the same convention (positive scalar).
+        assert pos.size >= 0 and close_qty >= 0, (
+            f"Position.size and close_qty must be non-negative; "
+            f"got size={pos.size}, close_qty={close_qty}"
+        )
+        if pos.size <= close_qty + 1e-12:
             pos.size = 0.0
             pos.entry_price = 0.0
             pos.best_price = 0.0
         else:
-            pos.size = pos.size - close_qty if pos.size > 0 else pos.size + close_qty
+            pos.size = pos.size - close_qty
 
     def _apply_funding(
         self,

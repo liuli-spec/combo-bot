@@ -56,6 +56,14 @@ class LiveConfig:
     max_orders_per_batch: int = 5
     order_match_tolerance_pct: float = 0.002
     state_file: str = "live_state.json"
+    # Round-28: Freqtrade-style declarative unfilled timeouts. Any
+    # pending entry order older than ``unfilledtimeout_entry_seconds``
+    # gets cancelled; same for exits. ``None`` (default) disables the
+    # declarative gate — only the programmatic ``check_*_timeout``
+    # strategy hooks fire. When BOTH are set, EITHER firing triggers
+    # cancel (declarative is the floor; strategy can be stricter).
+    unfilledtimeout_entry_seconds: int | None = None
+    unfilledtimeout_exit_seconds: int | None = None
     # Candle cadence the live trader fetches. Must match the timeframe
     # the backtest was tuned for — using a 1m default in live while the
     # backtest validated at 1h would give you a different trend signal,
@@ -129,6 +137,16 @@ class LiveTrader:
         # consumed by _tick AFTER bot_loop_start runs so populate_*
         # sees any state the hook just set (Freqtrade ordering).
         self._symbols_with_new_bars: set[str] = set()
+        # Round-27: per-symbol leverage cache. _init_exchange seeds it
+        # with the strategy's initial preference; _ensure_leverage()
+        # is called before each new entry to honor Freqtrade's
+        # per-entry ``leverage(...)`` hook. We only re-call
+        # exchange.set_leverage when the desired value actually
+        # changes, so a no-op hook costs zero API calls.
+        self._leverage_cache: dict[str, float] = {}
+        # Round-27: per-(pair, timeframe) watermarks for informative
+        # streams so each candle is appended exactly once across ticks.
+        self._informative_last_ts: dict[tuple[str, str], int] = {}
         # ── execution guards (modelled on passivbot executor / reconciler) ──
         # Cap scales with symbol count so busy multi-symbol books don't
         # evict legitimate entries.
@@ -250,14 +268,14 @@ class LiveTrader:
             self.strategy.bot_start()
         except Exception:
             logger.exception("[strategy] bot_start raised — continuing")
+        # Round-27: register the strategy's informative streams so
+        # _refresh_informative_candles can poll them every tick.
         try:
             extras = self.strategy.informative_pairs()
+            for pair, timeframe in extras or ():
+                self.data_provider.register_informative(pair, timeframe)
             if extras:
-                logger.info(
-                    "[strategy] informative_pairs declared: %s "
-                    "(not yet loaded — extra-timeframe data infra pending)",
-                    extras,
-                )
+                logger.info("[strategy] informative_pairs registered: %s", extras)
         except Exception:
             logger.exception("[strategy] informative_pairs raised — ignored")
         self._running = True
@@ -295,32 +313,17 @@ class LiveTrader:
             self.account.symbols[symbol] = SymbolState(symbol=symbol, c_mult=ep.c_mult)
 
             if not self.config.dry_run:
-                # Freqtrade-style leverage hook: strategy can shrink the
-                # configured leverage per-symbol (e.g. derate a volatile
-                # pair). Cap at the operator-supplied value — strategies
-                # can lower it, never raise it past the operator ceiling.
+                # Seed the leverage cache once. The per-entry hook in
+                # _ensure_leverage_for_entry handles all subsequent
+                # changes. Operator ceiling clamps the strategy.
+                initial_lev = await self._compute_strategy_leverage(symbol, ctx=None)
                 try:
-                    desired_lev = float(
-                        self.strategy.leverage(
-                            ctx=None,
-                            proposed_leverage=float(self.config.leverage),
-                            max_leverage=float(self.config.leverage),
-                        )
-                    )
-                except Exception:
-                    logger.exception(
-                        "[strategy] leverage hook raised for %s — "
-                        "falling back to configured leverage",
-                        symbol,
-                    )
-                    desired_lev = float(self.config.leverage)
-                effective_lev = max(1.0, min(desired_lev, float(self.config.leverage)))
-                try:
-                    await self.exchange.set_leverage(effective_lev, symbol)
+                    await self.exchange.set_leverage(initial_lev, symbol)
                     if self.config.margin_mode == "cross":
                         await self.exchange.set_margin_mode("cross", symbol)
                     else:
                         await self.exchange.set_margin_mode("isolated", symbol)
+                    self._leverage_cache[symbol] = initial_lev
                 except Exception:
                     logger.warning("Could not set leverage/margin for %s", symbol)
 
@@ -337,6 +340,10 @@ class LiveTrader:
             await self._save_state()
             return
         await self._refresh_candles()
+        # Round-27: poll any informative streams the strategy
+        # registered. Auxiliary; failure on one stream doesn't
+        # block the main tick.
+        await self._refresh_informative_candles()
 
         # Round-25 P1 #1: Freqtrade order is refresh→bot_loop_start
         # →analyze. So bot_loop_start runs AFTER all data refresh
@@ -1132,6 +1139,47 @@ class LiveTrader:
             except Exception:
                 logger.exception("Failed to fetch candles for %s", symbol)
 
+    async def _refresh_informative_candles(self) -> None:
+        """Round-27: poll exchange OHLCV for every registered
+        ``(pair, timeframe)`` informative stream and append new bars
+        to ``data_provider``. A fetch failure on one stream logs and
+        continues — informative data is auxiliary, never blocks the
+        main tick. Per-stream watermarks dedupe so the strategy sees
+        each bar exactly once."""
+        informative = self.data_provider.informative_pairs()
+        if not informative:
+            return
+        for pair, timeframe in informative:
+            wm_key = (pair, timeframe)
+            last_ts = self._informative_last_ts.get(wm_key, -1)
+            try:
+                ohlcv = await self.exchange.fetch_ohlcv(pair, timeframe, limit=100)
+            except Exception:
+                logger.exception(
+                    "[informative] fetch_ohlcv(%s, %s) failed — skipping",
+                    pair,
+                    timeframe,
+                )
+                continue
+            if not ohlcv:
+                continue
+            new_rows = [r for r in ohlcv if int(r[0]) > last_ts]
+            for row in new_rows:
+                self.data_provider.append_informative(
+                    pair,
+                    timeframe,
+                    Candle(
+                        timestamp=int(row[0]),
+                        open=float(row[1]),
+                        high=float(row[2]),
+                        low=float(row[3]),
+                        close=float(row[4]),
+                        volume=float(row[5]),
+                    ),
+                )
+            if new_rows:
+                self._informative_last_ts[wm_key] = int(new_rows[-1][0])
+
     async def _refresh_fills(self) -> None:
         """Poll exchange trade history for new fills and fan them out
         to protections / kelly_sizer / source-PnL bookkeeping. This is
@@ -1257,6 +1305,34 @@ class LiveTrader:
             self.protections.update(enriched, self.account, now_ms)
             if self.kelly_sizer is not None:
                 self.kelly_sizer.record_fills(enriched)
+
+            # Round-28: dispatch strategy.order_filled AFTER bucket /
+            # balance / PnL bookkeeping so the strategy sees the
+            # post-fill state. Resolve TradeContext lazily per fill.
+            def _resolve_fill_ctx(fill: Fill) -> TradeContext:  # noqa: B023
+                ss = self.account.symbols[fill.symbol]
+                ep = self.exchange_params[fill.symbol]
+                if fill.source == OrderSource.TREND:
+                    pos = ss.trend_long if fill.side == Side.LONG else ss.trend_short
+                else:
+                    pos = (
+                        ss.position_long
+                        if fill.side == Side.LONG
+                        else ss.position_short
+                    )
+                return TradeContext(
+                    symbol=fill.symbol,
+                    side=fill.side,
+                    position=pos,
+                    account=self.account,
+                    candle=self._latest_candle(fill.symbol, ss.last_price, now_ms),
+                    signal=None,
+                    current_time_ms=now_ms,
+                    exchange_params=ep,
+                    source=fill.source,
+                )
+
+            self.strategy_runner.fire_order_filled(enriched, _resolve_fill_ctx)
 
         for symbol in self.config.symbols:
             try:
@@ -1529,21 +1605,36 @@ class LiveTrader:
                     current_time_ms=now_ms,
                     exchange_params=ep,
                 )
-                try:
-                    if reduce_only:
-                        should_cancel = bool(
-                            self.strategy.check_exit_timeout(ctx, int(age_s))
+                # Round-28: declarative timeout floor runs FIRST
+                # (matches Freqtrade order). Either layer firing
+                # triggers cancel — the strategy hook can be stricter
+                # than the config, never more lenient.
+                declarative_limit = (
+                    self.config.unfilledtimeout_exit_seconds
+                    if reduce_only
+                    else self.config.unfilledtimeout_entry_seconds
+                )
+                should_cancel = (
+                    declarative_limit is not None
+                    and declarative_limit > 0
+                    and age_s >= declarative_limit
+                )
+                if not should_cancel:
+                    try:
+                        if reduce_only:
+                            should_cancel = bool(
+                                self.strategy.check_exit_timeout(ctx, int(age_s))
+                            )
+                        else:
+                            should_cancel = bool(
+                                self.strategy.check_entry_timeout(ctx, int(age_s))
+                            )
+                    except Exception:
+                        logger.exception(
+                            "[strategy] check_*_timeout raised for %s — ignored",
+                            symbol,
                         )
-                    else:
-                        should_cancel = bool(
-                            self.strategy.check_entry_timeout(ctx, int(age_s))
-                        )
-                except Exception:
-                    logger.exception(
-                        "[strategy] check_*_timeout raised for %s — ignored",
-                        symbol,
-                    )
-                    continue
+                        continue
                 if should_cancel:
                     eid = e.get("id")
                     if eid and eid not in recent_cancel_ids:
@@ -2255,6 +2346,88 @@ class LiveTrader:
         self._cid_by_desired[key] = (cid, now_ms)
         return cid
 
+    async def _compute_strategy_leverage(
+        self, symbol: str, ctx: TradeContext | None
+    ) -> float:
+        """Resolve the strategy's desired leverage for ``symbol``.
+
+        Clamped to ``[1, config.leverage]`` — the operator ceiling is
+        absolute; strategies can only derate, never inflate. A crashing
+        hook falls back to the configured leverage so an order isn't
+        blocked by a buggy callback.
+        """
+        try:
+            desired = float(
+                self.strategy.leverage(
+                    ctx=ctx,
+                    proposed_leverage=float(self.config.leverage),
+                    max_leverage=float(self.config.leverage),
+                )
+            )
+        except Exception:
+            logger.exception(
+                "[strategy] leverage hook raised for %s — falling back",
+                symbol,
+            )
+            desired = float(self.config.leverage)
+        return max(1.0, min(desired, float(self.config.leverage)))
+
+    async def _ensure_leverage_for_entry(self, order: Order) -> bool:
+        """Refresh exchange-side leverage to the strategy's per-entry
+        preference before submitting ``order``. Returns True on success
+        (or no-op), False if the leverage call failed — in which case
+        the caller MUST drop the entry rather than send at the wrong
+        leverage. Reduce-only orders don't trigger leverage changes
+        because they close existing exposure under whatever leverage
+        the position was opened at.
+
+        Round-27 Freqtrade parity: ``strategy.leverage`` is consulted
+        on every NEW entry with a real :class:`TradeContext`. A cached
+        per-symbol value avoids spamming ``set_leverage`` when the
+        strategy returns the same number every call.
+        """
+        if order.reduce_only or self.config.dry_run:
+            return True
+        if not hasattr(self.exchange, "set_leverage"):
+            # Spot exchanges / minimal stubs don't expose set_leverage.
+            # Skip the per-entry refresh entirely — there's nothing to
+            # change. _init_exchange's set_leverage attempt would have
+            # warned at startup if needed.
+            return True
+        symbol = order.symbol
+        ss = self.account.symbols.get(symbol)
+        ep = self.exchange_params.get(symbol)
+        if ss is None or ep is None:
+            return True  # state not initialized — let _create_order's
+            #              other guards decide whether to send.
+        pos = ss.position_long if order.side == Side.LONG else ss.position_short
+        ctx = TradeContext(
+            symbol=symbol,
+            side=order.side,
+            position=pos,
+            account=self.account,
+            candle=self._latest_candle(symbol, ss.last_price, self._now_ms()),
+            signal=None,
+            current_time_ms=self._now_ms(),
+            exchange_params=ep,
+            source=order.source,
+        )
+        desired = await self._compute_strategy_leverage(symbol, ctx)
+        current = self._leverage_cache.get(symbol)
+        if current is not None and abs(desired - current) < 1e-9:
+            return True  # no-op — cached value already matches
+        try:
+            await self.exchange.set_leverage(desired, symbol)
+        except Exception:
+            logger.exception(
+                "[live] set_leverage(%s, %s) failed — dropping entry",
+                desired,
+                symbol,
+            )
+            return False
+        self._leverage_cache[symbol] = desired
+        return True
+
     async def _create_order(self, order: Order):
         side = order.exchange_side
         order_type = "market" if order.is_market else "limit"
@@ -2265,6 +2438,11 @@ class LiveTrader:
             order = replace(order, client_order_id=self._make_client_order_id())
 
         if not order.reduce_only and self._risk_increasing_blocked(order.symbol):
+            return
+
+        # Round-27: refresh per-entry leverage. If the exchange call
+        # fails we drop rather than send at the wrong leverage.
+        if not await self._ensure_leverage_for_entry(order):
             return
 
         params = {"clientOrderId": order.client_order_id}

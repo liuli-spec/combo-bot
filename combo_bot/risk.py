@@ -842,7 +842,36 @@ class RiskManager:
             filtered.append(accepted)
         return filtered
 
-    def check_liquidation(self, account: AccountState) -> bool:
+    def check_liquidation(
+        self,
+        account: AccountState,
+        starting_balance: float = 0.0,
+    ) -> bool:
+        """Synthetic-liquidation circuit breaker.
+
+        Round-28 change: defaults to a STARTING-balance floor
+        (``starting_balance * liquidation_threshold``) matching
+        Passivbot. The legacy peak-relative formula (kept as
+        fallback when ``starting_balance <= 0``) is the **wrong**
+        circuit for a high-risk profile — a 10x account is killed
+        the moment it drops to 5x, even though the operator is
+        still up 4x. The starting-balance floor only fires on real
+        capital loss.
+
+        Neither formula is the true exchange liquidation. For
+        cross-margin perps, real liq triggers when equity falls
+        below maintenance-margin requirement (``sum(notional * mmr)``).
+        Both Passivbot and combo-bot use this synthetic gate as a
+        simulator stop-loss; the exchange enforces the real one.
+        """
+        threshold = self.config.liquidation_threshold
+        if threshold <= 0:
+            return False
+        if starting_balance > 0:
+            return account.equity <= starting_balance * threshold
+        # Backward-compat: legacy peak-relative behaviour when caller
+        # doesn't supply starting_balance. Logged in docs as the
+        # deprecated path.
         if account.equity_peak <= 0:
             return False
-        return account.equity <= account.equity_peak * self.config.liquidation_threshold
+        return account.equity <= account.equity_peak * threshold

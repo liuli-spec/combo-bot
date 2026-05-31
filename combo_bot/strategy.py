@@ -9,6 +9,7 @@ order stream produced by the engine.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -18,6 +19,7 @@ from combo_bot.types import (
     AccountState,
     Candle,
     ExchangeParams,
+    Fill,
     Order,
     OrderSource,
     Position,
@@ -26,6 +28,8 @@ from combo_bot.types import (
     TrendRegime,
     TrendSignal,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     # Imported lazily inside methods to avoid hard pandas dependency at import time.
@@ -117,6 +121,26 @@ class IStrategy(ABC):
     def informative_pairs(self) -> list[tuple[str, str]]:
         """Additional (pair, timeframe) tuples to load. Default: none."""
         return []
+
+    def order_filled(
+        self,
+        ctx: "TradeContext",
+        fill: "Fill",
+        **kwargs: Any,
+    ) -> None:
+        """Round-28: Freqtrade-style post-fill callback.
+
+        Fires AFTER a fill has been booked into the position bucket
+        and the realized PnL credited to balance. Strategies use this
+        for:
+          * post-fill audit / structured logging
+          * tightening trailing stops based on filled price
+          * recording features/labels for an ML pipeline
+          * sending an external notification (Slack, webhook)
+
+        Default: no-op. Wrapped so a misbehaving hook can't kill the
+        tick. ``ctx.position`` reflects the post-fill state.
+        """
 
     # --- entry / exit veto ---------------------------------------------------
 
@@ -356,6 +380,36 @@ class StrategyRunner:
         return result
 
     # --- final confirm pass (Round-25 P1 #4) -------------------------------
+
+    def fire_order_filled(
+        self,
+        fills: list[Fill],
+        ctx_resolver: "Callable[[Fill], TradeContext]",
+    ) -> None:
+        """Round-28: dispatch ``strategy.order_filled`` for each
+        fill. Wrapped so a hook crash on one fill doesn't block the
+        rest. Should be called AFTER all bucket / balance / PnL
+        bookkeeping for the batch is done, so the strategy sees the
+        post-fill state (``ctx.position`` reflects the just-booked
+        delta).
+        """
+        for fill in fills:
+            try:
+                ctx = ctx_resolver(fill)
+            except Exception:
+                logger.exception(
+                    "[strategy] order_filled ctx resolution failed for "
+                    "fill %s — skipping callback",
+                    getattr(fill, "trade_id", None),
+                )
+                continue
+            try:
+                self.strategy.order_filled(ctx, fill)
+            except Exception:
+                logger.exception(
+                    "[strategy] order_filled raised for fill %s — ignored",
+                    getattr(fill, "trade_id", None),
+                )
 
     def final_confirm(
         self,
