@@ -60,10 +60,14 @@ live_state.json
 *.intent_journal.jsonl
 *.STOPPED
 *.intent_journal.jsonl.compacting
+*.equity.jsonl
 
 # Optuna
 *.db
 optuna-journal*.log
+
+# UI-generated optimization results (also under data/ by default)
+optimize_results/
 
 # Codegraph daemon runtime
 .codegraph/

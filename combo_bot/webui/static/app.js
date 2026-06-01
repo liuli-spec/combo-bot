@@ -385,28 +385,139 @@ function positionRow(sym, p) {
 // ─── warnings ────────────────────────────────────────────────────
 
 function renderWarnings(d) {
-  const warnings = [];
-  if (d.sentinel_present) {
-    warnings.push(`检测到停止锁文件 <code>${d.sentinel_path}</code> —— 机器人已被锁定，需手动解除后才能启动。`);
-  }
+  const fragments = [];
   const state = d.state || {};
-  const stuck = ((state.fill_events || {}).stuck_symbols) || [];
-  if (stuck.length) {
-    warnings.push(`成交回报轮询卡住的交易对：<code>${stuck.join('、')}</code>（需人工排查交易所接口）`);
+  const fe = state.fill_events || {};
+
+  if (d.sentinel_present) {
+    fragments.push(`<div>检测到停止锁文件 <code>${d.sentinel_path}</code> —— 机器人已被锁定，需手动解除后才能启动。</div>`);
   }
+
+  // STUCK symbols — distinguish the two very different causes (see
+  // FillEventManager._stuck_reason): "cursor" is a real pagination
+  // stall (ledger-integrity risk, needs operator), "fetch" is a
+  // transient connectivity error (a restart auto-retries).
+  const stuck = fe.stuck_symbols || [];
+  if (stuck.length) {
+    const lastTs = fe.last_ts_ms || {};   // 最后一笔成功拉到的成交时间戳
+    const counts = fe.stuck_count || {};
+    const reasons = fe.stuck_reason || {};
+    for (const sym of stuck) {
+      const cnt = counts[sym] || '?';
+      const wm = lastTs[sym];
+      const wmStr = wm ? `最后成交回报 ${fmtTime(wm)}` : '尚无成功回报记录';
+      const reason = reasons[sym] || 'unknown';
+      const symSafe = sym.replace(/'/g, "\\'");
+
+      let icon, title, detail, explain, btnLabel, hint, rowCls;
+      if (reason === 'cursor') {
+        rowCls = 'stuck-cursor';
+        icon = '⛔';
+        title = `${sym} 成交分页卡死`;
+        detail = `${cnt} 次同毫秒满页 · ${wmStr}`;
+        explain = '交易所在同一毫秒有大量成交，分页游标无法前进，可能漏记成交。' +
+                  '请先在交易所核对该时刻成交是否完整，确认无误后再清除。';
+        btnLabel = '已核实交易所，清除';
+        hint = '清除后需重启机器人';
+      } else if (reason === 'fetch') {
+        rowCls = 'stuck-fetch';
+        icon = '⚠';
+        title = `${sym} 成交回报连续失败`;
+        detail = `${cnt} 次拉取异常 · ${wmStr}`;
+        explain = 'fetch_my_trades 连续失败（多为网络/接口波动）。' +
+                  '重启机器人会自动重试，通常无需手动清除。';
+        btnLabel = '立即清除';
+        hint = '或直接重启机器人自动重试';
+      } else {
+        rowCls = 'stuck-fetch';
+        icon = '⚠';
+        title = `${sym} 成交回报暂停`;
+        detail = `${cnt} 次连续失败 · ${wmStr}`;
+        explain = '历史遗留的暂停标记（无原因记录）。重启机器人会自动重试。';
+        btnLabel = '立即清除';
+        hint = '或直接重启机器人自动重试';
+      }
+
+      fragments.push(`
+        <div class="stuck-row ${rowCls}">
+          <div class="stuck-info">
+            <span class="stuck-sym">${icon} ${title}</span>
+            <span class="stuck-detail">${detail}</span>
+            <span class="stuck-explain">${explain}</span>
+          </div>
+          <div class="stuck-actions">
+            <button class="ghost-btn stuck-clear-btn"
+                    onclick="clearStuck('${symSafe}')"
+                    title="${reason === 'cursor' ? '务必先在交易所核对该时刻成交' : '清除后重启生效'}">
+              ${btnLabel}
+            </button>
+            <span class="stuck-hint">${hint}</span>
+          </div>
+        </div>`);
+    }
+  }
+
+  // Transient fill-poll failures — non-blocking, self-healing. Shown
+  // only when sustained (>=2 consecutive) to avoid flicker on a single
+  // blip. No clear button: a fresh poll auto-recovers; the only effect
+  // is that new entries are paused on each failing tick.
+  const pollFailed = fe.last_poll_failed || [];
+  const failCounts = fe.fetch_fail_count || {};
+  const stuckSet = new Set(stuck);
+  for (const sym of pollFailed) {
+    if (stuckSet.has(sym)) continue;          // already shown as STUCK
+    const cnt = failCounts[sym] || 0;
+    if (cnt < 2) continue;                     // ignore single transient blip
+    fragments.push(`
+      <div class="poll-fail-row">
+        <span class="poll-fail-sym">⏳ ${sym} 成交回报暂时失败</span>
+        <span class="poll-fail-detail">连续 ${cnt} 次 · 本轮已暂停加仓，正在自动重试，无需手动处理</span>
+      </div>`);
+  }
+
   const unknown = state.unknown_overlay || [];
   if (Array.isArray(unknown) && unknown.length) {
-    warnings.push(`存在状态未知的挂单认领：<code>${JSON.stringify(unknown)}</code>`);
+    fragments.push(`<div>存在状态未知的挂单认领：<code>${JSON.stringify(unknown)}</code></div>`);
   }
   if (d.trader.state === 'crashed') {
-    warnings.push(`机器人进程已崩溃（退出码 ${d.trader.exit_code}），请查看实时日志。`);
+    fragments.push(`<div>机器人进程已崩溃（退出码 ${d.trader.exit_code}），请查看实时日志。</div>`);
   }
+
   const card = $('warn-card');
-  if (warnings.length) {
+  if (fragments.length) {
     card.hidden = false;
-    $('warn-list').innerHTML = warnings.map(w => `<div>${w}</div>`).join('');
+    $('warn-list').innerHTML = fragments.join('');
   } else {
     card.hidden = true;
+  }
+}
+
+async function clearStuck(symbol) {
+  const btn = document.querySelector(`.stuck-clear-btn[onclick*="${symbol.replace(/'/g, "\\'")}"]`);
+  if (btn) { btn.disabled = true; btn.textContent = '清除中…'; }
+  try {
+    const res = await fetch('/api/control/clear_stuck', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      // Replace the row with a success message prompting restart
+      const row = btn ? btn.closest('.stuck-row') : null;
+      if (row) {
+        row.innerHTML = `<div class="stuck-cleared">
+          ✅ <strong>${symbol}</strong> 已从状态文件移除 ——
+          点击下方<strong>停止</strong>再<strong>启动</strong>使变更生效
+        </div>`;
+      }
+    } else {
+      alert('清除失败: ' + (data.error || '未知错误'));
+      if (btn) { btn.disabled = false; btn.textContent = '已排查，清除 STUCK'; }
+    }
+  } catch (e) {
+    alert('请求失败: ' + e.message);
+    if (btn) { btn.disabled = false; btn.textContent = '已排查，清除 STUCK'; }
   }
 }
 
@@ -610,11 +721,222 @@ function fmtSpan(ms) {
   return `${(s / 86400).toFixed(1)}d`;
 }
 
+// ─── tabs ─────────────────────────────────────────────────────────
+
+function initTabs() {
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const target = btn.dataset.tab;
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      document.getElementById('tab-' + target).classList.add('active');
+    });
+  });
+}
+
+// ─── backtest / optimize ──────────────────────────────────────────
+
+let btChart = null;
+let btJobId = null;
+let optJobId = null;
+
+async function submitBacktest() {
+  const body = { config: {} };
+  const balance = parseFloat($('bt-balance').value);
+  if (Number.isFinite(balance) && balance > 0) body.config.starting_balance = balance;
+
+  const spacing = parseFloat($('bt-grid-spacing').value);
+  const emaDist = parseFloat($('bt-ema-dist').value);
+  const wel = parseFloat($('bt-wel').value);
+  if (Number.isFinite(spacing))  body.config.grid = { ...(body.config.grid || {}), entry_grid_spacing_pct: spacing };
+  if (Number.isFinite(emaDist))  body.config.grid = { ...(body.config.grid || {}), entry_initial_ema_dist: emaDist };
+  if (Number.isFinite(wel))      body.config.grid = { ...(body.config.grid || {}), wallet_exposure_limit: wel };
+
+  $('btn-bt-run').disabled = true;
+  $('bt-status').textContent = '提交中…';
+  $('bt-result').hidden = true;
+
+  try {
+    const res = await fetch('/api/backtest/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
+    btJobId = data.job_id;
+    showJobProgress('bt', true, 0, '已加入队列…');
+    pollJob(btJobId, 'bt', onBacktestDone);
+  } catch (e) {
+    $('bt-status').textContent = '错误: ' + e.message;
+    $('btn-bt-run').disabled = false;
+  }
+}
+
+async function submitOptimize() {
+  const nTrials = parseInt($('opt-trials').value) || 100;
+  const sampler = $('opt-sampler').value;
+  const wfSplits = parseInt($('opt-wf-splits').value) || 3;
+
+  $('btn-opt-run').disabled = true;
+  $('opt-status').textContent = '提交中…';
+  $('opt-result').hidden = true;
+
+  try {
+    const res = await fetch('/api/optimize/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ n_trials: nTrials, sampler, walk_forward_splits: wfSplits }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
+    optJobId = data.job_id;
+    showJobProgress('opt', true, 0, '已加入队列…');
+    pollJob(optJobId, 'opt', onOptimizeDone);
+  } catch (e) {
+    $('opt-status').textContent = '错误: ' + e.message;
+    $('btn-opt-run').disabled = false;
+  }
+}
+
+function showJobProgress(prefix, visible, pct, msg) {
+  $(`${prefix}-progress-wrap`).hidden = !visible;
+  const bar = $(`${prefix}-progress-bar`);
+  if (bar) bar.style.width = pct + '%';
+  const msgEl = $(`${prefix}-progress-msg`);
+  if (msgEl) msgEl.textContent = msg;
+}
+
+function pollJob(jobId, prefix, onDone) {
+  const tick = async () => {
+    try {
+      const res = await fetch('/api/job/' + jobId, { cache: 'no-store' });
+      if (!res.ok) return;
+      const job = await res.json();
+      showJobProgress(prefix, true, job.progress, job.progress_msg || '运行中…');
+      $(`${prefix}-status`).textContent = job.status === 'running' ? '运行中' : '';
+      if (job.status === 'done' || job.status === 'error') {
+        onDone(job);
+        return;
+      }
+      setTimeout(tick, 800);
+    } catch (e) {
+      setTimeout(tick, 2000);
+    }
+  };
+  tick();
+}
+
+function onBacktestDone(job) {
+  $('btn-bt-run').disabled = false;
+  if (job.status === 'error') {
+    $('bt-status').textContent = '失败: ' + (job.error || '未知错误');
+    showJobProgress('bt', false, 0, '');
+    return;
+  }
+  $('bt-status').textContent = '完成';
+  showJobProgress('bt', true, 100, '回测完成');
+  renderBacktestResult(job.result);
+}
+
+function renderBacktestResult(r) {
+  if (!r) return;
+  const el = $('bt-result');
+  el.hidden = false;
+
+  const fmt = (v, dec=2) => Number.isFinite(v) ? v.toFixed(dec) : '—';
+  const pct = (v) => Number.isFinite(v) ? (v * 100).toFixed(2) + '%' : '—';
+
+  $('bt-metrics').innerHTML = `
+    <div class="metric-card"><div class="metric-val ${r.adg >= 0 ? 'up' : 'down'}">${pct(r.adg)}</div><div class="metric-label">ADG（日收益）</div></div>
+    <div class="metric-card"><div class="metric-val down">${pct(r.max_drawdown)}</div><div class="metric-label">最大回撤</div></div>
+    <div class="metric-card"><div class="metric-val">${fmt(r.sharpe_ratio)}</div><div class="metric-label">Sharpe</div></div>
+    <div class="metric-card"><div class="metric-val">${fmt(r.sortino_ratio)}</div><div class="metric-label">Sortino</div></div>
+    <div class="metric-card"><div class="metric-val">${fmt(r.calmar_ratio)}</div><div class="metric-label">Calmar</div></div>
+    <div class="metric-card"><div class="metric-val">${r.n_trades}</div><div class="metric-label">总成交笔数</div></div>
+    <div class="metric-card"><div class="metric-val">${pct(r.win_rate)}</div><div class="metric-label">胜率</div></div>
+    <div class="metric-card"><div class="metric-val">${fmt(r.duration_days, 0)} 天</div><div class="metric-label">回测时长</div></div>
+    <div class="metric-card"><div class="metric-val ${r.total_pnl >= 0 ? 'up' : 'down'}">${fmtUsd(r.total_pnl)}</div><div class="metric-label">总盈亏</div></div>
+    <div class="metric-card"><div class="metric-val">${fmtUsd(r.total_fees)}</div><div class="metric-label">手续费</div></div>
+    <div class="metric-card"><div class="metric-val ${r.grid_pnl >= 0 ? 'up' : 'down'}">${fmtUsd(r.grid_pnl)}</div><div class="metric-label">Grid 盈亏</div></div>
+    <div class="metric-card"><div class="metric-val ${r.trend_pnl >= 0 ? 'up' : 'down'}">${fmtUsd(r.trend_pnl)}</div><div class="metric-label">Trend 盈亏</div></div>
+  `;
+
+  // Equity chart
+  if (r.equity_curve && r.equity_curve.length > 1) {
+    const tss = r.equity_curve.map(p => p[0]);
+    const eqs = r.equity_curve.map(p => p[1]);
+    if (btChart) btChart.destroy();
+    const ctx = document.getElementById('bt-equity-chart').getContext('2d');
+    btChart = new Chart(ctx, {
+      type: 'line',
+      data: { labels: tss, datasets: [{
+        label: 'equity', data: eqs,
+        borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.10)',
+        borderWidth: 2, tension: 0.2, pointRadius: 0, fill: true,
+      }] },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { display: false }, tooltip: {
+          backgroundColor: '#0a0e1a', borderColor: '#10b981', borderWidth: 1,
+          callbacks: { label: ctx => '$' + ctx.parsed.y.toFixed(2),
+                       title: ctx => new Date(ctx[0].parsed.x).toLocaleDateString('zh-CN') },
+        }},
+        scales: {
+          x: { display: false },
+          y: { ticks: { color: '#6e7689', font: { family: 'JetBrains Mono' } },
+               grid: { color: 'rgba(255,255,255,0.05)' } },
+        },
+      },
+    });
+  }
+}
+
+function onOptimizeDone(job) {
+  $('btn-opt-run').disabled = false;
+  if (job.status === 'error') {
+    $('opt-status').textContent = '失败: ' + (job.error || '未知错误');
+    showJobProgress('opt', false, 0, '');
+    return;
+  }
+  $('opt-status').textContent = '完成';
+  showJobProgress('opt', true, 100, '优化完成');
+  renderOptimizeResult(job.result);
+}
+
+function renderOptimizeResult(r) {
+  if (!r) return;
+  $('opt-result').hidden = false;
+  const fmt = (v, dec=4) => Number.isFinite(Number(v)) ? Number(v).toFixed(dec) : String(v);
+
+  $('opt-metrics').innerHTML = `
+    <div class="metric-card"><div class="metric-val up">${fmt(r.best_value)}</div><div class="metric-label">最优得分</div></div>
+    <div class="metric-card"><div class="metric-val">${r.n_trials}</div><div class="metric-label">完成试验</div></div>
+    <div class="metric-card"><div class="metric-val dim">${r.study_name || '—'}</div><div class="metric-label">Study 名称</div></div>
+  `;
+
+  // Best params as JSON
+  const best = {
+    grid: r.grid || {},
+    trend: r.trend || {},
+    merger: r.merger || {},
+  };
+  $('opt-params-json').textContent = JSON.stringify(best, null, 2);
+}
+
+function attachLabControls() {
+  $('btn-bt-run').addEventListener('click', submitBacktest);
+  $('btn-opt-run').addEventListener('click', submitOptimize);
+}
+
 // ─── boot ─────────────────────────────────────────────────────────
 
 window.addEventListener('DOMContentLoaded', () => {
+  initTabs();
   initChart();
   attachControls();
+  attachLabControls();
   loadEquityHistory();
   loadFills();
   pollStatus();

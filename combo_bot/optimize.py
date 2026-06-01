@@ -153,8 +153,13 @@ class Optimizer:
         )
         return optuna.samplers.TPESampler()
 
-    def run(self) -> dict:
-        """Run the full optimization and return the best parameter set."""
+    def run(self, callbacks: list | None = None) -> dict:
+        """Run the full optimization and return the best parameter set.
+
+        ``callbacks`` is forwarded to ``study.optimize`` and receives
+        ``(study, trial)`` after each completed trial — useful for
+        progress reporting in the web UI without polling Optuna internals.
+        """
         sampler = self._build_sampler()
         study = optuna.create_study(
             study_name=self._config.study_name,
@@ -167,7 +172,8 @@ class Optimizer:
             self._objective,
             n_trials=self._config.n_trials,
             n_jobs=self._config.n_jobs,
-            show_progress_bar=True,
+            show_progress_bar=False,
+            callbacks=callbacks or [],
         )
 
         best = study.best_trial

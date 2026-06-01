@@ -225,8 +225,10 @@ def test_status_endpoint_returns_envelope(monkeypatch):
         assert data["state_file_present"] is False
         assert data["sentinel_present"] is False
         assert "exchange" in data
-        # exchange poll failed → error key present, but the envelope still parses.
-        assert "error" in data["exchange"]
+        # exchange init failed → cache holds the empty-but-well-formed sentinel.
+        assert data["exchange"]["balance"] is None
+        assert data["exchange"]["open_orders_by_symbol"] == {}
+        assert data["exchange"]["positions_by_symbol"] == {}
 
 
 def test_clear_sentinel_removes_file():
