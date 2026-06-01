@@ -21,7 +21,8 @@ Combined grid + trend futures trading bot. Merges Passivbot-style grid logic wit
 
 ```bash
 pip install -e .            # core only
-pip install -e ".[all]"     # core + pandas, pyarrow, optuna
+pip install -e ".[all]"     # core + pandas, pyarrow, optuna, UI deps
+pip install -e ".[ui]"      # core + FastAPI/uvicorn/jinja2 for web UI only
 ```
 
 ### Build Rust extension (required for Rust backtest/optimize paths)
@@ -34,16 +35,21 @@ pip install rust/target/wheels/*.whl
 ### Tests
 
 ```bash
-python -m pytest tests/                     # all Python tests
-python -m pytest tests/test_grid.py -v      # single test file
-cd rust && cargo test --release --lib        # Rust unit tests
+python -m pytest tests/                        # all Python tests
+python -m pytest tests/test_grid.py -v         # single test file
+python -m pytest tests/ -k "not rust" -v       # skip Rust-dependent tests
+cd rust && cargo test --release --lib           # Rust unit tests
 ```
 
-### Lint / format (Rust)
+`tests/test_round_N.py` files are regression snapshots from consecutive tuning rounds — treat them as integration fixtures.
+
+### Lint / format
 
 ```bash
 cd rust && cargo fmt --check
 cd rust && cargo clippy --release
+ruff check .                # Python lint (if ruff is installed)
+black .                     # Python format (if black is installed)
 ```
 
 ### CLI commands
@@ -52,8 +58,23 @@ cd rust && cargo clippy --release
 combo-futures download --exchange binance --symbol BTC/USDT:USDT --timeframe 1h
 combo-futures backtest --config config.json
 combo-futures optimize --config config.json --trials 200
-combo-futures live --config config.json
+combo-futures live --config config.json                   # dry-run (default)
+combo-futures live --config config.json --real            # REAL trading (requires confirmation)
+combo-futures live --config config.json --testnet         # testnet exchange
+combo-futures live --config config.json --clear-stuck     # manually clear persisted fill-stream STUCK state
+combo-futures ui   --config config.json --port 8765       # web console
 ```
+
+State files are segregated by profile: `state.dryrun.json`, `state.testnet.json`, `state.real.json` (overridable via `state_file` in config).
+
+### Web UI launcher
+
+```bash
+./start.sh                  # Linux/terminal — opens http://127.0.0.1:8765
+# macOS: double-click 启动机器人.command
+```
+
+The `ui` command spawns the live trader as a subprocess (`process_manager.py`) and serves a FastAPI dashboard at `combo_bot/webui/`.
 
 ## Architecture
 
@@ -105,6 +126,40 @@ Ranks candidate symbols by a weighted score of volume, volatility, and EMA-readi
 ### Config
 
 `config.example.json` shows the full config schema with nested `grid`, `trend`, `merger`, and `risk` blocks. Copy to `config.json` and set exchange credentials via environment variables or a `.env` file.
+
+### Optional module graph (`combo_bot/fusion_config.py`)
+
+All non-core modules are opt-in — enabled by the presence of their config block. `build_fusion(cfg)` is the single factory that constructs and returns a dict of optional components:
+
+| Module | Config key | Purpose |
+|--------|-----------|---------|
+| `regime.RegimeArbiter` | `regime` | Multi-indicator regime scorer; overlays scale factors on order sizes |
+| `sizing.KellySizer` | `kelly` | Kelly-fraction position sizing tracked per `OrderSource` |
+| `correlation.CorrelationGate` | `correlation` | Blocks entries when pair correlation exceeds threshold |
+| `vol_target.VolTargetSizer` | `vol_target` | Scales orders to hit a target annualised volatility |
+| `protections.ProtectionManager` | `protections[]` | Pluggable per-symbol+side locks (`StoplossGuard`, `CooldownPeriod`, …) |
+| `strategy.IStrategy` | `strategy.class` | Freqtrade-style callback hooks applied on top of the core engine |
+
+All optional modules implement a `filter_orders()` interface and are applied in `LiveTrader._tick()` after the core decision pipeline.
+
+### Reliability infrastructure
+
+- **`intent_journal.py`** — append-only write-ahead log (`live_state.intent_journal.jsonl`) that tracks every order from submission through fill/cancel. Replayed on restart to recover unknown orders without re-querying the exchange.
+- **`fill_events_manager.py`** — deduplicates exchange trade history, bridges confirmed fills to `KellySizer`, `ProtectionManager`, and `AccountState.add_realized_pnl`. Fetches are wrapped in in-tick exponential-backoff retry (`fetch_max_retries` / `fetch_retry_base_ms`) so a transient blip never reaches the fail-closed path. STUCK state is tagged by **reason**: `cursor` (same-ms pagination stall — a real ledger-integrity risk, persisted across restart, needs operator `clear_stuck`) vs `fetch` (transient — never persistently parks; only the single-tick `last_poll_failed` blocks new risk, and it self-heals on the next poll). On restart only `cursor`-reason STUCK is restored.
+- **`freshness.py` (`FreshnessLedger`)** — epoch-based data-surface freshness gate (ported from passivbot). `LiveTrader._tick` calls `begin_epoch()`; each successful refresh `stamp`s its surface (`balance`, `positions`, per-symbol `candle:<symbol>`). A failed per-symbol candle fetch `flag_symbol_block`s that symbol, which `_risk_increasing_blocked` honors; the block self-heals once the surface refreshes at/after `min_epoch`. Not persisted (runtime-only).
+- **`kill_switch.py`** — standalone async utility that cancels all open orders and market-closes all positions for a given symbol list. Can be run as `python -m combo_bot.kill_switch`.
+- **`hsl.py` (`HslSupervisor`)** — pure classification layer (SAFE / WARN / ALERT / HALT) based on drawdown EMA. Has no side effects; enforcement is done by `RiskManager`.
+- **`monitor.py`** — read-only CLI observer: `python -m combo_bot.monitor --config config.json` prints a live snapshot of positions, fills, and exchange state without touching orders.
+
+### Synthetic (reconstructed) realized PnL
+
+`LiveTrader._enrich_fill_pnl` reconstructs `realized_pnl` for reduce-only fills when the exchange returns none (e.g. non-Binance). If the close qty exceeds the locally-known bucket size, the cost basis is incomplete and the fill is flagged **`pnl_degraded`** (`types.Fill.pnl_degraded`). Degraded PnL is still booked to the account ledger (equity / HSL stay whole) but is **withheld from the `KellySizer`** edge estimator, so position sizing never compounds off a guessed PnL.
+
+### Web UI (`combo_bot/webui/`)
+
+- **`server.py`** — FastAPI app. Operator endpoints: `/api/status`, `/api/equity`, `/api/fills`, `/api/logs/stream` (SSE), `/api/control/{start,stop,kill,clear_sentinel,clear_stuck}`. Lab endpoints: `/api/backtest/run`, `/api/optimize/run`, `/api/job/{id}`, `/api/jobs`. Exchange data is refreshed by a background asyncio task (singleton ccxt connection) every 10s rather than per request; fills are read incrementally from the JSONL sidecar; the equity curve is persisted to a `*.equity.jsonl` sidecar so it survives a UI restart. Backtest/optimize run in a thread pool as tracked jobs (capped, oldest finished evicted); optimize results are also written to `<data_dir>/optimize_results/`.
+- **`process_manager.py`** (`TraderProcessManager`) — manages the `combo-futures live` subprocess lifecycle (incl. `--clear-stuck` passthrough), captures stdout, and exposes `start()`/`stop()` coroutines.
+- `static/` + `templates/` — Jinja2 HTML + vanilla JS (Chart.js via CDN with SRI), no build step. Two tabs: the operator dashboard and the backtest/optimize lab.
 
 ### Rust crate (`rust/src/`)
 
