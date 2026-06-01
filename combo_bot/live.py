@@ -47,6 +47,27 @@ from combo_bot.types import RegimeView
 logger = logging.getLogger(__name__)
 
 
+_TIMEFRAME_MS = {
+    "1m": 60_000,
+    "3m": 180_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "1h": 3_600_000,
+    "2h": 7_200_000,
+    "4h": 14_400_000,
+    "6h": 21_600_000,
+    "8h": 28_800_000,
+    "12h": 43_200_000,
+    "1d": 86_400_000,
+}
+
+
+def _timeframe_to_ms(tf: str) -> int:
+    """Bar interval in milliseconds for a ccxt timeframe string."""
+    return _TIMEFRAME_MS.get(str(tf), 60_000)
+
+
 @dataclass
 class LiveConfig:
     symbols: list[str] = field(default_factory=lambda: ["BTC/USDT:USDT"])
@@ -1150,7 +1171,22 @@ class LiveTrader:
                 # drifted from their backtest semantics. Bars with
                 # timestamp <= last_ts are skipped; the last_ts watermark
                 # then advances to the most recent processed bar.
-                new_rows = [r for r in ohlcv if int(r[0]) > last_ts]
+                #
+                # CRITICAL: exclude the still-forming current bar. ccxt
+                # fetch_ohlcv returns the live, un-closed bar as the last
+                # row; feeding it to trend/EMA/volatility would lock those
+                # indicators onto the bar's FIRST polled value (later polls
+                # see ts <= last_ts and skip it), repainting them and
+                # diverging from backtest (which only ever sees closed
+                # bars). A bar is final once open_ts + interval <= now.
+                # last_price below still uses the latest bar for marking.
+                tf_ms = _timeframe_to_ms(self.config.candle_timeframe)
+                bar_close_cutoff = self._now_ms() - tf_ms
+                new_rows = [
+                    r
+                    for r in ohlcv
+                    if int(r[0]) > last_ts and int(r[0]) <= bar_close_cutoff
+                ]
                 for row in new_rows:
                     close_px = float(row[4])
                     self.trend.update(symbol, close_px)
@@ -1279,7 +1315,16 @@ class LiveTrader:
                 continue
             if not ohlcv:
                 continue
-            new_rows = [r for r in ohlcv if int(r[0]) > last_ts]
+            # Same completed-bar gate as the primary feed: never hand the
+            # strategy a still-forming informative bar (repaint + backtest
+            # divergence). Closed once open_ts + interval <= now.
+            tf_ms = _timeframe_to_ms(timeframe)
+            bar_close_cutoff = self._now_ms() - tf_ms
+            new_rows = [
+                r
+                for r in ohlcv
+                if int(r[0]) > last_ts and int(r[0]) <= bar_close_cutoff
+            ]
             for row in new_rows:
                 self.data_provider.append_informative(
                     pair,

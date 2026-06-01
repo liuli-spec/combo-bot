@@ -359,3 +359,25 @@ def test_degraded_fills_withheld_from_kelly_but_booked_to_ledger():
     assert trader.account.grid_realized_pnl != before  # booked
     kelly_fills = [degraded] if not degraded.pnl_degraded else []
     assert kelly_fills == []  # withheld from Kelly
+
+
+def test_refresh_candles_excludes_in_progress_bar():
+    """The still-forming current bar (ccxt returns it as the last OHLCV
+    row) must NOT be fed to trend/EMA/volatility — only closed bars are
+    final. last_price still reflects the latest (live) bar for marking."""
+    trader, ex = _live_trader()
+    sym = "BTC/USDT:USDT"
+    NOW = 1_000_000_000_000
+    trader._now_ms = lambda: NOW  # type: ignore[method-assign]
+    tf = 60_000  # 1m default
+    a_ts, b_ts, c_ts = NOW - 2 * tf, NOW - tf, NOW  # A,B closed; C forming
+    ex.ohlcv = [
+        [a_ts, 100.0, 110.0, 90.0, 101.0, 1.0],
+        [b_ts, 101.0, 111.0, 91.0, 102.0, 1.0],
+        [c_ts, 102.0, 112.0, 92.0, 999.0, 1.0],  # in-progress, distinctive close
+    ]
+    asyncio.run(trader._refresh_candles())
+    # In-progress bar C must NOT advance the indicator watermark…
+    assert trader._last_candle_ts[sym] == b_ts
+    # …but last_price still reflects the latest (live) bar.
+    assert trader.account.symbols[sym].last_price == 999.0
