@@ -153,6 +153,29 @@ All optional modules implement a `filter_orders()` interface and are applied in 
 - **`hsl.py` (`HslSupervisor`)** — pure classification layer (SAFE / WARN / ALERT / HALT) based on drawdown EMA. Has no side effects; enforcement is done by `RiskManager`.
 - **`monitor.py`** — read-only CLI observer: `python -m combo_bot.monitor --config config.json` prints a live snapshot of positions, fills, and exchange state without touching orders.
 
+### ML signal layer (`combo_bot/ml_signal.py`)
+
+A self-contained supervised ML signal inspired by FreqAI + López de Prado's
+triple-barrier labeling. `MLSignalModel` turns an OHLCV window into a
+directional conviction `ml_score ∈ [-1, 1]` (`P(+1) − P(−1)`). **Stage 1 is
+pure model logic — it does not place orders yet** (the ML-driven overlay is
+the next layer). Pieces:
+
+- **Features** (`compute_features`) — causal-only: multi-lag log returns, EMA
+  distance, RSI, realized vol, intrabar range, volume z-score. Each row uses
+  data at indices `<= t` (verified by `test_features_are_causal`).
+- **Labels** (`triple_barrier_labels`) — per bar, vol-scaled profit-take /
+  stop-loss / time barriers; label = which is touched first (+1/−1/0).
+- **Look-ahead guard** — labels look forward `horizon_bars`, so the last
+  `horizon_bars` rows have incomplete windows and are excluded from training
+  (`last_complete_label_index`). This is the headline failure mode for
+  financial ML and is the most-tested part.
+- **Model** — `GradientBoostingClassifier` (shallow trees, low LR =
+  anti-overfit). scikit-learn is an optional dep (`pip install -e ".[ml]"`);
+  if missing, the model stays untrained and `predict_score` returns 0.0.
+- **Lifecycle** — `maybe_retrain(...)` on a sliding window every
+  `retrain_interval` bars, `predict_score(...)` each bar.
+
 ### Synthetic (reconstructed) realized PnL
 
 `LiveTrader._enrich_fill_pnl` reconstructs `realized_pnl` for reduce-only fills when the exchange returns none (e.g. non-Binance). If the close qty exceeds the locally-known bucket size, the cost basis is incomplete and the fill is flagged **`pnl_degraded`** (`types.Fill.pnl_degraded`). Degraded PnL is still booked to the account ledger (equity / HSL stay whole) but is **withheld from the `KellySizer`** edge estimator, so position sizing never compounds off a guessed PnL.
