@@ -39,6 +39,7 @@ class TraderProcessConfig:
     config_path: Path
     testnet: bool
     real: bool
+    clear_stuck: bool = False
     log_buffer_size: int = 2000
     stop_timeout_seconds: float = 20.0
 
@@ -77,6 +78,8 @@ class TraderProcessManager:
                 args.append("--testnet")
             if self.config.real:
                 args.append("--real")
+            if self.config.clear_stuck:
+                args.append("--clear-stuck")
             self.state = TraderState.STARTING
             self.exit_code = None
             self._append_log(f"[ui] launching: {' '.join(args)}\n")

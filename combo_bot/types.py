@@ -137,6 +137,13 @@ class Fill:
     realized_pnl: float
     source: OrderSource
     reduce_only: bool = False
+    # True when realized_pnl was synthesised locally from an INCOMPLETE
+    # basis (e.g. the close qty exceeds the locally-known position size,
+    # so part of the cost basis is unknown). The number is still booked
+    # into the account ledger (equity stays correct) but it must NOT feed
+    # the Kelly edge estimator, which would size up real money off a
+    # low-confidence PnL. See LiveTrader._enrich_fill_pnl.
+    pnl_degraded: bool = False
     # Identity of the originating order. ``exchange_order_id`` and
     # ``client_order_id`` are best-effort and may be empty when the
     # exchange (or test stub) doesn't echo them. Without these the

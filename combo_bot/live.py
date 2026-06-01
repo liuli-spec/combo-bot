@@ -40,6 +40,7 @@ from combo_bot.fill_events_manager import (
     FillEventManager,
     FillEventManagerConfig,
 )
+from combo_bot.freshness import FreshnessLedger, candle_surface
 from combo_bot.intent_journal import IntentJournal
 from combo_bot.types import RegimeView
 
@@ -56,6 +57,9 @@ class LiveConfig:
     max_orders_per_batch: int = 5
     order_match_tolerance_pct: float = 0.002
     state_file: str = "live_state.json"
+    # Clear stuck fill-event symbols on start so a restarted bot can
+    # resume polling even when a previous run left STUCK persisted.
+    clear_stuck_on_start: bool = False
     # Round-28: Freqtrade-style declarative unfilled timeouts. Any
     # pending entry order older than ``unfilledtimeout_entry_seconds``
     # gets cancelled; same for exits. ``None`` (default) disables the
@@ -115,6 +119,11 @@ class LiveTrader:
         # account.add_realized_pnl. Without this layer the Stage 7-11
         # bookkeeping silently no-ops in live (backtest still works).
         self.fill_events = FillEventManager(exchange, fill_events_config)
+        # Epoch-based data-surface freshness gate. Stamps balance /
+        # positions / fills / per-symbol candles each tick; blocks a
+        # symbol's risk-increasing orders when its candle feed (or the
+        # account surfaces) go stale, self-healing once they refresh.
+        self.freshness = FreshnessLedger()
         # Stage 9 — fractional-Kelly trend overlay throttle. Now live
         # too: fills surfaced by FillEventManager are routed in.
         self.kelly_sizer = kelly_sizer
@@ -273,6 +282,12 @@ class LiveTrader:
             return
         await self._init_exchange()
         await self._load_state()
+        # Clear persisted STUCK state on start when the operator opts in.
+        # The stuck detector is fail-safe (blocks entries), but a restart
+        # is often enough for the exchange pagination to have advanced.
+        if self.config.clear_stuck_on_start:
+            for sym in list(self.fill_events._stuck_symbols):
+                self.fill_events.clear_stuck(sym)
         # Replay the durable intent journal — this is what closes the
         # crash window between create_order ack and _save_state. Any
         # non-terminal cID gets its attribution restored to
@@ -370,6 +385,10 @@ class LiveTrader:
                     )
 
     async def _tick(self):
+        # Advance the freshness epoch once per tick. Each successful
+        # surface refresh below stamps it; stale surfaces leave their
+        # epoch behind and gate the affected symbols.
+        self.freshness.begin_epoch()
         # Pull fills first so source-isolated buckets (especially TREND)
         # are updated before aggregate exchange positions are split into
         # grid-vs-trend in _refresh_account.
@@ -387,11 +406,23 @@ class LiveTrader:
         # block the main tick.
         await self._refresh_informative_candles()
 
-        # Round-25 P1 #1: Freqtrade order is refresh→bot_loop_start
-        # →analyze. So bot_loop_start runs AFTER all data refresh
-        # (fills, account, candles) but BEFORE the populate_* pass.
-        # populate_* runs immediately after, scoped to symbols that
-        # actually got new bars this tick.
+        # Equity must be current before strategy hooks read it (matches
+        # backtest ordering: update_equity → bot_loop_start → populate_*).
+        # Previously update_equity ran AFTER bot_loop_start, meaning any
+        # strategy that inspected account.equity or source bucket equity
+        # for sizing decisions would see the previous tick's value.
+        self.account.update_equity()
+        # Feed the vol-target sizer's rolling equity sample so live
+        # actually warms up the same way backtest does. Without this
+        # call the sizer stayed at cold-start (scale=1.0) forever in
+        # live — vol-targeting was effectively a no-op once turned on,
+        # silently disabling the Stage 11 portfolio-vol throttle.
+        if self.vol_target_sizer is not None:
+            self.vol_target_sizer.record_equity(self.account.equity)
+
+        # bot_loop_start fires AFTER all data refresh + equity update
+        # but BEFORE populate_* — Freqtrade-style ordering so any
+        # instance vars the hook sets are visible to populate callbacks.
         try:
             from datetime import datetime, timezone
 
@@ -402,15 +433,6 @@ class LiveTrader:
         for sym_with_new in self._symbols_with_new_bars:
             self._apply_strategy_populates(sym_with_new)
         self._symbols_with_new_bars.clear()
-
-        self.account.update_equity()
-        # Feed the vol-target sizer's rolling equity sample so live
-        # actually warms up the same way backtest does. Without this
-        # call the sizer stayed at cold-start (scale=1.0) forever in
-        # live — vol-targeting was effectively a no-op once turned on,
-        # silently disabling the Stage 11 portfolio-vol throttle.
-        if self.vol_target_sizer is not None:
-            self.vol_target_sizer.record_equity(self.account.equity)
         all_desired_orders: list[Order] = []
 
         # Round-24 per-side active sets — see the parallel comment in
@@ -804,7 +826,7 @@ class LiveTrader:
             all_desired_orders, _resolve_ctx
         )
 
-        await self._reconcile_orders(all_desired_orders)
+        reconcile_stats = await self._reconcile_orders(all_desired_orders)
         # Round-13 P1.a: try to resolve any unknown-state overlays via
         # the exchange before persisting state. Successful resolves
         # are journaled (terminal) so compaction can evict them.
@@ -812,11 +834,14 @@ class LiveTrader:
         await self._save_state()
 
         logger.info(
-            "tick | balance=%.2f equity=%.2f dd=%.4f orders=%d",
+            "tick | balance=%.2f equity=%.2f dd=%.4f desired=%d "
+            "create_attempted=%d cancel_attempted=%d",
             self.account.balance,
             self.account.equity,
             self.account.drawdown,
-            len(all_desired_orders),
+            reconcile_stats["desired"],
+            reconcile_stats["create_attempted"],
+            reconcile_stats["cancel_attempted"],
         )
         # Round-29 diagnostic: per-symbol state so the operator can
         # see WHY orders=0 (EMA not init / mode TP_ONLY / no signal /
@@ -955,6 +980,14 @@ class LiveTrader:
         except Exception:
             logger.exception("Failed to refresh account")
             return False
+
+        # Account surfaces refreshed OK this tick — stamp them so any
+        # symbol block that required fresh account state can self-heal.
+        _acct_now = self._now_ms()
+        self.freshness.stamp(
+            "balance", signature=self.account.balance, now_ms=_acct_now
+        )
+        self.freshness.stamp("positions", now_ms=_acct_now)
 
         # Funding rates feed into the regime arbiter's overlay veto. Best-effort:
         # if the exchange doesn't support it or the call fails, keep zeros so
@@ -1201,8 +1234,26 @@ class LiveTrader:
                 for pos in (ss.position_short, ss.trend_short):
                     if pos.is_open:
                         pos.update_best_price(low, Side.SHORT)
+                # Candle surface for this symbol refreshed OK — stamp it
+                # so a prior staleness block can self-heal. Signature is
+                # the latest bar timestamp (changes only on a new bar).
+                self.freshness.stamp(
+                    candle_surface(symbol),
+                    signature=self._last_candle_ts.get(symbol),
+                    now_ms=self._now_ms(),
+                )
             except Exception:
                 logger.exception("Failed to fetch candles for %s", symbol)
+                # Per-symbol candle feed is stale — block risk-increasing
+                # orders for THIS symbol until its candle surface refreshes
+                # at/after the next epoch. Self-heals on the next good poll.
+                self.freshness.flag_symbol_block(
+                    symbol,
+                    reason="candle_fetch_failed",
+                    required_surfaces={candle_surface(symbol)},
+                    min_epoch=self.freshness.epoch + 1,
+                    detected_ms=self._now_ms(),
+                )
 
     async def _refresh_informative_candles(self) -> None:
         """Round-27: poll exchange OHLCV for every registered
@@ -1369,7 +1420,13 @@ class LiveTrader:
             # fills within a tick.
             self.protections.update(enriched, self.account, now_ms)
             if self.kelly_sizer is not None:
-                self.kelly_sizer.record_fills(enriched)
+                # Withhold degraded-PnL fills from the Kelly edge estimator
+                # — their realized_pnl was reconstructed on an incomplete
+                # basis and would bias position sizing. They're still in
+                # the account ledger (above) so equity / HSL stay correct.
+                kelly_fills = [f for f in enriched if not f.pnl_degraded]
+                if kelly_fills:
+                    self.kelly_sizer.record_fills(kelly_fills)
 
             # Round-28: dispatch strategy.order_filled AFTER bucket /
             # balance / PnL bookkeeping so the strategy sees the
@@ -1408,6 +1465,10 @@ class LiveTrader:
                 await self.fill_events.poll(symbol, now_ms, _sink)
             except Exception:
                 logger.exception("fill-event poll failed for %s", symbol)
+                # Unexpected escape from poll(): mark the failure so
+                # _risk_increasing_blocked refuses new entries this tick
+                # and the stuck escalation counter advances.
+                self.fill_events.record_poll_failure(symbol)
 
     def _apply_strategy_populates(self, symbol: str) -> None:
         """Mirror of Backtester._apply_strategy_populates — call the
@@ -1482,7 +1543,7 @@ class LiveTrader:
 
         return replace(order, qty=new_qty)
 
-    async def _reconcile_orders(self, desired: list[Order]):
+    async def _reconcile_orders(self, desired: list[Order]) -> dict[str, int]:
         now_ms = self._now_ms()
         # Quantize / revalidate every desired order to its post-send
         # form FIRST so dedup keys, reconcile matching, and the eventual
@@ -1496,6 +1557,7 @@ class LiveTrader:
             if q is not None:
                 quantized.append(q)
         desired = quantized
+        desired_count = len(desired)
         # ── prune stale dedup + cOID cache BEFORE stamping ────────
         # Order matters: stamping cOIDs first would refresh the ts of
         # any expired-but-recurring identity (the _assign_cid path
@@ -1553,6 +1615,7 @@ class LiveTrader:
         # qty and silently cross-blocked them).
         recent_create_keys = {ident for (_, ident) in self._recent_creates}
         recent_cancel_ids = {oid for (_, oid) in self._recent_cancels}
+        risk_blocked_cache: dict[str, bool] = {}
 
         to_cancel = []
         to_create = []
@@ -1590,8 +1653,13 @@ class LiveTrader:
                         d.side,
                     ) in self._state_change_keys and not d.reduce_only:
                         continue
-                    if not d.reduce_only and self._risk_increasing_blocked(symbol):
-                        continue
+                    if not d.reduce_only:
+                        blocked = risk_blocked_cache.get(symbol)
+                        if blocked is None:
+                            blocked = self._risk_increasing_blocked(symbol)
+                            risk_blocked_cache[symbol] = blocked
+                        if blocked:
+                            continue
                     if symbol in open_order_refresh_failed:
                         # Without an authoritative open-orders snapshot,
                         # a duplicate limit-close ladder would double-
@@ -1721,16 +1789,25 @@ class LiveTrader:
         # create orders again on those (symbol, side) pairs.
         self._state_change_keys.clear()
 
+        cancel_attempted = 0
         for e in to_cancel[: self.config.max_orders_per_batch]:
+            cancel_attempted += 1
             await self._cancel_order(e)
 
+        create_attempted = 0
         for d in to_create[: self.config.max_orders_per_batch]:
             # cOID was stamped at the top of _reconcile_orders. Record
             # the FULL desired identity tuple BEFORE the API call so
             # the next tick sees this order as in-flight even if the
             # exchange hasn't yet confirmed.
             self._recent_creates.append((now_ms, self._desired_identity(d)))
+            create_attempted += 1
             await self._create_order(d)
+        return {
+            "desired": desired_count,
+            "create_attempted": create_attempted,
+            "cancel_attempted": cancel_attempted,
+        }
 
     def _risk_increasing_blocked(self, symbol: str) -> bool:
         """Return True when local safety state is too stale to add risk."""
@@ -1752,6 +1829,15 @@ class LiveTrader:
                 "[reconcile] %s last fill poll failed — blocking new "
                 "entries for this tick",
                 symbol,
+            )
+            return True
+        if self.freshness.is_blocked(symbol):
+            block = self.freshness.block_for(symbol)
+            logger.warning(
+                "[reconcile] %s freshness-blocked (%s) — data surface stale, "
+                "blocking new entries until it refreshes",
+                symbol,
+                block.reason if block else "stale",
             )
             return True
         return False
@@ -2862,7 +2948,25 @@ class LiveTrader:
             pnl = fill.qty * (bucket.entry_price - fill.price) * c_mult
         from dataclasses import replace as _replace
 
-        return _replace(fill, realized_pnl=pnl)
+        # passivbot-style degraded flag: if the close qty exceeds the
+        # locally-known position size, the cost basis for the excess is
+        # unknown, so the reconstructed PnL is only partially trustworthy.
+        # We still book it (equity stays whole) but mark it so the Kelly
+        # edge estimator skips it — sizing real money off a guessed PnL
+        # is exactly the failure we want to avoid.
+        degraded = fill.qty > bucket.size + 1e-9
+        if degraded:
+            logger.warning(
+                "[fill] %s %s reduce qty %.8f exceeds known %s size %.8f — "
+                "PnL reconstructed on incomplete basis (degraded); booked to "
+                "ledger but withheld from Kelly",
+                fill.symbol,
+                fill.side.value,
+                fill.qty,
+                fill.source.value,
+                bucket.size,
+            )
+        return _replace(fill, realized_pnl=pnl, pnl_degraded=degraded)
 
     def _apply_fill_to_trend_bucket(self, order: Order, filled_qty: float) -> None:
         """Update the local trend bucket after a confirmed trend order.
@@ -3035,6 +3139,11 @@ class LiveTrader:
             # the cold-start window means hours of mis-sized overlay).
             "grid_realized_pnl": self.account.grid_realized_pnl,
             "trend_realized_pnl": self.account.trend_realized_pnl,
+            # grid_equity / trend_equity = realized + current unrealized.
+            # Persisted so the UI can show true source equity without
+            # re-deriving unrealized PnL from position buckets + prices.
+            "grid_equity": self.account.grid_equity,
+            "trend_equity": self.account.trend_equity,
             "grid_equity_peak": self.account.grid_equity_peak,
             "trend_equity_peak": self.account.trend_equity_peak,
             # Rolling 24h loss logs feed unstuck allowance — persist

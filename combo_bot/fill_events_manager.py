@@ -36,6 +36,7 @@ tick will skip the fetch.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -56,6 +57,15 @@ class FillEventManagerConfig:
     # Where the bookkeeping ledger of seen trade IDs lives, capped so a
     # long-running bot doesn't grow unbounded.
     dedup_capacity: int = 4_096
+    # In-tick exponential-backoff retry for fetch_my_trades (freqtrade
+    # @retrier style). A single transient blip (network, brief rate
+    # limit) is retried in-place BEFORE it reaches the fail-closed path,
+    # so it never accumulates toward a fetch-fail count or pauses the
+    # tick. Total attempts = fetch_max_retries + 1. Delay per retry =
+    # fetch_retry_base_ms * 2**attempt (e.g. 500ms, 1000ms). Set
+    # fetch_max_retries=0 to disable (every failure is immediate).
+    fetch_max_retries: int = 2
+    fetch_retry_base_ms: int = 500
 
 
 class FillEventManager:
@@ -85,8 +95,26 @@ class FillEventManager:
         # _stuck_symbols after a few attempts so a single anomalous
         # poll doesn't pause a real-money feed.
         self._stuck_count: dict[str, int] = {}
+        # WHY each symbol is parked. Two very different conditions share
+        # the escalation machinery, but must be treated differently
+        # across a restart:
+        #   "cursor" — same-millisecond pagination stall. A genuine
+        #              ledger-integrity risk (unfetched same-ms siblings
+        #              exist on the exchange). MUST survive restart.
+        #   "fetch"  — fetch_my_trades raised repeatedly. A transient
+        #              connectivity / API condition. A fresh process is
+        #              the natural remedy, so this is DROPPED on restart
+        #              and re-detected within the session if it persists.
+        self._stuck_reason: dict[str, str] = {}
         # How many consecutive stuck polls before we hard-stop.
         self._stuck_escalate_after: int = 3
+        # Consecutive fetch_my_trades failures per symbol. Distinct from
+        # the cursor-stuck ``_stuck_count``: a fetch failure is transient
+        # and never parks the symbol persistently (handled by the
+        # single-tick last_poll_failed signal). This counter only drives
+        # one loud ERROR at the escalation threshold for operator
+        # visibility, and resets on the next successful poll.
+        self._fetch_fail_count: dict[str, int] = {}
         # Per-symbol "last actual poll attempt failed" flag. Distinct
         # from ``_stuck_symbols`` (which is the persistent operator-
         # required block); this is the lighter signal "we couldn't
@@ -183,6 +211,13 @@ class FillEventManager:
             "seen_ids": {sym: list(ids) for sym, ids in self._seen_ids.items()},
             "stuck_symbols": sorted(self._stuck_symbols),
             "stuck_count": dict(self._stuck_count),
+            "stuck_reason": dict(self._stuck_reason),
+            # Single-tick fail-closed signal — surfaced so the web UI can
+            # show a transient "fill poll failing" notice (non-blocking,
+            # no operator action needed). NOT restored on load (it's a
+            # runtime signal; a fresh poll re-evaluates it).
+            "last_poll_failed": sorted(self._last_poll_failed_symbols),
+            "fetch_fail_count": dict(self._fetch_fail_count),
             "order_source": {
                 oid: source.value for oid, source in self.order_source.items()
             },
@@ -225,16 +260,50 @@ class FillEventManager:
                 if isinstance(ids, list)
             }
 
+        raw_reason = data.get("stuck_reason") or {}
+        reason_map: dict[str, str] = (
+            {str(sym): str(r) for sym, r in raw_reason.items()}
+            if isinstance(raw_reason, dict)
+            else {}
+        )
+
         raw_stuck = data.get("stuck_symbols") or []
         if isinstance(raw_stuck, list):
-            self._stuck_symbols = {str(sym) for sym in raw_stuck if sym}
+            # Only RESTORE a STUCK park whose reason is "cursor" — a real
+            # same-ms pagination stall that the operator must clear. A
+            # "fetch" reason (transient connectivity) is dropped: a fresh
+            # process re-attempts the fetch, and if it still fails the
+            # detector re-escalates within the session. Legacy state files
+            # have no reason tag; treat missing/unknown as transient (the
+            # common case is fetch-failure, and a genuine cursor-stuck
+            # self-re-detects on the next poll), so they don't trap the
+            # bot in a permanent block across restarts.
+            all_stuck = {str(sym) for sym in raw_stuck if sym}
+            self._stuck_symbols = {
+                sym for sym in all_stuck if reason_map.get(sym) == "cursor"
+            }
+            self._stuck_reason = {
+                sym: reason_map[sym] for sym in self._stuck_symbols
+            }
+            dropped = all_stuck - self._stuck_symbols
+            if dropped:
+                import logging as _log
+                _log.getLogger(__name__).warning(
+                    "[fill_events] dropped %d transient STUCK entr%s on load: %s "
+                    "(reason=fetch/unknown — restart retries; cursor-stuck "
+                    "self-re-detects). Kept (cursor-stuck): %s",
+                    len(dropped),
+                    "y" if len(dropped) == 1 else "ies",
+                    sorted(dropped),
+                    sorted(self._stuck_symbols) or "none",
+                )
 
         raw_stuck_count = data.get("stuck_count") or {}
         if isinstance(raw_stuck_count, dict):
             self._stuck_count = {
                 str(sym): int(count)
                 for sym, count in raw_stuck_count.items()
-                if self._can_int(count)
+                if self._can_int(count) and str(sym) in self._stuck_symbols
             }
 
         raw_sources = data.get("order_source") or {}
@@ -289,35 +358,51 @@ class FillEventManager:
         return symbol in self._last_poll_failed_symbols
 
     def _record_fetch_failure(self, symbol: str) -> None:
-        """Treat fetch_my_trades exceptions exactly like the same-ms
-        stuck-pagination escalation — once trade history can't be
-        confirmed for N consecutive polls, the fill ledger for that
-        symbol is unsafe and the symbol must be parked so live stops
-        adding new exposure. Also tags this symbol's last-poll-failed
-        flag so the CURRENT tick refuses to add risk even before the
-        escalation threshold is reached.
+        """Record a fetch_my_trades exception.
+
+        A fetch failure is TRANSIENT (network / API / testnet blip), not
+        a ledger-integrity stall. It is handled entirely by the
+        single-tick ``last_poll_failed`` signal: the CURRENT tick refuses
+        to add risk (see :meth:`last_poll_failed` →
+        ``_risk_increasing_blocked``), and the next successful poll clears
+        it. We deliberately do NOT escalate to the persistent
+        ``_stuck_symbols`` set the way cursor-stuck (same-ms pagination)
+        does — a fetch error needs no cross-restart park and no operator
+        ``clear_stuck`` call; a fresh poll (this tick or after a restart)
+        is the natural remedy. We still count consecutive failures so a
+        SUSTAINED outage gets one loud ERROR for operator visibility.
         """
         self._last_poll_failed_symbols.add(symbol)
-        self._stuck_count[symbol] = self._stuck_count.get(symbol, 0) + 1
-        cnt = self._stuck_count[symbol]
-        if cnt >= self._stuck_escalate_after:
-            self._stuck_symbols.add(symbol)
+        self._fetch_fail_count[symbol] = self._fetch_fail_count.get(symbol, 0) + 1
+        cnt = self._fetch_fail_count[symbol]
+        if cnt == self._stuck_escalate_after:
+            # One loud ERROR at the escalation threshold — a sustained
+            # fetch outage the operator should look at. No persistent
+            # park: new entries are already blocked every failing tick.
             logger.error(
-                "[fill_events] %s STUCK after %d consecutive "
-                "fetch_my_trades failures — pausing fill ingestion. "
-                "Operator must investigate and call clear_stuck(%r).",
+                "[fill_events] %s fetch_my_trades has failed %d times in a "
+                "row — new entries are blocked each failing tick and the "
+                "feed auto-retries. If this persists, investigate the "
+                "exchange / API (key, rate limit, testnet outage).",
                 symbol,
                 cnt,
-                symbol,
             )
         else:
             logger.warning(
-                "[fill_events] %s fetch_my_trades failed (attempt %d/%d)"
+                "[fill_events] %s fetch_my_trades failed (attempt %d)"
                 " — will retry next poll",
                 symbol,
                 cnt,
-                self._stuck_escalate_after,
             )
+
+    def record_poll_failure(self, symbol: str) -> None:
+        """Mark an unexpected poll failure from outside the poll loop.
+
+        Call from the outer ``except`` handler around :meth:`poll` when
+        an exception escapes before the internal failure-tracking code
+        runs. Ensures ``last_poll_failed`` is set for the current tick
+        (blocking new risk) and advances the stuck escalation counter."""
+        self._record_fetch_failure(symbol)
 
     def clear_stuck(self, symbol: str) -> None:
         """Operator-callable reset for a symbol parked by the
@@ -325,11 +410,66 @@ class FillEventManager:
         the exchange's fill stream is making forward progress again."""
         self._stuck_symbols.discard(symbol)
         self._stuck_count.pop(symbol, None)
+        self._stuck_reason.pop(symbol, None)
         logger.warning("[fill_events] %s manually cleared from stuck set", symbol)
 
     def is_stuck(self, symbol: str) -> bool:
         """True when fill ingestion for ``symbol`` is parked and unsafe."""
         return symbol in self._stuck_symbols
+
+    async def _fetch_trades_page(
+        self, symbol: str, cursor: int | None, from_id: str | None
+    ) -> list[dict]:
+        """Fetch one page of trades with in-tick exponential-backoff retry.
+
+        A single transient ``fetch_my_trades`` error (network blip, brief
+        rate limit) is retried in-place with backoff before giving up, so
+        it never reaches the fail-closed path. Only a SUSTAINED failure
+        (all attempts exhausted) propagates to the caller, which then
+        records the fetch failure. Mirrors freqtrade's ``@retrier``:
+        total attempts = ``fetch_max_retries + 1``.
+
+        The ccxt-signature ``TypeError`` fallback (some brokers reject the
+        ``params`` kwarg) is handled inside each attempt.
+        """
+        attempts = max(1, self.config.fetch_max_retries + 1)
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                params = {"fromId": from_id} if from_id is not None else None
+                try:
+                    return await self.exchange.fetch_my_trades(
+                        symbol,
+                        since=cursor,
+                        limit=self.config.page_size,
+                        params=params,
+                    )
+                except TypeError:
+                    # ccxt fetch_my_trades signature varies — fall back to
+                    # the no-params form when the broker doesn't accept it.
+                    return await self.exchange.fetch_my_trades(
+                        symbol,
+                        since=cursor,
+                        limit=self.config.page_size,
+                    )
+            except Exception as exc:
+                last_exc = exc
+                if attempt < attempts - 1:
+                    delay_ms = self.config.fetch_retry_base_ms * (2**attempt)
+                    logger.warning(
+                        "[fill_events] %s fetch_my_trades attempt %d/%d failed "
+                        "(%s) — retrying in %dms",
+                        symbol,
+                        attempt + 1,
+                        attempts,
+                        exc,
+                        delay_ms,
+                    )
+                    if delay_ms > 0:
+                        await asyncio.sleep(delay_ms / 1000.0)
+        # Exhausted — propagate so the caller fails the page closed.
+        assert last_exc is not None
+        raise last_exc
 
     async def poll(
         self,
@@ -397,39 +537,17 @@ class FillEventManager:
         pagination_interrupted = False
         for _ in range(max_pages):
             try:
-                params = {}
-                if last_seen_trade_id is not None:
-                    # Best-effort fromId hint — Binance USDM honors it.
-                    params["fromId"] = last_seen_trade_id
-                page = await self.exchange.fetch_my_trades(
-                    symbol,
-                    since=cursor,
-                    limit=self.config.page_size,
-                    params=params if params else None,
+                page = await self._fetch_trades_page(
+                    symbol, cursor, last_seen_trade_id
                 )
-            except TypeError:
-                # ccxt fetch_my_trades signature varies — fall back to
-                # the no-params form when the broker doesn't accept it.
-                try:
-                    page = await self.exchange.fetch_my_trades(
-                        symbol,
-                        since=cursor,
-                        limit=self.config.page_size,
-                    )
-                except Exception:
-                    logger.exception(
-                        "fetch_my_trades failed for %s since=%s",
-                        symbol,
-                        cursor,
-                    )
-                    self._record_fetch_failure(symbol)
-                    pagination_interrupted = True
-                    break
             except Exception:
+                # All in-tick retries exhausted — now it's a real failure.
                 logger.exception(
-                    "fetch_my_trades failed for %s since=%s",
+                    "fetch_my_trades failed for %s since=%s (after %d retr%s)",
                     symbol,
                     cursor,
+                    self.config.fetch_max_retries,
+                    "y" if self.config.fetch_max_retries == 1 else "ies",
                 )
                 self._record_fetch_failure(symbol)
                 pagination_interrupted = True
@@ -442,6 +560,7 @@ class FillEventManager:
                 # Short page = clean drain; any transient stuck
                 # counter resets so a future blip doesn't escalate.
                 self._stuck_count.pop(symbol, None)
+                self._stuck_reason.pop(symbol, None)
                 break
             page_max = max(int(p.get("timestamp") or 0) for p in page)
             page_max_id = page[-1].get("id")
@@ -461,6 +580,10 @@ class FillEventManager:
                 cnt = self._stuck_count[symbol]
                 if cnt >= self._stuck_escalate_after:
                     self._stuck_symbols.add(symbol)
+                    # Tag "cursor" — a genuine same-ms pagination stall
+                    # with unfetched siblings. Survives restart so the
+                    # integrity block isn't lost on a crash-recovery.
+                    self._stuck_reason[symbol] = "cursor"
                     logger.error(
                         "[fill_events] %s STUCK after %d consecutive "
                         "same-ms full-page polls (ts=%s) — pausing fill "
@@ -485,6 +608,12 @@ class FillEventManager:
                 break
             cursor = page_max
             last_seen_trade_id = str(page_max_id) if page_max_id is not None else None
+        # The pagination loop finished without a fetch exception → this
+        # was a successful poll. Clear the consecutive fetch-failure
+        # counter so a past blip doesn't carry forward. (A sink failure
+        # below re-arms it via _record_fetch_failure.)
+        if not pagination_interrupted:
+            self._fetch_fail_count.pop(symbol, None)
         if not trades:
             return []
 
@@ -564,10 +693,9 @@ class FillEventManager:
                     symbol,
                 )
                 # Record as a fetch-style failure so live blocks new
-                # entries this tick AND eventually escalates to STUCK
-                # if it keeps happening. Don't commit ANYTHING from
-                # this poll — staged_seen + staged_watermark are
-                # dropped so the next poll re-fetches.
+                # entries this tick (via last_poll_failed). Don't commit
+                # ANYTHING from this poll — staged_seen + staged_watermark
+                # are dropped so the next poll re-fetches.
                 self._record_fetch_failure(symbol)
                 return []
 

@@ -240,6 +240,7 @@ def cmd_live(args):
     live_cfg = LiveConfig(
         symbols=cfg.get("symbols", []),
         leverage=cfg.get("leverage", 5),
+        clear_stuck_on_start=args.clear_stuck,
         margin_mode=cfg.get("margin_mode", "cross"),
         dry_run=not args.real,
         candle_timeframe=timeframe,
@@ -291,7 +292,8 @@ def cmd_live(args):
     async def run():
         try:
             await trader.start()
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            logger.info("Shutdown requested; stopping live trader")
             await trader.stop()
         finally:
             await exchange.close()
@@ -338,6 +340,11 @@ def main():
         "--real", action="store_true", help="Real trading (not dry run)"
     )
     p_live.add_argument("--testnet", action="store_true", help="Use testnet")
+    p_live.add_argument(
+        "--clear-stuck",
+        action="store_true",
+        help="Clear persisted STUCK fill-event state on start",
+    )
 
     p_status = sub.add_parser(
         "status", help="Print one-shot live trader snapshot (state + exchange)"
@@ -369,6 +376,11 @@ def main():
         "--real",
         action="store_true",
         help="Pass --real when the UI's Start button launches the trader.",
+    )
+    p_ui.add_argument(
+        "--clear-stuck",
+        action="store_true",
+        help="Pass --clear-stuck when the UI's Start button launches the trader.",
     )
     p_ui.add_argument("--host", default="127.0.0.1")
     p_ui.add_argument("--port", type=int, default=8765)
@@ -426,6 +438,7 @@ def main():
             config_path=Path(args.config),
             testnet=args.testnet,
             real=args.real,
+            clear_stuck=args.clear_stuck,
             host=args.host,
             port=args.port,
         )

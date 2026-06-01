@@ -19,7 +19,13 @@ from pathlib import Path
 # ────────────────────────────────────────────────────────────────────
 
 
-def test_fetch_my_trades_exception_escalates_to_stuck():
+def test_fetch_my_trades_failure_blocks_tick_but_does_not_park():
+    """A fetch_my_trades outage is TRANSIENT: it must fail-close the
+    current tick (last_poll_failed) but must NOT escalate to the
+    persistent ``_stuck_symbols`` set. Persistent parking is reserved
+    for cursor-stuck (same-ms pagination) — a ledger-integrity stall
+    that needs operator review. A fetch error needs no clear_stuck and
+    no cross-restart park; a fresh poll is the natural remedy."""
     from combo_bot.fill_events_manager import (
         FillEventManager,
         FillEventManagerConfig,
@@ -35,18 +41,55 @@ def test_fetch_my_trades_exception_escalates_to_stuck():
 
     mgr = FillEventManager(
         _BrokenEx(),
-        FillEventManagerConfig(poll_interval_ms=0),
+        FillEventManagerConfig(poll_interval_ms=0, fetch_max_retries=0),
     )
     mgr._stuck_escalate_after = 3
     sym = "BTC/USDT:USDT"
-    # 3 consecutive failures escalate.
-    for i in range(3):
+    # Many consecutive failures — well past the escalation threshold.
+    for i in range(5):
         asyncio.run(mgr.poll(sym, now_ms=i, sink=lambda fs: None))
-    assert sym in mgr._stuck_symbols, (
-        "fetch_my_trades failures must accumulate in the same stuck "
-        "counter same-ms-pagination uses; both signals mean the fill "
-        "ledger is unsafe"
+    # NOT parked persistently …
+    assert sym not in mgr._stuck_symbols, (
+        "fetch failures must not park the symbol persistently"
     )
+    # … but the current tick is fail-closed, and the consecutive-fail
+    # counter tracked the outage for the operator-visibility ERROR.
+    assert mgr.last_poll_failed(sym) is True
+    assert mgr._fetch_fail_count.get(sym) == 5
+
+
+def test_fetch_fail_count_resets_after_recovery():
+    """Once fetch_my_trades succeeds again, the consecutive-failure
+    counter resets and the fail-closed flag clears."""
+    from combo_bot.fill_events_manager import (
+        FillEventManager,
+        FillEventManagerConfig,
+    )
+
+    class _RecoverEx:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetch_my_trades(self, *a, **k):
+            self.calls += 1
+            if self.calls <= 2:
+                raise RuntimeError("down")
+            return []
+
+    mgr = FillEventManager(
+        _RecoverEx(),
+        FillEventManagerConfig(poll_interval_ms=0, fetch_max_retries=0),
+    )
+    mgr._stuck_escalate_after = 3
+    sym = "BTC/USDT:USDT"
+    asyncio.run(mgr.poll(sym, now_ms=0, sink=lambda fs: None))
+    asyncio.run(mgr.poll(sym, now_ms=1, sink=lambda fs: None))
+    assert mgr._fetch_fail_count.get(sym) == 2
+    # Recovery poll — empty page is a clean success.
+    asyncio.run(mgr.poll(sym, now_ms=2, sink=lambda fs: None))
+    assert mgr._fetch_fail_count.get(sym, 0) == 0
+    assert mgr.last_poll_failed(sym) is False
+    assert sym not in mgr._stuck_symbols
 
 
 def test_pagination_interrupted_holds_watermark_inside_stuck_ms():
@@ -85,7 +128,7 @@ def test_pagination_interrupted_holds_watermark_inside_stuck_ms():
 
     mgr = FillEventManager(
         _PartialEx(),
-        FillEventManagerConfig(poll_interval_ms=0, page_size=2),
+        FillEventManagerConfig(poll_interval_ms=0, page_size=2, fetch_max_retries=0),
     )
     sym = "BTC/USDT:USDT"
     asyncio.run(mgr.poll(sym, now_ms=0, sink=lambda fs: None))
@@ -117,7 +160,7 @@ def test_last_poll_failed_clears_after_clean_poll():
 
     mgr = FillEventManager(
         _RecoverEx(),
-        FillEventManagerConfig(poll_interval_ms=0),
+        FillEventManagerConfig(poll_interval_ms=0, fetch_max_retries=0),
     )
     sym = "BTC/USDT:USDT"
     asyncio.run(mgr.poll(sym, now_ms=0, sink=lambda fs: None))
@@ -146,7 +189,7 @@ def test_fetch_my_trades_transient_failure_does_not_escalate():
 
     mgr = FillEventManager(
         _BlinkEx(),
-        FillEventManagerConfig(poll_interval_ms=0),
+        FillEventManagerConfig(poll_interval_ms=0, fetch_max_retries=0),
     )
     mgr._stuck_escalate_after = 3
     sym = "BTC/USDT:USDT"
@@ -154,6 +197,79 @@ def test_fetch_my_trades_transient_failure_does_not_escalate():
     asyncio.run(mgr.poll(sym, now_ms=1, sink=lambda fs: None))
     asyncio.run(mgr.poll(sym, now_ms=2, sink=lambda fs: None))
     assert sym not in mgr._stuck_symbols
+
+
+# ────────────────────────────────────────────────────────────────────
+# In-tick exponential-backoff retry (freqtrade @retrier style)
+# ────────────────────────────────────────────────────────────────────
+
+
+def test_fetch_retry_absorbs_transient_blip():
+    """With retries enabled, a single fetch_my_trades blip is retried
+    in-place and recovers WITHIN the same poll — it never reaches the
+    fail-closed path, so last_poll_failed stays False and no fetch-fail
+    count accrues."""
+    from combo_bot.fill_events_manager import (
+        FillEventManager,
+        FillEventManagerConfig,
+    )
+
+    class _BlinkEx:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetch_my_trades(self, *a, **k):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient blip")
+            return []
+
+    ex = _BlinkEx()
+    mgr = FillEventManager(
+        ex,
+        # base_ms=0 keeps the test fast; 2 retries available.
+        FillEventManagerConfig(
+            poll_interval_ms=0, fetch_max_retries=2, fetch_retry_base_ms=0
+        ),
+    )
+    sym = "BTC/USDT:USDT"
+    asyncio.run(mgr.poll(sym, now_ms=0, sink=lambda fs: None))
+    # First attempt raised, second attempt returned [] — absorbed.
+    assert ex.calls == 2
+    assert mgr.last_poll_failed(sym) is False
+    assert mgr._fetch_fail_count.get(sym, 0) == 0
+
+
+def test_fetch_retry_exhaustion_still_fails_closed():
+    """If every retry also fails, the poll fails closed exactly as
+    before: last_poll_failed set, fetch-fail count advanced. Retries
+    only ABSORB transient blips; they never mask a sustained outage."""
+    from combo_bot.fill_events_manager import (
+        FillEventManager,
+        FillEventManagerConfig,
+    )
+
+    class _DeadEx:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetch_my_trades(self, *a, **k):
+            self.calls += 1
+            raise RuntimeError("sustained outage")
+
+    ex = _DeadEx()
+    mgr = FillEventManager(
+        ex,
+        FillEventManagerConfig(
+            poll_interval_ms=0, fetch_max_retries=2, fetch_retry_base_ms=0
+        ),
+    )
+    sym = "BTC/USDT:USDT"
+    asyncio.run(mgr.poll(sym, now_ms=0, sink=lambda fs: None))
+    # 1 initial attempt + 2 retries = 3 calls, all failed.
+    assert ex.calls == 3
+    assert mgr.last_poll_failed(sym) is True
+    assert mgr._fetch_fail_count.get(sym) == 1
 
 
 # ────────────────────────────────────────────────────────────────────
