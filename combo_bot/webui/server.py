@@ -116,8 +116,9 @@ def create_app(
                 best_primary = sd.get("signal_regime", "neutral") or "neutral"
         return {"primary": best_primary, "conviction": best_conviction}
 
-    def _read_fills(limit: int) -> list[dict]:
-        """Tail the trader's fills JSONL sidecar, oldest→newest."""
+    def _read_fills(limit: int, symbol: str | None = None) -> list[dict]:
+        """Tail the trader's fills JSONL sidecar. Returns newest→oldest
+        (for the table) optionally filtered to one symbol."""
         if not fills_path.exists():
             return []
         limit = max(1, min(limit, 2000))
@@ -126,16 +127,20 @@ def create_app(
         except Exception:
             logger.exception("[ui] failed to read fills log %s", fills_path)
             return []
-        out: list[dict] = []
-        for line in lines[-limit:]:
+        rows: list[dict] = []
+        for line in lines:
             line = line.strip()
             if not line:
                 continue
             try:
-                out.append(json.loads(line))
+                rows.append(json.loads(line))
             except Exception:
                 continue
-        return out
+        if symbol:
+            target = symbol.strip()
+            rows = [r for r in rows if str(r.get("symbol", "")).strip() == target]
+        # newest first, capped to limit
+        return rows[::-1][:limit]
 
     async def _fetch_orders(exchange, sym: str) -> list[dict] | dict:
         try:
@@ -259,7 +264,7 @@ def create_app(
         # table updates every poll without a manual reload.
         if state is not None:
             fe = payload["state"].setdefault("fill_events", {})
-            fe["recent_fills"] = _read_fills(50)[::-1]
+            fe["recent_fills"] = _read_fills(50)
         return JSONResponse(payload)
 
     @app.get("/api/equity")
@@ -269,10 +274,13 @@ def create_app(
         )
 
     @app.get("/api/fills")
-    async def fills_endpoint(limit: int = 200) -> JSONResponse:
-        """Recent fills from the sidecar, newest→oldest for the table."""
-        fills = _read_fills(limit)
-        return JSONResponse({"fills": fills[::-1]})
+    async def fills_endpoint(
+        limit: int = 200, symbol: str | None = None
+    ) -> JSONResponse:
+        """Recent fills from the sidecar, newest→oldest, optional
+        symbol filter (e.g. ``?symbol=BTC/USDT:USDT``)."""
+        fills = _read_fills(limit, symbol)
+        return JSONResponse({"fills": fills, "returned": len(fills)})
 
     @app.get("/api/logs/stream")
     async def logs_stream() -> StreamingResponse:

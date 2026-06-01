@@ -183,10 +183,13 @@ def test_fills_endpoint_tails_sidecar(monkeypatch):
         ]
         fills_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
         client = TestClient(create_app(config_path=cfg_path, testnet=True, real=False))
-        # limit=3 → last 3 entries (timestamps 2,3,4).
+        # limit=3, newest-first → timestamps 4,3,2.
         data = client.get("/api/fills?limit=3").json()
         assert len(data["fills"]) == 3
-        assert [f["timestamp"] for f in data["fills"]] == [2, 3, 4]
+        assert [f["timestamp"] for f in data["fills"]] == [4, 3, 2]
+        # symbol filter keeps only matching rows.
+        data_f = client.get("/api/fills?symbol=BTC/USDT:USDT").json()
+        assert len(data_f["fills"]) == 5
         # No sidecar → empty list, not an error.
         fills_path.unlink()
         data2 = client.get("/api/fills").json()
