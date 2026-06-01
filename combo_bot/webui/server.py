@@ -425,12 +425,23 @@ def create_app(
             n_trials = int(body.get("n_trials", 100))
             sampler = str(body.get("sampler", "tpe"))
             wf_splits = int(body.get("walk_forward_splits", 3))
+            # Optional multi-objective (Pareto) optimization. A non-empty
+            # list like ["adg:max", "max_drawdown:min"] switches to a true
+            # multi-objective NSGA-II run; empty/None keeps the legacy scalar.
+            raw_obj = body.get("objectives") or None
+            objectives = (
+                [str(o) for o in raw_obj]
+                if isinstance(raw_obj, list) and raw_obj
+                else None
+            )
+            multi = objectives is not None
 
             opt_config = OptimizeConfig(
                 n_trials=n_trials,
                 n_jobs=1,
                 sampler=sampler,
                 walk_forward_splits=max(2, wf_splits),
+                objectives=objectives,
                 study_name=f"ui_{jid}",
             )
 
@@ -440,14 +451,25 @@ def create_app(
                 completed[0] += 1
                 pct = 10 + int(completed[0] / max(n_trials, 1) * 85)
                 job["progress"] = min(pct, 95)
-                try:
-                    best = study.best_value
-                    best_str = f"{best:.4f}" if best is not None else "—"
-                except Exception:
-                    best_str = "—"
-                job["progress_msg"] = (
-                    f"试验 {completed[0]}/{n_trials} | 当前最优: {best_str}"
-                )
+                if multi:
+                    # Multi-objective studies have no single best_value;
+                    # report the Pareto front size instead.
+                    try:
+                        front_n = len(study.best_trials)
+                    except Exception:
+                        front_n = 0
+                    job["progress_msg"] = (
+                        f"试验 {completed[0]}/{n_trials} | 帕累托前沿: {front_n}"
+                    )
+                else:
+                    try:
+                        best = study.best_value
+                        best_str = f"{best:.4f}" if best is not None else "—"
+                    except Exception:
+                        best_str = "—"
+                    job["progress_msg"] = (
+                        f"试验 {completed[0]}/{n_trials} | 当前最优: {best_str}"
+                    )
 
             job["progress"] = 10
             job["progress_msg"] = f"开始优化 (0/{n_trials})…"

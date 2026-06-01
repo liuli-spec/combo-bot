@@ -896,6 +896,11 @@ html, body {
   text-transform: uppercase;
   margin-bottom: 8px;
 }
+.pareto-wrap { margin-bottom: 16px; }
+.pareto-row:hover { background: rgba(255,255,255,0.04); }
+.pareto-row-active { background: var(--indigo-soft); }
+.pareto-row-active td { color: var(--text); }
+
 .opt-params-pre {
   background: rgba(8, 11, 22, 0.6);
   border-radius: 10px;

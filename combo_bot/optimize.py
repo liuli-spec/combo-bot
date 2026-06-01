@@ -36,6 +36,65 @@ _ADG_SCALE = 10.0
 
 
 # ---------------------------------------------------------------------------
+# Multi-objective (Pareto) support
+# ---------------------------------------------------------------------------
+# Map an objective metric name to a getter on BacktestResult. Aliases let
+# configs use either the short or the full field name.
+_METRIC_GETTERS = {
+    "adg": lambda r: r.adg,
+    "sortino": lambda r: r.sortino_ratio,
+    "sortino_ratio": lambda r: r.sortino_ratio,
+    "calmar": lambda r: r.calmar_ratio,
+    "calmar_ratio": lambda r: r.calmar_ratio,
+    "sharpe": lambda r: r.sharpe_ratio,
+    "sharpe_ratio": lambda r: r.sharpe_ratio,
+    "max_drawdown": lambda r: r.max_drawdown,
+    "drawdown": lambda r: r.max_drawdown,
+    "win_rate": lambda r: r.win_rate,
+    "total_pnl": lambda r: r.total_pnl,
+    "n_trades": lambda r: float(r.n_trades),
+}
+
+# Penalty assigned to a failed trial, per optimization direction. Maximize
+# objectives get a very negative value; minimize objectives a very positive
+# one — so a hopeless parameter set is dominated on every axis.
+_PENALTY_MAXIMIZE = -1e6
+_PENALTY_MINIMIZE = 1e6
+
+
+def _parse_objectives(specs: list[str] | None) -> list[tuple[str, str]] | None:
+    """Parse ``["adg:max", "max_drawdown:min"]`` into ``[(metric, direction)]``.
+
+    Returns None for an empty/None spec (legacy single-scalar mode). Raises
+    ValueError on an unknown metric so a typo fails loudly at startup rather
+    than silently optimizing the wrong thing.
+    """
+    if not specs:
+        return None
+    out: list[tuple[str, str]] = []
+    for raw in specs:
+        metric, _, goal = str(raw).partition(":")
+        metric = metric.strip()
+        goal = (goal.strip().lower() or "max")
+        if metric not in _METRIC_GETTERS:
+            valid = ", ".join(sorted(_METRIC_GETTERS))
+            raise ValueError(
+                f"unknown optimization metric {metric!r}; valid: {valid}"
+            )
+        direction = "maximize" if goal in ("max", "maximize") else "minimize"
+        out.append((metric, direction))
+    return out
+
+
+def _metric_value(result: BacktestResult, metric: str) -> float:
+    getter = _METRIC_GETTERS.get(metric)
+    if getter is None:
+        return 0.0
+    value = getter(result)
+    return float(value) if math.isfinite(value) else 0.0
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 @dataclass
@@ -60,6 +119,14 @@ class OptimizeConfig:
     #              trial budget recommended (1000+).
     #   "random" — Random search baseline. Useful sanity check.
     sampler: str = "tpe"
+    # Multi-objective (Pareto) optimization. A list like
+    # ["adg:max", "max_drawdown:min"] turns the search into a true
+    # multi-objective NSGA-II run whose output is the Pareto front — no
+    # arbitrary scalar weighting. None keeps the legacy single-scalar
+    # ``combined`` score (sortino/calmar/adg/drawdown weighting). Valid
+    # metrics: adg, sortino_ratio, calmar_ratio, sharpe_ratio,
+    # max_drawdown, win_rate, total_pnl, n_trades.
+    objectives: list[str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +194,8 @@ class Optimizer:
         self._funding_rates = funding_rates
         self._symbols = list(candle_data.keys())
         self._min_length = min(len(v) for v in candle_data.values())
+        # None → legacy single-scalar score; otherwise [(metric, direction)].
+        self._objective_specs = _parse_objectives(config.objectives)
 
     # ------------------------------------------------------------------
     # Public API
@@ -161,13 +230,21 @@ class Optimizer:
         progress reporting in the web UI without polling Optuna internals.
         """
         sampler = self._build_sampler()
-        study = optuna.create_study(
+        specs = self._objective_specs
+
+        common = dict(
             study_name=self._config.study_name,
             storage=self._config.storage,
-            direction="maximize",
             load_if_exists=True,
             sampler=sampler,
         )
+        if specs is None:
+            study = optuna.create_study(direction="maximize", **common)
+        else:
+            study = optuna.create_study(
+                directions=[direction for _, direction in specs], **common
+            )
+
         study.optimize(
             self._objective,
             n_trials=self._config.n_trials,
@@ -176,21 +253,52 @@ class Optimizer:
             callbacks=callbacks or [],
         )
 
-        best = study.best_trial
+        if specs is None:
+            best = study.best_trial
+            logger.info(
+                "Optimization complete  |  best value=%.6f  trial=%d",
+                best.value,
+                best.number,
+            )
+            print_optimization_report(study)
+            return {
+                "best_value": best.value,
+                "best_params": best.params,
+                "grid": _grid_config_from_params(best.params).__dict__,
+                "trend": _trend_config_from_params(best.params).__dict__,
+                "merger": _merger_config_from_params(best.params).__dict__,
+                "n_trials": len(study.trials),
+                "study_name": study.study_name,
+            }
+
+        # Multi-objective: the result is the Pareto front (non-dominated
+        # trials). No arbitrary scalar weighting — the caller/operator picks
+        # a point on the risk/return trade-off curve.
+        front = study.best_trials
         logger.info(
-            "Optimization complete  |  best value=%.6f  trial=%d",
-            best.value,
-            best.number,
+            "Optimization complete  |  pareto_front=%d  trials=%d  objectives=%s",
+            len(front),
+            len(study.trials),
+            [f"{m}:{'max' if d == 'maximize' else 'min'}" for m, d in specs],
         )
-
-        print_optimization_report(study)
-
+        solutions = []
+        for t in sorted(front, key=lambda tr: tr.number):
+            solutions.append(
+                {
+                    "params": t.params,
+                    "objectives": {
+                        metric: value for (metric, _), value in zip(specs, t.values)
+                    },
+                    "grid": _grid_config_from_params(t.params).__dict__,
+                    "trend": _trend_config_from_params(t.params).__dict__,
+                    "merger": _merger_config_from_params(t.params).__dict__,
+                }
+            )
         return {
-            "best_value": best.value,
-            "best_params": best.params,
-            "grid": _grid_config_from_params(best.params).__dict__,
-            "trend": _trend_config_from_params(best.params).__dict__,
-            "merger": _merger_config_from_params(best.params).__dict__,
+            "pareto_front": solutions,
+            "objectives": [
+                f"{m}:{'max' if d == 'maximize' else 'min'}" for m, d in specs
+            ],
             "n_trials": len(study.trials),
             "study_name": study.study_name,
         }
@@ -198,8 +306,9 @@ class Optimizer:
     # ------------------------------------------------------------------
     # Objective
     # ------------------------------------------------------------------
-    def _objective(self, trial: Trial) -> float:
-        """Evaluate a single parameter combination via walk-forward."""
+    def _objective(self, trial: Trial):
+        """Evaluate a parameter set. Returns a scalar in legacy mode, or a
+        tuple of objective values in multi-objective (Pareto) mode."""
         grid_cfg = self._suggest_grid_params(trial)
         trend_cfg = self._suggest_trend_params(trial)
         merger_cfg = self._suggest_merger_params(trial)
@@ -211,14 +320,26 @@ class Optimizer:
             symbols=list(self._symbols),
         )
 
-        score = self._walk_forward_evaluate(bt_config)
+        metrics = self._walk_forward_evaluate(bt_config)
+        specs = self._objective_specs
 
-        # Prune hopeless trials early.
-        trial.report(score, step=0)
-        if trial.should_prune():
-            raise optuna.TrialPruned()
+        if specs is None:
+            # Legacy single-scalar path (with pruning).
+            score = -1e6 if metrics is None else metrics["_combined"]
+            trial.report(score, step=0)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+            return score
 
-        return score
+        # Multi-objective: return one value per objective. Failed trials
+        # get a dominated penalty on every axis. (Optuna's standard pruners
+        # don't apply to multi-objective studies, so we don't report/prune.)
+        if metrics is None:
+            return tuple(
+                _PENALTY_MAXIMIZE if direction == "maximize" else _PENALTY_MINIMIZE
+                for _, direction in specs
+            )
+        return tuple(metrics.get(metric, 0.0) for metric, _ in specs)
 
     # ------------------------------------------------------------------
     # Parameter suggestion helpers
@@ -301,23 +422,26 @@ class Optimizer:
     # ------------------------------------------------------------------
     # Walk-forward validation
     # ------------------------------------------------------------------
-    def _walk_forward_evaluate(self, config: BacktestConfig) -> float:
+    def _walk_forward_evaluate(self, config: BacktestConfig) -> dict[str, float] | None:
         """Split data chronologically, train on front, score on back.
 
-        Repeats across ``walk_forward_splits`` rolling windows and
-        returns the mean test score.
+        Repeats across ``walk_forward_splits`` rolling windows and returns
+        the per-metric mean across splits (including the legacy ``_combined``
+        scalar). Returns None when the parameter set is unevaluable
+        (insufficient data, or zero in-sample trades) so the caller can
+        assign a per-objective penalty.
         """
         n_splits = self._config.walk_forward_splits
         total_len = self._min_length
 
         if total_len < 2:
-            return -1e6
+            return None
 
         window_size = total_len // n_splits
         if window_size < 2:
-            return -1e6
+            return None
 
-        test_scores: list[float] = []
+        metric_rows: list[dict[str, float]] = []
 
         for split_idx in range(n_splits):
             start = split_idx * (total_len - window_size) // max(n_splits - 1, 1)
@@ -344,7 +468,7 @@ class Optimizer:
                     exchange_params=self._exchange_params,
                 )
                 if train_result.n_trades == 0:
-                    return -1e6
+                    return None
 
             # -- test partition --
             test_candles = {
@@ -367,12 +491,19 @@ class Optimizer:
                     exchange_params=self._exchange_params,
                 )
 
-            test_scores.append(self._compute_score(result))
+            metric_rows.append(self._result_metrics(result))
 
-        if not test_scores:
-            return -1e6
+        if not metric_rows:
+            return None
 
-        return sum(test_scores) / len(test_scores)
+        keys = metric_rows[0].keys()
+        return {k: sum(row[k] for row in metric_rows) / len(metric_rows) for k in keys}
+
+    def _result_metrics(self, result: BacktestResult) -> dict[str, float]:
+        """All optimizable metrics for one backtest plus the legacy scalar."""
+        metrics = {name: _metric_value(result, name) for name in _METRIC_GETTERS}
+        metrics["_combined"] = self._compute_score(result)
+        return metrics
 
     # ------------------------------------------------------------------
     # Scoring

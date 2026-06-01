@@ -271,6 +271,15 @@
             <span class="param-label">walk-forward 折数</span>
             <input class="param-input mono" type="number" id="opt-wf-splits" value="3" min="2" max="8" />
           </label>
+          <label class="param-row">
+            <span class="param-label">优化目标</span>
+            <select class="param-input" id="opt-objectives">
+              <option value="">单标量综合评分（旧）</option>
+              <option value="adg:max,max_drawdown:min" selected>收益↑ / 回撤↓（帕累托）</option>
+              <option value="sortino_ratio:max,max_drawdown:min">Sortino↑ / 回撤↓</option>
+              <option value="adg:max,sortino_ratio:max,max_drawdown:min">收益↑ / Sortino↑ / 回撤↓</option>
+            </select>
+          </label>
         </div>
 
         <div class="lab-actions">
@@ -289,8 +298,18 @@
         <!-- result -->
         <div class="opt-result" id="opt-result" hidden>
           <div class="result-metrics" id="opt-metrics"></div>
+          <!-- Pareto front (multi-objective) -->
+          <div class="pareto-wrap" id="opt-pareto-wrap" hidden>
+            <div class="opt-params-title">帕累托前沿 · 点击一行查看该解参数</div>
+            <div class="fills-table-wrap">
+              <table class="fills-table mono" id="opt-pareto-table">
+                <thead id="opt-pareto-head"></thead>
+                <tbody id="opt-pareto-body"></tbody>
+              </table>
+            </div>
+          </div>
           <div class="opt-params-wrap">
-            <div class="opt-params-title">最优参数（可复制到 config.json）</div>
+            <div class="opt-params-title" id="opt-params-title">最优参数（可复制到 config.json）</div>
             <pre class="opt-params-pre mono" id="opt-params-json"></pre>
           </div>
         </div>

@@ -778,6 +778,9 @@ async function submitOptimize() {
   const nTrials = parseInt($('opt-trials').value) || 100;
   const sampler = $('opt-sampler').value;
   const wfSplits = parseInt($('opt-wf-splits').value) || 3;
+  // "adg:max,max_drawdown:min" → ["adg:max","max_drawdown:min"]; "" → [] (scalar)
+  const objRaw = ($('opt-objectives') ? $('opt-objectives').value : '').trim();
+  const objectives = objRaw ? objRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
 
   $('btn-opt-run').disabled = true;
   $('opt-status').textContent = '提交中…';
@@ -787,7 +790,7 @@ async function submitOptimize() {
     const res = await fetch('/api/optimize/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ n_trials: nTrials, sampler, walk_forward_splits: wfSplits }),
+      body: JSON.stringify({ n_trials: nTrials, sampler, walk_forward_splits: wfSplits, objectives }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
@@ -910,19 +913,67 @@ function renderOptimizeResult(r) {
   $('opt-result').hidden = false;
   const fmt = (v, dec=4) => Number.isFinite(Number(v)) ? Number(v).toFixed(dec) : String(v);
 
+  if (r.pareto_front) {
+    renderParetoFront(r);
+    return;
+  }
+
+  // Legacy single-scalar result.
+  $('opt-pareto-wrap').hidden = true;
   $('opt-metrics').innerHTML = `
     <div class="metric-card"><div class="metric-val up">${fmt(r.best_value)}</div><div class="metric-label">最优得分</div></div>
     <div class="metric-card"><div class="metric-val">${r.n_trials}</div><div class="metric-label">完成试验</div></div>
     <div class="metric-card"><div class="metric-val dim">${r.study_name || '—'}</div><div class="metric-label">Study 名称</div></div>
   `;
+  $('opt-params-title').textContent = '最优参数（可复制到 config.json）';
+  $('opt-params-json').textContent = JSON.stringify(
+    { grid: r.grid || {}, trend: r.trend || {}, merger: r.merger || {} }, null, 2
+  );
+}
 
-  // Best params as JSON
-  const best = {
-    grid: r.grid || {},
-    trend: r.trend || {},
-    merger: r.merger || {},
+function renderParetoFront(r) {
+  const fmt = (v, dec=4) => Number.isFinite(Number(v)) ? Number(v).toFixed(dec) : String(v);
+  const front = r.pareto_front || [];
+  const objKeys = (r.objectives || []).map(o => o.split(':')[0]);
+
+  $('opt-metrics').innerHTML = `
+    <div class="metric-card"><div class="metric-val up">${front.length}</div><div class="metric-label">帕累托解数</div></div>
+    <div class="metric-card"><div class="metric-val">${r.n_trials}</div><div class="metric-label">完成试验</div></div>
+    <div class="metric-card"><div class="metric-val dim">${(r.objectives || []).join(' · ')}</div><div class="metric-label">优化目标</div></div>
+  `;
+
+  // Table: one row per non-dominated solution, columns = objective values.
+  $('opt-pareto-wrap').hidden = false;
+  $('opt-pareto-head').innerHTML =
+    '<tr><th>#</th>' + objKeys.map(k => `<th>${k}</th>`).join('') + '</tr>';
+  $('opt-pareto-body').innerHTML = front.map((sol, idx) => {
+    const cells = objKeys.map(k => {
+      const v = sol.objectives[k];
+      const pctLike = k.includes('drawdown') || k === 'adg' || k.includes('win');
+      return `<td>${pctLike ? (Number(v) * 100).toFixed(2) + '%' : fmt(v)}</td>`;
+    }).join('');
+    return `<tr class="pareto-row" data-idx="${idx}" style="cursor:pointer">
+      <td class="dim">${idx + 1}</td>${cells}</tr>`;
+  }).join('');
+
+  // Click a row → show that solution's config blocks.
+  const showSolution = (idx) => {
+    const sol = front[idx];
+    if (!sol) return;
+    $('opt-params-title').textContent =
+      `解 #${idx + 1} 参数（可复制到 config.json）`;
+    $('opt-params-json').textContent = JSON.stringify(
+      { grid: sol.grid || {}, trend: sol.trend || {}, merger: sol.merger || {} }, null, 2
+    );
+    $('opt-pareto-body').querySelectorAll('.pareto-row').forEach(row => {
+      row.classList.toggle('pareto-row-active', Number(row.dataset.idx) === idx);
+    });
   };
-  $('opt-params-json').textContent = JSON.stringify(best, null, 2);
+  $('opt-pareto-body').querySelectorAll('.pareto-row').forEach(row => {
+    row.addEventListener('click', () => showSolution(Number(row.dataset.idx)));
+  });
+  // Default: show the first solution.
+  if (front.length) showSolution(0);
 }
 
 function attachLabControls() {

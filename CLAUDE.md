@@ -115,6 +115,8 @@ There are two parallel implementations. The Python path is the reference; the Ru
 
 `rust_adapter.py` bridges the Python `GridConfig`/`EMAState`/`VolatilityState` types to the dict-based API the Rust extension expects. If `combo_futures_core` is not installed the Python path is used as fallback (with a log warning).
 
+**Optimizer objective modes** (`optimize.Optimizer`): by default it maximizes a single weighted scalar (`_compute_score`: sortino/calmar/adg/drawdown). Setting `OptimizeConfig.objectives` to a list like `["adg:max", "max_drawdown:min"]` switches to true **multi-objective NSGA-II** optimization — `run()` then returns a Pareto front (`{"pareto_front": [...]}`) of non-dominated solutions instead of a single `best_*`, so no arbitrary scalar weighting is imposed. Valid metrics: `adg`, `sortino_ratio`, `calmar_ratio`, `sharpe_ratio`, `max_drawdown`, `win_rate`, `total_pnl`, `n_trades`. The web lab exposes this via the "优化目标" selector and renders the front as a clickable table.
+
 ### Strategy plugin layer (`combo_bot/strategy.py`)
 
 A Freqtrade-inspired callback interface. Subclass `IStrategy` and override `populate_indicators`, `populate_entry_trend`, and `populate_exit_trend`. Optional hooks: `confirm_trade_entry`, `confirm_trade_exit`, `custom_stoploss`, `adjust_trade_position`, etc. `StrategyRunner` applies these callbacks to the order stream produced by the core engine. `DefaultStrategy` (no-op) and `ExampleTrendStrategy` (RSI + EMA crossover) are built in.
