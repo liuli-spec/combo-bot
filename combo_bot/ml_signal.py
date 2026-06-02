@@ -92,6 +92,23 @@ def ml_overlay_decision(score: float, threshold: float) -> tuple[str | None, flo
     return None, 0.0
 
 
+def apply_ml_overlay(regime_view, score: float, threshold: float):
+    """Replace the trend-overlay fields on a RegimeView from an ml_score.
+
+    Shared by Backtester and LiveTrader so both drive the overlay
+    identically. Returns a NEW RegimeView (the original is frozen).
+    """
+    from dataclasses import replace
+
+    from combo_bot.types import Side
+
+    side_str, scale = ml_overlay_decision(score, threshold)
+    if side_str is None:
+        return replace(regime_view, trend_overlay=None, trend_qty_scale=0.0)
+    side = Side.LONG if side_str == "long" else Side.SHORT
+    return replace(regime_view, trend_overlay=side, trend_qty_scale=scale)
+
+
 # ---------------------------------------------------------------------------
 # Causal feature engineering (each row uses only past+current data)
 # ---------------------------------------------------------------------------

@@ -120,9 +120,15 @@ class LiveTrader:
     ):
         self.config = config
         self.exchange = exchange
-        # ML overlay config (stage 2). Stored now; wired into the live
-        # decision loop in stage 2b. None / disabled → no ML overlay.
+        # ML overlay (stage 2b). When enabled, a per-symbol model drives the
+        # trend-overlay side/sizing in _tick. None / disabled → no overlay.
         self.ml_config = ml_config if (ml_config and ml_config.enabled) else None
+        self._ml_models: dict = {}
+        if self.ml_config is not None:
+            from combo_bot.ml_signal import MLSignalModel
+
+            for _s in config.symbols:
+                self._ml_models[_s] = MLSignalModel(self.ml_config)
         self.grid = GridEngine(config.grid)
         self.trend = TrendEngine(config.trend)
         # Round-22: pass the canonical trend WEL so overlay sizing and
@@ -136,7 +142,15 @@ class LiveTrader:
         self.regime_arbiter = RegimeArbiter(config.regime)
         self.strategy: IStrategy = strategy or DefaultStrategy()
         self.strategy_runner = StrategyRunner(self.strategy)
-        self.data_provider = DataProvider(max_rows=1000)
+        # When the ML overlay is active, keep enough candle history for a
+        # full training window (+ horizon tail) so the model isn't starved.
+        _dp_rows = 1000
+        if self.ml_config is not None:
+            _dp_rows = max(
+                1000,
+                self.ml_config.train_window + self.ml_config.horizon_bars + 200,
+            )
+        self.data_provider = DataProvider(max_rows=_dp_rows)
         self.protections = ProtectionManager(protections or [])
         # Fill event manager — polls fetch_my_trades, dedups by trade
         # ID, attributes source via the order_id we record at create
@@ -507,6 +521,12 @@ class LiveTrader:
                 strategy_enter_long=strat_enter_long,
                 strategy_enter_short=strat_enter_short,
             )
+            # Stage 2b ML overlay: ML model drives the trend-overlay side +
+            # sizing (mirrors backtest). Risk-increasing, so it still passes
+            # through _risk_increasing_blocked / freshness / STUCK gates and
+            # is a no-op under dry_run (no real orders).
+            if self.ml_config is not None:
+                regime_view = self._ml_overlay_regime(symbol, regime_view)
 
             we_long = (
                 calc_wallet_exposure(
@@ -2887,6 +2907,32 @@ class LiveTrader:
                 order.client_order_id or "<none>",
                 exc_info=True,
             )
+
+    def _ml_overlay_regime(self, symbol: str, regime_view: RegimeView) -> RegimeView:
+        """Override the overlay side/sizing from the per-symbol ML model
+        using the live candle buffer. Returns the regime unchanged on any
+        shortfall (no model, too little history, predict failure) so a
+        cold/degraded model is a flat no-op rather than a wrong trade."""
+        model = self._ml_models.get(symbol)
+        if model is None:
+            return regime_view
+        candles = self.data_provider.get_candles(symbol)
+        if len(candles) < model.config.min_train_samples:
+            return regime_view  # not enough history yet → stay flat
+        import numpy as np
+
+        from combo_bot.ml_signal import apply_ml_overlay
+
+        closes = np.array([c.close for c in candles], dtype=float)
+        highs = np.array([c.high for c in candles], dtype=float)
+        lows = np.array([c.low for c in candles], dtype=float)
+        vols = np.array([c.volume for c in candles], dtype=float)
+        # Monotonic bar index for retrain scheduling (survives buffer trim).
+        bar_ms = max(self.config.bar_interval_minutes * 60_000.0, 1.0)
+        bar_index = int(candles[-1].timestamp / bar_ms)
+        model.maybe_retrain(closes, highs, lows, vols, bar_index=bar_index)
+        score = model.predict_score(closes, highs, lows, vols)
+        return apply_ml_overlay(regime_view, score, model.config.score_threshold)
 
     def _emit_trend_overlay(
         self,

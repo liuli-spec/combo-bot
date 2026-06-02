@@ -182,8 +182,15 @@ side + sizing on the `RegimeView` via `_ml_overlay_regime` —
 qty scale, which flows through the existing `_emit_trend_overlay` path
 (reusing all sizing / strategy-filter / bucket logic). Grid modes stay
 rule-based; only the overlay becomes ML-driven. Causal: trains/predicts on
-`candles[:step+1]` only. `LiveTrader` accepts `ml_config` but the live
-decision wiring is stage 2b (pending).
+`candles[:step+1]` only. `LiveTrader` mirrors this in `_tick` via its own
+`_ml_overlay_regime` (candle history from `DataProvider.get_candles`, the
+buffer auto-sized to the training window when ML is enabled; bar index from
+the candle timestamp for retrain scheduling). The overlay stays flat until
+enough history accumulates, and — being risk-increasing — still passes
+through `_risk_increasing_blocked` / freshness / STUCK gates and is inert
+under `dry_run`. The shared `ml_signal.apply_ml_overlay` does the
+`RegimeView` replacement for both paths. **Always backtest to confirm the
+model adds alpha before enabling it live.**
 
 ### Synthetic (reconstructed) realized PnL
 

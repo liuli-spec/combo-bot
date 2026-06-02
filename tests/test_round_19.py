@@ -381,3 +381,27 @@ def test_refresh_candles_excludes_in_progress_bar():
     assert trader._last_candle_ts[sym] == b_ts
     # …but last_price still reflects the latest (live) bar.
     assert trader.account.symbols[sym].last_price == 999.0
+
+
+def test_live_ml_overlay_flat_until_enough_history():
+    """With the ML overlay enabled but an empty candle buffer, the live
+    decision must stay flat (no overlay) — a cold model never trades."""
+    from combo_bot.ml_signal import MLSignalConfig
+    from combo_bot.types import RegimeView, TrendRegime, TradingMode
+
+    ml = MLSignalConfig(enabled=True, min_train_samples=100, train_window=500)
+    trader, _ = _live_trader()
+    trader.ml_config = ml
+    from combo_bot.ml_signal import MLSignalModel
+    trader._ml_models = {"BTC/USDT:USDT": MLSignalModel(ml)}
+
+    rv = RegimeView(
+        primary=TrendRegime.NEUTRAL,
+        conviction=0.0,
+        long_mode=TradingMode.NORMAL,
+        short_mode=TradingMode.NORMAL,
+    )
+    # No candles in the buffer yet → overlay stays None (flat).
+    out = trader._ml_overlay_regime("BTC/USDT:USDT", rv)
+    assert out.trend_overlay is None
+    assert out.trend_qty_scale == 0.0

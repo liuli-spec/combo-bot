@@ -49,6 +49,15 @@ class DataProvider:
         self._cached_df.pop(symbol, None)
         self._cache_len.pop(symbol, None)
 
+    def get_candles(self, symbol: str) -> list[Candle]:
+        """Return the raw candle buffer (oldest→newest) for ``symbol``.
+
+        Pandas-free accessor used by the ML signal layer, which works on
+        numpy arrays. The returned list is the live buffer; callers must
+        not mutate it.
+        """
+        return self._buffers.get(symbol, [])
+
     def get_dataframe(self, symbol: str) -> "DataFrame":
         import pandas as pd
 

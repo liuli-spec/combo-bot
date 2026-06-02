@@ -975,10 +975,7 @@ class Backtester:
         """Override the overlay side/sizing on ``regime_view`` from the
         per-symbol ML model. Causal: trains/predicts on candles[:step+1]
         only. Returns the regime unchanged on any failure (fail-flat)."""
-        from dataclasses import replace
-
-        from combo_bot.ml_signal import ml_overlay_decision
-        from combo_bot.types import Side
+        from combo_bot.ml_signal import apply_ml_overlay
 
         model = self._ml_models.get(symbol)
         arrays = self._ml_arrays.get(symbol)
@@ -991,11 +988,7 @@ class Backtester:
         c, h, lw, v = closes[lo:hi], highs[lo:hi], lows[lo:hi], vols[lo:hi]
         model.maybe_retrain(c, h, lw, v, bar_index=step)
         score = model.predict_score(c, h, lw, v)
-        side_str, scale = ml_overlay_decision(score, model.config.score_threshold)
-        if side_str is None:
-            return replace(regime_view, trend_overlay=None, trend_qty_scale=0.0)
-        side = Side.LONG if side_str == "long" else Side.SHORT
-        return replace(regime_view, trend_overlay=side, trend_qty_scale=scale)
+        return apply_ml_overlay(regime_view, score, model.config.score_threshold)
 
     def _emit_trend_overlay(
         self,
