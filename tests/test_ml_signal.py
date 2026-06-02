@@ -160,3 +160,52 @@ def test_maybe_retrain_respects_interval():
     assert model.maybe_retrain(closes, highs, lows, vols, bar_index=1200) is False
     # Far enough out — retrains again.
     assert model.maybe_retrain(closes, highs, lows, vols, bar_index=1600) is True
+
+
+# ── backtest integration (stage 2) ───────────────────────────────────
+
+
+def test_backtest_runs_with_ml_overlay():
+    """A backtest with an enabled ML overlay runs end-to-end and produces a
+    valid result. The ML model drives the trend-overlay side/sizing instead
+    of the rule-based arbiter."""
+    pytest.importorskip("sklearn")
+    from combo_bot.backtest import BacktestConfig, Backtester
+    from combo_bot.grid_engine import GridConfig
+    from combo_bot.ml_signal import MLSignalConfig
+
+    closes, highs, lows, vols = _trending_ohlcv(2500)
+    from combo_bot.types import Candle
+
+    candles = [
+        Candle(timestamp=i * 60000, open=float(c), high=float(h), low=float(lo),
+               close=float(c), volume=float(v))
+        for i, (c, h, lo, v) in enumerate(zip(closes, highs, lows, vols))
+    ]
+    cfg = BacktestConfig(
+        starting_balance=10000,
+        symbols=["BTC/USDT:USDT"],
+        grid=GridConfig(wallet_exposure_limit=0.2),
+    )
+    ml = MLSignalConfig(
+        enabled=True, horizon_bars=12, vol_window=20, min_train_samples=100,
+        train_window=800, retrain_interval=400, n_estimators=20, max_depth=2,
+        score_threshold=0.2,
+    )
+    result = Backtester(cfg, ml_config=ml).run({"BTC/USDT:USDT": candles})
+    # End-to-end completion + sane envelope.
+    assert result.duration_days > 0
+    assert result.n_trades >= 0
+    assert len(result.equity_curve) > 0
+
+
+def test_ml_disabled_config_is_inert():
+    """An ml_config with enabled=False must not engage the ML path."""
+    from combo_bot.backtest import BacktestConfig, Backtester
+    from combo_bot.ml_signal import MLSignalConfig
+
+    bt = Backtester(
+        BacktestConfig(symbols=["BTC/USDT:USDT"]),
+        ml_config=MLSignalConfig(enabled=False),
+    )
+    assert bt.ml_config is None

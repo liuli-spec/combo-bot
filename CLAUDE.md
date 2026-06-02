@@ -157,9 +157,7 @@ All optional modules implement a `filter_orders()` interface and are applied in 
 
 A self-contained supervised ML signal inspired by FreqAI + López de Prado's
 triple-barrier labeling. `MLSignalModel` turns an OHLCV window into a
-directional conviction `ml_score ∈ [-1, 1]` (`P(+1) − P(−1)`). **Stage 1 is
-pure model logic — it does not place orders yet** (the ML-driven overlay is
-the next layer). Pieces:
+directional conviction `ml_score ∈ [-1, 1]` (`P(+1) − P(−1)`). Pieces:
 
 - **Features** (`compute_features`) — causal-only: multi-lag log returns, EMA
   distance, RSI, realized vol, intrabar range, volume z-score. Each row uses
@@ -175,6 +173,17 @@ the next layer). Pieces:
   if missing, the model stays untrained and `predict_score` returns 0.0.
 - **Lifecycle** — `maybe_retrain(...)` on a sliding window every
   `retrain_interval` bars, `predict_score(...)` each bar.
+
+**ML-driven overlay** (config block `ml_signal`, built by
+`fusion_config.build_ml_signal`): when enabled, `Backtester` builds one
+`MLSignalModel` per symbol and, each step, overrides the trend-overlay
+side + sizing on the `RegimeView` via `_ml_overlay_regime` —
+`ml_overlay_decision(score, threshold)` maps conviction to a side and a
+qty scale, which flows through the existing `_emit_trend_overlay` path
+(reusing all sizing / strategy-filter / bucket logic). Grid modes stay
+rule-based; only the overlay becomes ML-driven. Causal: trains/predicts on
+`candles[:step+1]` only. `LiveTrader` accepts `ml_config` but the live
+decision wiring is stage 2b (pending).
 
 ### Synthetic (reconstructed) realized PnL
 

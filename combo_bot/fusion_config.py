@@ -74,6 +74,20 @@ def build_kelly_sizer(cfg: dict[str, Any]) -> KellySizer | None:
     return KellySizer(_build_dataclass(KellySizerConfig, block))
 
 
+def build_ml_signal(cfg: dict[str, Any]):
+    """Build the MLSignalConfig from the ``ml_signal`` block, or None.
+
+    Returns the config (not a model) — Backtester / LiveTrader build one
+    MLSignalModel per symbol so each symbol learns independently.
+    """
+    from combo_bot.ml_signal import MLSignalConfig
+
+    block = cfg.get("ml_signal")
+    if not _block_enabled(block):
+        return None
+    return _build_dataclass(MLSignalConfig, block)
+
+
 def build_correlation_gate(cfg: dict[str, Any]) -> CorrelationGate | None:
     block = cfg.get("correlation_gate")
     if not _block_enabled(block):
@@ -225,6 +239,7 @@ def build_fusion(cfg: dict[str, Any]) -> dict[str, Any]:
         "kelly_sizer": build_kelly_sizer(cfg),
         "correlation_gate": build_correlation_gate(cfg),
         "vol_target_sizer": build_vol_target_sizer(cfg),
+        "ml_config": build_ml_signal(cfg),
     }
 
 

@@ -71,6 +71,25 @@ class MLSignalConfig:
     return_lags: tuple[int, ...] = (1, 2, 3, 5, 10)
     ema_spans: tuple[int, ...] = (10, 30)
     rsi_period: int = 14
+    # ── Overlay action ───────────────────────────────────────────────
+    # |ml_score| must exceed this before the ML overlay takes a side. The
+    # conviction above the threshold maps linearly to the entry qty scale.
+    score_threshold: float = 0.3
+
+
+def ml_overlay_decision(score: float, threshold: float) -> tuple[str | None, float]:
+    """Map a directional ml_score to an overlay (side, qty_scale).
+
+    Returns ("long"/"short"/None, scale) where scale ∈ [0, 1] grows with
+    conviction above the threshold. Side strings (not the Side enum) keep
+    this module import-light; callers translate.
+    """
+    span = max(1.0 - threshold, 1e-9)
+    if score > threshold:
+        return "long", min(1.0, (score - threshold) / span)
+    if score < -threshold:
+        return "short", min(1.0, (-score - threshold) / span)
+    return None, 0.0
 
 
 # ---------------------------------------------------------------------------

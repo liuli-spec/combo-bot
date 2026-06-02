@@ -116,9 +116,13 @@ class LiveTrader:
         correlation_gate: CorrelationGate | None = None,
         vol_target_sizer: VolTargetSizer | None = None,
         fill_events_config: FillEventManagerConfig | None = None,
+        ml_config=None,
     ):
         self.config = config
         self.exchange = exchange
+        # ML overlay config (stage 2). Stored now; wired into the live
+        # decision loop in stage 2b. None / disabled → no ML overlay.
+        self.ml_config = ml_config if (ml_config and ml_config.enabled) else None
         self.grid = GridEngine(config.grid)
         self.trend = TrendEngine(config.trend)
         # Round-22: pass the canonical trend WEL so overlay sizing and

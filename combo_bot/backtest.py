@@ -80,8 +80,15 @@ class Backtester:
         kelly_sizer: KellySizer | None = None,
         correlation_gate: CorrelationGate | None = None,
         vol_target_sizer: VolTargetSizer | None = None,
+        ml_config=None,
     ):
         self.config = config
+        # ML signal overlay (stage 2). When enabled, the trend-overlay side
+        # and sizing are driven by a per-symbol triple-barrier model instead
+        # of the rule-based RegimeArbiter. None → legacy rule overlay.
+        self.ml_config = ml_config if (ml_config and ml_config.enabled) else None
+        self._ml_models: dict = {}
+        self._ml_arrays: dict = {}
         self.grid = GridEngine(config.grid)
         # Round-27: log once at construction whether the Rust grid
         # path is active. ``use_rust_grid=True`` with no extension
@@ -168,6 +175,23 @@ class Backtester:
         for s in symbols:
             ep = exchange_params.get(s, ExchangeParams())
             account.symbols[s] = SymbolState(symbol=s, c_mult=ep.c_mult)
+
+        # ML overlay (stage 2): one model per symbol + pre-extracted OHLCV
+        # arrays for causal, sliced look-back during the step loop.
+        if self.ml_config is not None:
+            import numpy as _np
+
+            from combo_bot.ml_signal import MLSignalModel
+
+            for s in symbols:
+                self._ml_models[s] = MLSignalModel(self.ml_config)
+                rows = candle_data[s]
+                self._ml_arrays[s] = (
+                    _np.array([c.close for c in rows], dtype=float),
+                    _np.array([c.high for c in rows], dtype=float),
+                    _np.array([c.low for c in rows], dtype=float),
+                    _np.array([c.volume for c in rows], dtype=float),
+                )
 
         fills: list[Fill] = []
         equity_log: list[tuple[int, float]] = []
@@ -387,6 +411,12 @@ class Backtester:
                     strategy_enter_long=strat_enter_long,
                     strategy_enter_short=strat_enter_short,
                 )
+                # Stage 2 ML overlay: replace the rule-based overlay side +
+                # sizing with the per-symbol model's conviction. Grid modes
+                # from the arbiter are untouched; only the trend overlay
+                # becomes ML-driven. Causal — uses only candles[:step+1].
+                if self.ml_config is not None:
+                    regime_view = self._ml_overlay_regime(s, step, regime_view)
                 ss.mode_long = regime_view.long_mode
                 ss.mode_short = regime_view.short_mode
 
@@ -938,6 +968,34 @@ class Backtester:
             if idx >= 0:
                 return funding_rates[symbol][idx]
         return self.config.funding_rate_default
+
+    def _ml_overlay_regime(
+        self, symbol: str, step: int, regime_view: RegimeView
+    ) -> RegimeView:
+        """Override the overlay side/sizing on ``regime_view`` from the
+        per-symbol ML model. Causal: trains/predicts on candles[:step+1]
+        only. Returns the regime unchanged on any failure (fail-flat)."""
+        from dataclasses import replace
+
+        from combo_bot.ml_signal import ml_overlay_decision
+        from combo_bot.types import Side
+
+        model = self._ml_models.get(symbol)
+        arrays = self._ml_arrays.get(symbol)
+        if model is None or arrays is None:
+            return regime_view
+        closes, highs, lows, vols = arrays
+        hi = step + 1
+        window = model.config.train_window + model.config.horizon_bars
+        lo = max(0, hi - window)
+        c, h, lw, v = closes[lo:hi], highs[lo:hi], lows[lo:hi], vols[lo:hi]
+        model.maybe_retrain(c, h, lw, v, bar_index=step)
+        score = model.predict_score(c, h, lw, v)
+        side_str, scale = ml_overlay_decision(score, model.config.score_threshold)
+        if side_str is None:
+            return replace(regime_view, trend_overlay=None, trend_qty_scale=0.0)
+        side = Side.LONG if side_str == "long" else Side.SHORT
+        return replace(regime_view, trend_overlay=side, trend_qty_scale=scale)
 
     def _emit_trend_overlay(
         self,
