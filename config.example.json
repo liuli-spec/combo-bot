@@ -67,5 +67,21 @@
         "max_single_exposure": 0.5,
         "liquidation_threshold": 0.05,
         "cooldown_after_red_minutes": 60
+    },
+
+    "ml_signal": {
+        "_comment": "Triple-barrier ML overlay. Drives the trend overlay side/sizing by a per-symbol model instead of the rule-based regime. Needs scikit-learn: pip install -e \".[ml]\". Set enabled=true to activate. ALWAYS backtest first to confirm it adds alpha before enabling live.",
+        "enabled": false,
+        "horizon_bars": 24,
+        "pt_mult": 2.0,
+        "sl_mult": 2.0,
+        "vol_window": 50,
+        "train_window": 2000,
+        "retrain_interval": 500,
+        "min_train_samples": 200,
+        "max_depth": 3,
+        "n_estimators": 100,
+        "learning_rate": 0.05,
+        "score_threshold": 0.3
     }
 }
