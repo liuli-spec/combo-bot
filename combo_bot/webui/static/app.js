@@ -992,4 +992,306 @@ window.addEventListener('DOMContentLoaded', () => {
   loadFills();
   pollStatus();
   startLogStream();
+  initDeepSeek();
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// DeepSeek AI 分析 (v3)
+// ═══════════════════════════════════════════════════════════════════
+
+let _dsKey = '';         // 内存中暂存的 API key
+let _dsAvailable = false;
+let _lastBtJobId = null; // 最近回测 job id
+let _chatHistory = [];   // 对话历史 [{role, content}]
+
+function initDeepSeek() {
+  // 尝试自动加载环境变量 key（如果后端已配置则无需手动输入）
+  checkDSHealth();
+
+  // 配置按钮
+  $('btn-ds-config').addEventListener('click', configureDS);
+
+  // 分析按钮
+  $('btn-ds-analyze').addEventListener('click', () => analyzeBacktest(false));
+  $('btn-ds-analyze-stream').addEventListener('click', () => analyzeBacktest(true));
+
+  // 聊天
+  $('btn-ds-send').addEventListener('click', sendChat);
+  $('ds-chat-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+  });
+
+  // 快捷提问按钮
+  document.querySelectorAll('.ai-quick-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      $('ds-chat-input').value = btn.dataset.q;
+      sendChat();
+    });
+  });
+
+  // 市场分析按钮
+  const mktBtn = $('btn-ds-market');
+  if (mktBtn) mktBtn.addEventListener('click', analyzeMarket);
+}
+
+async function checkDSHealth() {
+  try {
+    const res = await fetch('/api/deepseek/health');
+    const data = await res.json();
+    _dsAvailable = data.available;
+    renderDSStatus(data);
+  } catch (e) {
+    _dsAvailable = false;
+    renderDSStatus({ available: false, message: '无法连接后端' });
+  }
+}
+
+function renderDSStatus(data) {
+  const el = $('ds-health');
+  if (!el) return;
+  if (data.available) {
+    el.innerHTML = `<span class="ai-status ai-status-ok">● 已连接</span><span class="ai-model-select">${data.model || 'deepseek-chat'}</span>`;
+    $('ds-key').placeholder = '已从环境变量加载（无需手动输入）';
+    $('btn-ds-config').textContent = '重新配置';
+  } else {
+    el.innerHTML = `<span class="ai-status ai-status-err">○ 未配置</span>`;
+    $('ds-key').placeholder = '粘贴 DeepSeek API key (sk-…)';
+  }
+}
+
+async function configureDS() {
+  const key = $('ds-key').value.trim();
+  if (!key) {
+    appendChatMsg('assistant', '请先在输入框中粘贴 DeepSeek API key。');
+    return;
+  }
+  $('btn-ds-config').disabled = true;
+  $('btn-ds-config').textContent = '配置中…';
+  try {
+    const res = await fetch('/api/deepseek/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: key }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      _dsAvailable = true;
+      _dsKey = key;
+      $('ds-health').innerHTML = `<span class="ai-status ai-status-ok">● 已连接</span><span class="ai-model-select">${data.model}</span>`;
+      $('btn-ds-config').textContent = '✓ 已配置';
+      appendChatMsg('assistant', 'DeepSeek 客户端配置成功！现在可以使用 AI 分析功能了。');
+    } else {
+      $('ds-health').innerHTML = `<span class="ai-status ai-status-err">✕ ${data.message || '配置失败'}</span>`;
+      $('btn-ds-config').textContent = '重试';
+      appendChatMsg('error', '配置失败: ' + (data.message || '未知错误'));
+    }
+  } catch (e) {
+    $('ds-health').innerHTML = `<span class="ai-status ai-status-err">✕ 网络错误</span>`;
+    $('btn-ds-config').textContent = '重试';
+    appendChatMsg('error', '请求失败: ' + e.message);
+  } finally {
+    $('btn-ds-config').disabled = false;
+  }
+}
+
+async function analyzeBacktest(stream) {
+  const resultEl = $('ds-analysis-result');
+  if (!_dsAvailable) {
+    resultEl.innerHTML = '<div class="empty">请先配置 DeepSeek API key。</div>';
+    return;
+  }
+
+  // 优先用最近的回测 job
+  let jobId = _lastBtJobId;
+  if (!jobId) {
+    // 尝试从 job list 找最近的 backtest
+    try {
+      const res = await fetch('/api/jobs');
+      const data = await res.json();
+      const btJobs = (data.jobs || []).filter(j => j.kind === 'backtest' && j.status === 'done');
+      if (btJobs.length > 0) jobId = btJobs[0].id;
+    } catch (e) {}
+  }
+  if (!jobId) {
+    resultEl.innerHTML = '<div class="empty">请先在「回测实验室」运行一次回测。</div>';
+    return;
+  }
+
+  if (!stream) {
+    // 非流式：fetch 完整结果
+    resultEl.innerHTML = '<div class="ai-dot-pulse"><span></span><span></span><span></span></div><span style="color:var(--text-dim)">AI 正在分析…</span>';
+    try {
+      // 获取 job 的 result
+      const jobRes = await fetch('/api/job/' + jobId);
+      const job = await jobRes.json();
+      if (!job.result) throw new Error('回测结果不可用');
+
+      const res = await fetch('/api/deepseek/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ result: job.result }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        resultEl.innerHTML = `<div class="empty" style="color:var(--rose)">${data.error}</div>`;
+      } else {
+        resultEl.innerHTML = simpleMarkdown(data.analysis || '无分析结果');
+        resultEl.scrollTop = 0;
+      }
+    } catch (e) {
+      resultEl.innerHTML = `<div class="empty" style="color:var(--rose)">分析失败: ${e.message}</div>`;
+    }
+    return;
+  }
+
+  // 流式 SSE
+  resultEl.innerHTML = '<span class="typing-cursor"></span>';
+  try {
+    const evtSrc = new EventSource(
+      `/api/deepseek/analyze/stream?job_id=${encodeURIComponent(jobId)}`
+    );
+    let firstChunk = true;
+    evtSrc.onmessage = (ev) => {
+      try {
+        const d = JSON.parse(ev.data);
+        if (d.content) {
+          if (firstChunk) { resultEl.innerHTML = ''; firstChunk = false; }
+          resultEl.innerHTML += d.content.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+          resultEl.scrollTop = resultEl.scrollHeight;
+        } else if (d.status) {
+          resultEl.innerHTML = `<span style="color:var(--text-dim)">${d.msg || d.status}</span>`;
+        } else if (d.error) {
+          resultEl.innerHTML = `<span style="color:var(--rose)">错误: ${d.error}</span>`;
+        }
+      } catch {}
+    };
+    evtSrc.onerror = () => {
+      evtSrc.close();
+      // 如果已有内容，用 simpleMarkdown 重新渲染
+      if (resultEl.textContent && resultEl.textContent.length > 20) {
+        const raw = resultEl.textContent;
+        resultEl.innerHTML = simpleMarkdown(raw);
+      }
+    };
+  } catch (e) {
+    resultEl.innerHTML = `<span style="color:var(--rose)">SSE 连接失败: ${e.message}</span>`;
+  }
+}
+
+function simpleMarkdown(text) {
+  if (!text) return '';
+  return text
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    // 标题
+    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
+    // 粗体
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    // 行内代码
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    // 列表
+    .replace(/^- (.+)$/gm, '<li>$1</li>')
+    .replace(/^(\d+)\. (.+)$/gm, '<li>$2</li>')
+    // 区块引用
+    .replace(/^> (.+)$/gm, '<blockquote>$1</blockquote>')
+    // 段落（连续非空行）
+    .replace(/\n\n/g, '</p><p>')
+    // 单换行
+    .replace(/\n/g, '<br>')
+    // wrap
+    .replace(/^(.+)$/m, (m) => m.startsWith('<') ? m : `<p>${m}</p>`);
+}
+
+// ─── 聊天 ─────────────────────────────────────────────────────────
+
+function sendChat() {
+  const input = $('ds-chat-input');
+  const prompt = input.value.trim();
+  if (!prompt) return;
+
+  if (!_dsAvailable) {
+    appendChatMsg('error', '请先配置 DeepSeek API key。');
+    return;
+  }
+
+  input.value = '';
+  appendChatMsg('user', prompt);
+  appendChatMsg('assistant', '<span class="ai-dot-pulse"><span></span><span></span><span></span></span>', true);
+  _chatHistory.push({ role: 'user', content: prompt });
+
+  const evtSrc = new EventSource(
+    `/api/deepseek/freeform/stream?prompt=${encodeURIComponent(prompt)}`
+  );
+
+  let lastMsg = document.querySelector('#ds-chat-body .ai-chat-msg-assistant:last-child');
+  let content = '';
+  let firstChunk = true;
+
+  evtSrc.onmessage = (ev) => {
+    try {
+      const d = JSON.parse(ev.data);
+      if (d.content) {
+        if (firstChunk && lastMsg) {
+          lastMsg.innerHTML = '';
+          firstChunk = false;
+        }
+        content += d.content;
+        if (lastMsg) {
+          lastMsg.innerHTML = simpleMarkdown(content);
+          $('ds-chat-body').scrollTop = $('ds-chat-body').scrollHeight;
+        }
+      } else if (d.error) {
+        if (lastMsg) lastMsg.innerHTML = `<span style="color:var(--rose)">${d.error}</span>`;
+      }
+    } catch {}
+  };
+
+  evtSrc.onerror = () => {
+    evtSrc.close();
+    if (content) _chatHistory.push({ role: 'assistant', content });
+  };
+}
+
+function appendChatMsg(role, html, isStreaming) {
+  const body = $('ds-chat-body');
+  const cls = role === 'user' ? 'ai-chat-msg-user' :
+              role === 'error' ? 'ai-chat-msg-error' : 'ai-chat-msg-assistant';
+  const div = document.createElement('div');
+  div.className = `ai-chat-msg ${cls}`;
+  if (isStreaming) div.dataset.streaming = '1';
+  div.innerHTML = html;
+  body.appendChild(div);
+  body.scrollTop = body.scrollHeight;
+}
+
+// ─── 市场分析 ─────────────────────────────────────────────────────
+
+async function analyzeMarket() {
+  if (!_dsAvailable) {
+    appendChatMsg('error', '请先配置 DeepSeek API key。');
+    return;
+  }
+  const resultEl = $('ds-analysis-result');
+  resultEl.innerHTML = '<div class="ai-dot-pulse"><span></span><span></span><span></span></div><span style="color:var(--text-dim)">AI 正在分析市场…</span>';
+  try {
+    const res = await fetch('/api/deepseek/market');
+    const data = await res.json();
+    if (data.error) {
+      resultEl.innerHTML = `<div class="empty" style="color:var(--rose)">${data.error}</div>`;
+    } else {
+      resultEl.innerHTML = simpleMarkdown(data.analysis || '无分析结果');
+    }
+  } catch (e) {
+    resultEl.innerHTML = `<div class="empty" style="color:var(--rose)">市场分析失败: ${e.message}</div>`;
+  }
+}
+
+// ─── 跟踪最近回测 job ─────────────────────────────────────────────
+
+// Monkey-patch onBacktestDone to record the job id
+const _origOnBacktestDone = onBacktestDone;
+onBacktestDone = function(job) {
+  _lastBtJobId = job.id;
+  _origOnBacktestDone(job);
+};

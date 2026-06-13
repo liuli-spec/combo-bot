@@ -38,6 +38,7 @@
   <nav class="tab-nav">
     <button class="tab-btn active" data-tab="dashboard">📊 操作台</button>
     <button class="tab-btn" data-tab="lab">🧬 回测 / 优化</button>
+    <button class="tab-btn" data-tab="ai">🤖 AI 分析</button>
   </nav>
 
   <!-- ═══════════════ TAB: dashboard ═══════════════ -->
@@ -317,6 +318,116 @@
 
     </main>
   </div><!-- #tab-lab -->
+
+  <!-- ═══════════════ TAB: ai ═══════════════ -->
+  <div class="tab-pane" id="tab-ai">
+    <main class="ai-wrap">
+
+      <!-- ── DeepSeek API 配置 ── -->
+      <section class="card ai-card">
+        <div class="card-header">
+          <div class="card-title">🔑 DeepSeek API 配置</div>
+          <div class="card-meta" id="ds-health">检测中…</div>
+        </div>
+        <div class="ai-config-row">
+          <input type="password" id="ds-key" class="param-input mono"
+                 placeholder="粘贴 DeepSeek API key (sk-…)"
+                 autocomplete="off" />
+          <button class="btn btn-start" id="btn-ds-config">配置</button>
+        </div>
+        <div class="card-meta" style="margin-top:8px">
+          密钥仅存储在服务器内存中，浏览器不会保留。重启 UI 后需重新配置。
+        </div>
+      </section>
+
+      <!-- ── 回测 AI 分析 ── -->
+      <section class="card ai-card">
+        <div class="card-header">
+          <div class="card-title">📊 回测 AI 分析</div>
+          <div class="card-meta">自动选择最近的回测结果进行 AI 深度分析</div>
+        </div>
+        <div class="ai-actions">
+          <button class="btn btn-start" id="btn-ds-analyze">
+            <span>🤖 分析最近回测</span>
+          </button>
+          <button class="btn btn-start" id="btn-ds-analyze-stream">
+            <span>📡 流式分析</span>
+          </button>
+          <button class="btn btn-ghost" id="btn-ds-market">
+            <span>📈 市场分析</span>
+          </button>
+        </div>
+        <div class="ai-result" id="ds-analysis-result">
+          <div class="empty">先在「回测实验室」运行一次回测，然后点击上方按钮开始 AI 分析。</div>
+        </div>
+      </section>
+
+      <!-- ── 自由对话 ── -->
+      <section class="card ai-card">
+        <div class="card-header">
+          <div class="card-title">💬 策略顾问对话</div>
+          <div class="card-meta">与 DeepSeek 量化分析师自由对话</div>
+        </div>
+
+        <!-- 快捷提问 -->
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+          <button class="chip ai-quick-btn" data-q="请分析最近的回测结果，指出策略的风险和改进建议。">
+            回测风险分析
+          </button>
+          <button class="chip ai-quick-btn" data-q="对比 Grid 和 Trend 两个组件的贡献，哪个更有优势？">
+            Grid vs Trend
+          </button>
+          <button class="chip ai-quick-btn" data-q="当前参数设置是否合理？有没有过拟合的风险？">
+            参数评估
+          </button>
+          <button class="chip ai-quick-btn" data-q="在当前市场环境下，这个策略最需要注意什么风险？">
+            风险提示
+          </button>
+          <button class="chip ai-quick-btn" data-q="给我一些具体的参数优化建议，包括调整方向和幅度。">
+            优化建议
+          </button>
+        </div>
+
+        <div class="ai-chat" id="ds-chat">
+          <div class="ai-chat-body" id="ds-chat-body">
+            <div class="ai-chat-msg ai-chat-msg-assistant">
+              你好！我是基于 <strong>DeepSeek</strong> 的量化分析助手 🤖<br><br>
+              我可以帮你：<br>
+              • 分析回测结果的优劣<br>
+              • 诊断策略参数是否过拟合<br>
+              • 给出具体的参数优化建议<br>
+              • 评估当前市场环境与策略的匹配度<br>
+              • 解读风险管理指标<br><br>
+              请先配置 API key（上方），然后开始提问。也可以点击上方的快捷提问按钮。
+            </div>
+          </div>
+          <div class="ai-chat-input-row">
+            <input type="text" id="ds-chat-input" class="param-input"
+                   placeholder="输入你的问题… (Enter 发送)"
+                   autocomplete="off" />
+            <button class="btn btn-start" id="btn-ds-send">发送</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── 使用说明 ── -->
+      <section class="card ai-card">
+        <div class="card-header">
+          <div class="card-title">📖 使用说明</div>
+        </div>
+        <div class="ai-result" style="font-size:13px;color:var(--text-dim);max-height:unset;">
+          <p><strong>第一步：</strong>在顶部输入框粘贴你的 DeepSeek API key，点击「配置」。</p>
+          <p><strong>第二步：</strong>切换到「回测实验室」tab，调整参数并运行一次回测。</p>
+          <p><strong>第三步：</strong>回到「AI 分析」tab，点击「分析最近回测」或「流式分析」。</p>
+          <p><strong>第四步：</strong>在下方对话框中自由提问，AI 会基于回测结果给出专业建议。</p>
+          <p style="margin-top:8px;color:var(--text-muted)">
+            💡 提示：API key 仅在当前服务器进程内存中保留，关闭 UI 后不会保存。推荐通过环境变量 <code>DEEPSEEK_API_KEY</code> 持久化配置。
+          </p>
+        </div>
+      </section>
+
+    </main>
+  </div><!-- #tab-ai -->
 
   <!-- 紧急停止确认弹窗 -->
   <div class="modal-backdrop" id="kill-modal" hidden>

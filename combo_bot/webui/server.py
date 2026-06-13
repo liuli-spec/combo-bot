@@ -43,6 +43,7 @@ from combo_bot.webui.process_manager import (
     TraderProcessConfig,
     TraderProcessManager,
 )
+from combo_bot.deepseek import DeepSeekClient
 
 logger = logging.getLogger("combo_bot.webui")
 
@@ -296,6 +297,18 @@ def create_app(
         max_workers=2, thread_name_prefix="bt_job"
     )
     _jobs: dict[str, dict[str, Any]] = {}
+
+    # ─── DeepSeek AI 客户端 ─────────────────────────────────────────
+    # 延迟初始化，由第一个请求触发；key 从环境变量读取。
+    _ds_client: DeepSeekClient | None = None
+    _ds_api_key_override: str | None = None  # 允许前端临时传入 key
+
+    def _get_ds() -> DeepSeekClient:
+        nonlocal _ds_client
+        if _ds_client is None:
+            key = _ds_api_key_override or None
+            _ds_client = DeepSeekClient(api_key=key)
+        return _ds_client
 
     _MAX_JOBS = 50
 
@@ -748,6 +761,202 @@ def create_app(
         loop.run_in_executor(_thread_pool, _run_optimize_job, jid, body)
         return JSONResponse({"job_id": jid})
 
+    # ─── DeepSeek AI 分析路由 ──────────────────────────────────────
+
+    @app.get("/api/deepseek/health")
+    async def deepseek_health() -> JSONResponse:
+        """检查 DeepSeek 客户端是否已配置且可用。"""
+        client = _get_ds()
+        if not client.available:
+            return JSONResponse({
+                "available": False,
+                "message": "API key 未配置。请设置环境变量 DEEPSEEK_API_KEY 或通过 POST /api/deepseek/config 传入。",
+            })
+        return JSONResponse({
+            "available": True,
+            "model": client.config.model,
+            "base_url": client.config.base_url,
+        })
+
+    @app.post("/api/deepseek/config")
+    async def deepseek_config(request: Request) -> JSONResponse:
+        """配置 DeepSeek API key（临时，重启后失效）。"""
+        nonlocal _ds_api_key_override, _ds_client
+        body = await request.json()
+        api_key = (body.get("api_key") or "").strip()
+        model = (body.get("model") or "").strip()
+        if not api_key:
+            return JSONResponse({
+                "ok": False,
+                "message": "api_key 不能为空",
+            }, status_code=400)
+        _ds_api_key_override = api_key
+        if _ds_client is not None:
+            await _ds_client.close()
+        _ds_client = DeepSeekClient(api_key=api_key)
+        if model:
+            _ds_client.config.model = model
+        return JSONResponse({
+            "ok": True,
+            "model": _ds_client.config.model,
+            "message": "DeepSeek 客户端已配置（内存中，重启后需重新配置）",
+        })
+
+    @app.post("/api/deepseek/analyze")
+    async def deepseek_analyze(request: Request) -> JSONResponse:
+        """AI 分析回测结果（非流式）。"""
+        body = await request.json()
+        result = body.get("result") or {}
+        config_summary = body.get("config_summary", "")
+        if not result:
+            return JSONResponse({"error": "缺少回测结果"}, status_code=400)
+        client = _get_ds()
+        if not client.available:
+            return JSONResponse({
+                "error": "DeepSeek API key 未配置。请先调用 POST /api/deepseek/config",
+                "health_url": "/api/deepseek/health",
+            }, status_code=503)
+        try:
+            analysis = await client.analyze_backtest(
+                result, config_summary=config_summary, stream=False
+            )
+            return JSONResponse({"analysis": analysis})
+        except Exception as exc:
+            logger.exception("[ui] DeepSeek analyze failed")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    @app.get("/api/deepseek/analyze/stream")
+    async def deepseek_analyze_stream(
+        job_id: str, config_summary: str = ""
+    ) -> StreamingResponse:
+        """SSE 流式 AI 分析回测结果。"""
+
+        async def event_stream():
+            client = _get_ds()
+            if not client.available:
+                yield f"data: {json.dumps({'error': 'DeepSeek API key 未配置'})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            job = _jobs.get(job_id)
+            if not job or not job.get("result"):
+                yield f"data: {json.dumps({'error': '回测结果不存在或未完成'})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            result = job["result"].copy()
+            result.pop("equity_curve", None)  # 不发送曲线数据
+
+            try:
+                yield f"data: {json.dumps({'status': 'thinking', 'msg': 'AI 正在分析回测结果…'})}\n\n"
+                stream = await client.analyze_backtest(
+                    result,
+                    config_summary=config_summary,
+                    stream=True,
+                )
+                if isinstance(stream, str):
+                    yield f"data: {json.dumps({'content': stream})}\n\n"
+                else:
+                    async for chunk in stream:
+                        yield f"data: {json.dumps({'content': chunk})}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as exc:
+                logger.exception("[ui] DeepSeek stream failed")
+                yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            event_stream(), media_type="text/event-stream"
+        )
+
+    @app.post("/api/deepseek/freeform")
+    async def deepseek_freeform(request: Request) -> JSONResponse:
+        """AI 自由对话（带上回测上下文）。"""
+        body = await request.json()
+        prompt = (body.get("prompt") or "").strip()
+        context = body.get("context", "")
+        if not prompt:
+            return JSONResponse({"error": "prompt 不能为空"}, status_code=400)
+        client = _get_ds()
+        if not client.available:
+            return JSONResponse({
+                "error": "DeepSeek API key 未配置。",
+                "health_url": "/api/deepseek/health",
+            }, status_code=503)
+        try:
+            reply = await client.freeform_chat(
+                prompt, context=context, stream=False
+            )
+            return JSONResponse({"reply": reply})
+        except Exception as exc:
+            logger.exception("[ui] DeepSeek freeform failed")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    @app.get("/api/deepseek/freeform/stream")
+    async def deepseek_freeform_stream(
+        prompt: str, context: str = ""
+    ) -> StreamingResponse:
+        """SSE 流式自由对话。"""
+
+        async def event_stream():
+            client = _get_ds()
+            if not client.available:
+                yield f"data: {json.dumps({'error': 'DeepSeek API key 未配置'})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            if not prompt.strip():
+                yield f"data: {json.dumps({'error': 'prompt 不能为空'})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            try:
+                stream = await client.freeform_chat(
+                    prompt, context=context, stream=True
+                )
+                if isinstance(stream, str):
+                    yield f"data: {json.dumps({'content': stream})}\n\n"
+                else:
+                    async for chunk in stream:
+                        yield f"data: {json.dumps({'content': chunk})}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as exc:
+                logger.exception("[ui] DeepSeek freeform stream failed")
+                yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            event_stream(), media_type="text/event-stream"
+        )
+
+    @app.get("/api/deepseek/market")
+    async def deepseek_market_analysis() -> JSONResponse:
+        """基于当前状态文件生成市场分析。"""
+        client = _get_ds()
+        if not client.available:
+            return JSONResponse({
+                "error": "DeepSeek API key 未配置。",
+                "health_url": "/api/deepseek/health",
+            }, status_code=503)
+
+        state = _load_state()
+        if not state:
+            return JSONResponse({"error": "无状态数据，请先启动机器人"}, status_code=400)
+
+        detail = state.get("symbols_detail", {})
+        market_data: dict[str, Any] = {}
+        for sym, sd in detail.items():
+            market_data[sym] = {
+                "last": sd.get("last_price", "N/A"),
+                "regime": sd.get("signal_regime", "neutral"),
+                "ema_trend": sd.get("ema_trend", "N/A"),
+            }
+
+        try:
+            analysis = await client.analyze_market(market_data, stream=False)
+            return JSONResponse({"analysis": analysis, "symbols": list(market_data.keys())})
+        except Exception as exc:
+            logger.exception("[ui] DeepSeek market analysis failed")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
     def _job_summary(j: dict) -> dict:
         """Strip large result fields for the list endpoint."""
         s = dict(j)
@@ -834,6 +1043,22 @@ def create_app(
                 "note": "已从状态文件移除，重启机器人后生效",
             }
         )
+
+    # 修补 lifespan 以在关闭时清理 DeepSeek 客户端
+    _orig_lifespan = lifespan
+
+    @asynccontextmanager
+    async def _patched_lifespan(app: FastAPI):
+        async with _orig_lifespan(app):
+            yield
+        nonlocal _ds_client
+        if _ds_client is not None:
+            try:
+                await _ds_client.close()
+            except Exception:
+                pass
+            _ds_client = None
+    app.router.lifespan_context = _patched_lifespan
 
     return app
 
